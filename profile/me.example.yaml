@@ -1,0 +1,16 @@
+# hwHandler 用户画像（占位默认；首次启动 / Phase 7.2 自修改时会覆盖）
+# - identity.* 改动需用户二次确认（敏感字段）
+# - preferences.* 可由 agent 直接 update_field 写回
+identity:
+  name: 张三
+  student_id: 2021xxxxx
+
+preferences:
+  language: zh-CN
+  writing_style:
+    formality: medium       # low / medium / high
+    avg_sentence_len: 25    # 平均句长（中文字符数）
+  coding_style:
+    type_hints: true        # 是否强制 type hints
+    docstring: short        # none / short / numpy
+  style_rules: []           # 自由文本规则；/remember 追加；inject 时拼进所有产物 agent 的 system prompt

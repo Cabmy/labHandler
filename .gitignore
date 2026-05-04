@@ -1,0 +1,40 @@
+# 环境变量与密钥
+.env
+.env.local
+*.env.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# hwHandler 运行时数据
+.hwhandler_data/
+workspace/.hwhandler/
+workspace/
+.trash/
+
+# verify/ 已迁到 docs/ 并清空（保留兼容历史）
+# 内部设计 / 实施文档（本地保留可查；不发布）
+_internal/
+docs/
+PROJECT_SUMMARY.md
+workspace/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.claude/
+CLAUDE.md
+
+# OS
+.DS_Store
+Thumbs.db
+profile/me.yaml
