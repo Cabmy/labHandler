@@ -28,7 +28,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm import get_llm
 from memory.profile import inject_for_agent
 from orchestrator.state import HwState
-from prompts import SUMMARIZER_SYSTEM, extract_result
+from config.prompts import SUMMARIZER_SYSTEM, extract_result
 
 WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
 SUMMARY_PATH = WORKSPACE_DIR / "SUMMARY.md"

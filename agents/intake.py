@@ -29,7 +29,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm import get_llm
 from orchestrator.state import HwState
-from prompts import INTAKE_SYSTEM, extract_result
+from config.prompts import INTAKE_SYSTEM, extract_result
 
 WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
 
@@ -49,6 +49,11 @@ _INSTRUCTION_PATTERNS = [
 _TEXT_EXTS = {".md", ".txt", ".rst", ".markdown"}
 _PARSEABLE_EXTS = {".pdf", ".docx", ".pptx"}  # 需要 sandbox 解析
 _SUPPORT_EXTS = {".py", ".cpp", ".c", ".h", ".java", ".js", ".ts", ".sql", ".sh"}
+
+
+class IntakeRejectError(Exception):
+    """当 intake 发现输入不足以构成有效任务或解析异常时，主动抛出以提示用户"""
+    pass
 
 
 def _scan_workspace() -> dict[str, list[Path]]:
@@ -73,16 +78,21 @@ def _scan_workspace() -> dict[str, list[Path]]:
         else:
             support_files.append(p)
 
-    # 兜底：workspace 没匹到任何指导文件，但只有"一个" PDF/DOCX 候选 → 升级为 needs_parse
-    # 理由：用户既然只丢了一个可解析文档，那就是要用它（避免因命名不规范而漏识）
+    # 兜底：workspace 没匹到任何指导文件，但 support 里有可读的文本/可解析文档 →
+    # 全部升级（用户既然只丢了文档，那就是要用它，避免因命名不规范而漏识）。
+    # 文本类（.md/.txt/.rst）进 instruction_files，PDF/DOCX 进 needs_parse。
     if not instruction_files and not needs_parse:
-        parseable_in_support = [
-            p for p in support_files if p.suffix.lower() in _PARSEABLE_EXTS
-        ]
-        if len(parseable_in_support) == 1:
-            promoted = parseable_in_support[0]
-            needs_parse.append(promoted)
-            support_files.remove(promoted)
+        promoted: list[Path] = []
+        for p in support_files:
+            ext = p.suffix.lower()
+            if ext in _TEXT_EXTS:
+                instruction_files.append(p)
+                promoted.append(p)
+            elif ext in _PARSEABLE_EXTS:
+                needs_parse.append(p)
+                promoted.append(p)
+        for p in promoted:
+            support_files.remove(p)
 
     return {
         "instruction": instruction_files,
@@ -135,15 +145,12 @@ def _parse_with_sandbox(files: list[Path], max_chars_per_file: int = 6000) -> st
     return "\n\n---\n\n".join(chunks)
 
 
-_INTAKE_SYSTEM = INTAKE_SYSTEM  # 保持局部引用名兼容
-
-
 def _llm_extract(instructions_text: str) -> dict[str, Any]:
     """LLM 抽 title/type/deliverables/constraints（带 CoT 双段输出 + 容错抽取）"""
     llm = get_llm()
     prompt = f"作业说明文档：\n\n{instructions_text}\n\n请按 system prompt 要求输出 <thinking> + <result>。"
     resp = llm.invoke(
-        [SystemMessage(content=_INTAKE_SYSTEM), HumanMessage(content=prompt)]
+        [SystemMessage(content=INTAKE_SYSTEM), HumanMessage(content=prompt)]
     )
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
 
@@ -165,6 +172,7 @@ def _llm_extract(instructions_text: str) -> dict[str, Any]:
         "type": (data.get("type") or "other").strip().lower(),
         "deliverables": list(data.get("deliverables") or []),
         "constraints": list(data.get("constraints") or []),
+        "suggestion": str(data.get("suggestion") or "").strip(),
     }
 
 
@@ -206,20 +214,14 @@ def run_intake(state: HwState) -> dict[str, Any]:
     if has_signal:
         try:
             extracted = _llm_extract(text)
+            if extracted.get("suggestion"):
+                raise IntakeRejectError(extracted["suggestion"])
+        except IntakeRejectError:
+            raise
         except Exception as e:
-            extracted = {
-                "title": state.get("question") or "未命名作业",
-                "type": "other",
-                "deliverables": [],
-                "constraints": [f"[Intake LLM 解析失败：{type(e).__name__}]"],
-            }
+            raise IntakeRejectError(f"Intake LLM 解析异常，请检查是否上传了格式正确的作业文档或重新输入。({type(e).__name__}: {e})")
     else:
-        extracted = {
-            "title": "未命名作业",
-            "type": "other",
-            "deliverables": [],
-            "constraints": [],
-        }
+        raise IntakeRejectError("未发现作业说明文档，且未提供具体请求。请先将作业要求（README/PDF等）放入 workspace 目录。")
 
     intake = {
         **extracted,

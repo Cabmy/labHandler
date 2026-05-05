@@ -11,7 +11,7 @@ state 管理（用户决策：单进程单任务）：
 - 第二次起的 REPL 输入由 graph 入口路由直接进 planner（复用 prior intake_result + verifier_runs 做修订）
 - /done：archive_task → workspace 内容 mv .trash/<ts>/ → 重建 sandbox 容器 → 退出 REPL（结束进程）
 
-命令清单：/help /quit /done /show /show summary /skills /profile /verbose /remember
+命令清单：/help /quit /done /show /show summary /skills /profile /remember
 """
 
 from __future__ import annotations
@@ -29,7 +29,9 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# .env 集中管理在 config/ 目录（任务 3 重构）；显式指定路径，
+# 这样从任何 cwd 启动 cli.py 都能读到（不再依赖 cwd == 项目根）。
+load_dotenv(Path(__file__).resolve().parent / "config" / ".env")
 
 from rich.console import Console  # noqa: E402
 from rich.prompt import Prompt  # noqa: E402
@@ -140,7 +142,6 @@ _HELP_TEXT = """
   /profile               显示当前 profile（me.yaml）
   /remember <rule>       追加一条用户偏好规则到 profile.preferences.style_rules
                          （注入到 planner / coder / verifier / summarizer 的 system prompt）
-  /verbose               切换详细模式（更多 stream 信息）
 
 直接输入文字即作为本轮 question，发到主图。
 首次输入跑完整 intake → planner → ... 链；之后再输入会跳过 intake，
@@ -192,8 +193,8 @@ def _cmd_profile() -> None:
 def _cmd_remember(rule: str) -> None:
     """显式追加一条用户偏好规则到 profile.preferences.style_rules（list）。
 
-    取代了 P7.2 时期的 LLM 意图判别（PROFILE_INTENT_SYSTEM）：用户用 /remember
-    显式触发，不再每条普通输入都付一次 LLM 时延。注入路径见 memory.profile.inject_for_agent。
+    取代了早期版本的 LLM 意图判别：用户用 /remember 显式触发，
+    不再每条普通输入都付一次 LLM 时延。注入路径见 memory.profile.inject_for_agent。
 
     入参 rule 是 line 原文中 "/remember " 之后的整段（保留所有空白和零宽字符；
     避免 split + " ".join 折叠多空格 / 零宽空格导致丢字）。
@@ -257,7 +258,7 @@ def _cmd_done(state: dict[str, Any]) -> None:
     # 一并重建 sandbox 容器，清掉 pip 全局包 / /tmp / 长跑进程残留
     # ensure_sandbox 同步阻塞等就绪（最多 60s）；失败也让 REPL 正常退出
     try:
-        from _internal.sandbox_boot import recreate_sandbox
+        from infra.sandbox_boot import recreate_sandbox
         ok = recreate_sandbox(log=lambda m: console.print(f"[dim]{m}[/]"))
         if ok:
             console.print("[green]✓ sandbox 容器已重建[/]")
@@ -287,6 +288,15 @@ def _crash_dump(exc: BaseException, state: dict[str, Any]) -> Path:
     return crash
 
 
+def _get_intake_reject_msg(exc: BaseException) -> str | None:
+    cur: BaseException | None = exc
+    while cur is not None:
+        if type(cur).__name__ == "IntakeRejectError":
+            return str(cur)
+        cur = cur.__cause__
+    return None
+
+
 def _run_task(state: dict[str, Any], user_input: str) -> dict[str, Any]:
     """跑一次主图，stream 节点事件，异常 dump CRASH.log
 
@@ -313,6 +323,11 @@ def _run_task(state: dict[str, Any], user_input: str) -> dict[str, Any]:
         console.print("\n[yellow](已中断本次任务，state 保留)[/]")
         return state
     except Exception as e:
+        reject_msg = _get_intake_reject_msg(e)
+        if reject_msg:
+            console.print(f"\n[yellow]💡 提示: {reject_msg}[/]")
+            sys.exit(1)
+            
         crash = _crash_dump(e, state)
         print_crash_panel(e, crash)
         return state
@@ -324,7 +339,7 @@ def _run_task(state: dict[str, Any], user_input: str) -> dict[str, Any]:
 def _startup_checks() -> None:
     # AIO Sandbox 容器：未跑则自动拉起（HW_AUTOSTART_SANDBOX=false 可禁用）
     try:
-        from _internal.sandbox_boot import ensure_sandbox
+        from infra.sandbox_boot import ensure_sandbox
         ensure_sandbox(log=lambda m: console.print(f"[dim]{m}[/]"))
     except Exception as e:
         console.print(f"[yellow]sandbox 自动启动检查失败（已跳过）：{e}[/]")
@@ -379,7 +394,6 @@ def repl() -> None:
     )
     _startup_checks()
     state: dict[str, Any] = _new_state()
-    verbose = False
 
     try:
         while True:
@@ -410,9 +424,6 @@ def repl() -> None:
                 elif cmd == "remember":
                     # 用 line 原文截取 "/remember " 之后的整段，绕开 split+join 对零宽空白 / 多空格的折叠
                     _cmd_remember(line[len("/remember"):].lstrip())
-                elif cmd == "verbose":
-                    verbose = not verbose
-                    console.print(f"verbose={verbose}")
                 elif cmd == "done":
                     _cmd_done(state)
                     console.print("[dim]bye[/]")

@@ -41,6 +41,30 @@ class HwState(TypedDict, total=False):
     summary: str            # Summarizer 输出 user_summary（写入 workspace/SUMMARY.md 的人话提纲）
     lessons: str            # Summarizer 输出 lessons（archive_task 直接读，不再从 SUMMARY 字符串抽取）
 
+    # ─── Plan-and-Execute Lite（Coder 单步执行循环） ────────
+    # current_step_idx：coder_step 节点要执行 task_dag.nodes 中的第几个 step（0-based）；
+    #   每跑完一轮 coder_step → +1，由 step_router 判断是回 coder_step 还是进 verifier；
+    #   每次 planner 节点执行（含 Replan）都会 reset 回 0
+    # step_outputs：每跑完一个 step 的简报（[{id, name, summary, ...}]），用 Annotated[list, add]
+    #   累加保留——Replan 时旧轮的不会被清空，Verifier/Summarizer 能看到全部历史。
+    current_step_idx: int
+    step_outputs: Annotated[list[dict], add]
+
+
+# ─── reducer 字段清单（list-add reducer，外部消费方需累加而非覆盖） ───
+#
+# 这些字段在 HwState 里用 Annotated[list, add]，LangGraph 内部跑主图时会
+# 自动累加节点的 return delta。但 ui/live_panel.stream_graph 从 stream_mode='updates'
+# 读 diff 后给外部 (cli) 拼 final_state 时，必须按这个清单做 list.extend，
+# 不能直接 dict 赋值覆盖（否则只剩最后一个节点 return 的部分，前面的丢失）。
+REDUCER_LIST_FIELDS: tuple[str, ...] = (
+    "progress_log",
+    "verifier_runs",
+    "artifacts",
+    "user_constraints",
+    "step_outputs",
+)
+
 
 # ─── 序列化辅助 ────────────────────────────────────────────────────
 

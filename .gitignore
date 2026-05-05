@@ -20,12 +20,8 @@ workspace/.hwhandler/
 workspace/
 .trash/
 
-# verify/ 已迁到 docs/ 并清空（保留兼容历史）
-# 内部设计 / 实施文档（本地保留可查；不发布）
-_internal/
+# 内部设计文档
 docs/
-PROJECT_SUMMARY.md
-workspace/
 
 # IDE
 .vscode/
@@ -33,6 +29,8 @@ workspace/
 *.swp
 .claude/
 CLAUDE.md
+WALKTHROUGH.md
+log.md
 
 # OS
 .DS_Store

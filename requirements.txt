@@ -7,7 +7,7 @@ langchain-community>=0.3.0
 langgraph>=0.2.0
 ollama
 
-# MCP (Phase 0 实测：streamable-http transport 需 Accept: application/json, text/event-stream)
+# MCP (streamable-http transport 需 Accept: application/json, text/event-stream)
 mcp
 langchain-mcp-adapters
 
@@ -16,7 +16,7 @@ chromadb>=0.5.0
 rank_bm25>=0.2.2
 jieba>=0.42.1
 
-# Web Search & Scraping
+# Web Search
 ddgs
 httpx[socks]
 beautifulsoup4
@@ -28,12 +28,5 @@ PyYAML
 # CLI
 rich
 
-# Web UI
-streamlit>=1.30
-
-# Verifier 跑 pytest 用（hwHandler 自身依赖；workspace 内若需更高版本 sandbox 自己装）
+# Verifier 在 workspace 跑 pytest
 pytest>=8.0
-
-# Evaluation (Step 4，预留)
-ragas>=0.1.0
-datasets

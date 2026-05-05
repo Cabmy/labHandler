@@ -7,13 +7,22 @@
    - 含 `..` token（`/^|\s\.\.[/\\\s]` 形式）→ 拒
    - 含 `~` 展开 → 拒
    - 含以 `/` 开头的可能绝对路径（如 `cat /etc/passwd`）→ 拒
-4. 越界一律 raise PermissionError（不静默）
+4. 越界**拒绝执行**（危险命令永不进 subprocess.run）+ 返回 `[ERROR/PermissionError] ...`
+   字符串，让 ReAct 在下一轮自我纠正。
+   注意：内部 helper `_safe_path` / `_check_cmd` **仍然 raise PermissionError**，
+   方便单元测试 / verifier 直调断言；只有 @tool 包装层把异常翻译成观测字符串
+   （langgraph 1.x 的 ToolNode 默认会把 Exception 重抛，不翻译，所以必须工具层自捕）。
 
 **越权 4 用例（DoD）**：
-  ① read_file("/etc/passwd")          → PermissionError
-  ② read_file("../../etc/passwd")     → PermissionError
-  ③ host_bash("cat /etc/passwd")      → PermissionError
-  ④ host_bash("cd .. && ls")          → PermissionError
+  外部（@tool 调用）       → 返回字符串，以 "[ERROR/PermissionError]" 起头
+  ① read_file("/etc/passwd")
+  ② read_file("../../etc/passwd")
+  ③ host_bash("cat /etc/passwd")
+  ④ host_bash("cd .. && ls")
+
+  内部 helper（直调）       → 仍 raise PermissionError
+  · _safe_path("/etc/passwd")
+  · _check_cmd("cat /etc/passwd")
 """
 
 from __future__ import annotations
@@ -64,13 +73,30 @@ def _check_cmd(cmd: str) -> None:
             )
 
 
+# Coder 看到 [ERROR/PermissionError] 后的统一改写提示（作为 ToolMessage observation）
+_PERM_HINT = (
+    "host fs 工具只能在 WORKSPACE_DIR 内运行；host_bash 还禁用 ..、绝对路径前缀、~ 展开。"
+    "请改用相对路径（如 'solution.py' 而非 '/workspace/solution.py'，"
+    "`pytest -q test_x.py` 而非 `cd /workspace && pytest`），"
+    "或改用 sandbox_run_python / sandbox_file_operations 在容器内访问 /workspace/*。"
+)
+
+
+def _perm_msg(e: PermissionError) -> str:
+    """把 PermissionError 翻译成给 LLM 看的观测字符串（ReAct 自我纠正用）"""
+    return f"[ERROR/PermissionError] {e}\n提示：{_PERM_HINT}"
+
+
 # ─── 工具（@tool 装饰器自动产 OpenAI schema） ─────────────────────
 
 
 @tool
 def read_file(path: str) -> str:
     """读 workspace 内的文本文件，返回全文。path 是相对 WORKSPACE_DIR 的路径。"""
-    p = _safe_path(path)
+    try:
+        p = _safe_path(path)
+    except PermissionError as e:
+        return _perm_msg(e)
     if not p.exists():
         raise FileNotFoundError(f"文件不存在：{path}")
     if not p.is_file():
@@ -81,16 +107,22 @@ def read_file(path: str) -> str:
 @tool
 def write_file(path: str, content: str) -> str:
     """写 workspace 内文本文件（覆盖写）。path 是相对 WORKSPACE_DIR 的路径。返回字节数描述。"""
-    p = _safe_path(path)
+    try:
+        p = _safe_path(path)
+    except PermissionError as e:
+        return _perm_msg(e)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"wrote {len(content)} chars to {p.relative_to(WORKSPACE_DIR)}"
 
 
 @tool
-def list_dir(path: str = ".") -> list[str]:
-    """列 workspace 内目录的文件名（一级，不递归）。"""
-    p = _safe_path(path)
+def list_dir(path: str = ".") -> list[str] | str:
+    """列 workspace 内目录的文件名（一级，不递归）。越界时返回 [ERROR/PermissionError] 字符串。"""
+    try:
+        p = _safe_path(path)
+    except PermissionError as e:
+        return _perm_msg(e)
     if not p.exists():
         raise FileNotFoundError(f"目录不存在：{path}")
     if not p.is_dir():
@@ -101,7 +133,10 @@ def list_dir(path: str = ".") -> list[str]:
 @tool
 def patch_file(path: str, old: str, new: str) -> str:
     """在 workspace 内文件做精确字符串替换（old 必须在文件中出现一次，否则报错）。"""
-    p = _safe_path(path)
+    try:
+        p = _safe_path(path)
+    except PermissionError as e:
+        return _perm_msg(e)
     text = p.read_text(encoding="utf-8")
     count = text.count(old)
     if count == 0:
@@ -121,9 +156,14 @@ def host_bash(cmd: str, timeout: int = 30) -> str:
     cwd 强制为 WORKSPACE_DIR；timeout 默认 30s。
 
     用例：`pytest -v` / `ls -la` / `python solution.py`
-    返回 stdout + stderr 合并文本。
+    返回 stdout + stderr 合并文本；越界时**命令不会被执行**，返回
+    `[ERROR/PermissionError] ...` 字符串，请改写命令后重试（去掉绝对路径前缀、
+    使用相对路径，或改用 sandbox_run_python）。
     """
-    _check_cmd(cmd)
+    try:
+        _check_cmd(cmd)
+    except PermissionError as e:
+        return _perm_msg(e)
     try:
         result = subprocess.run(
             ["bash", "-c", cmd],

@@ -26,12 +26,9 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm import get_llm
 from memory.profile import inject_for_agent
 from orchestrator.state import HwState
-from prompts import PLANNER_SYSTEM, extract_result
+from config.prompts import PLANNER_SYSTEM, extract_result
 
 ARCHIVE_TOP_K = int(os.getenv("PLANNER_ARCHIVE_TOP_K", "3"))
-
-
-_PLANNER_SYSTEM = PLANNER_SYSTEM  # 局部引用名兼容
 
 
 def _format_lessons(lessons: list[dict]) -> str:
@@ -108,10 +105,12 @@ def run_planner(state: HwState) -> dict[str, Any]:
     if skill_body:
         user_msg_parts.append(f"## skill SOP（{skill_name}）\n{skill_body[:2000]}")
 
-    # Replan: 把上一轮 Verifier 反馈塞进 prompt
+    # Replan: 把上一轮 Verifier 反馈 + 旧 DAG + workspace 现有产物塞进 prompt
     # ① 让 DAG 真的能基于失败信号调整（否则 2 次 Planner 输出几乎一致）
     # ② 输入与首轮不同，避开 langchain SQLite cache 命中导致 stream_mode='messages'
     #    无 chunk 流出 → live_panel 拿不到 token → CLI 看不到第 2 次 Planner 的思考过程
+    # ③ 进入 PLANNER_SYSTEM 的「Replan 修补模式」：让 Planner 只产针对 missing 的最小修补 DAG，
+    #    不再重复拆已通过的 step（避免 Coder 对已存在产物做无效自证）。
     verifier_runs = state.get("verifier_runs") or []
     if verifier_runs:
         last = verifier_runs[-1]
@@ -122,15 +121,55 @@ def run_planner(state: HwState) -> dict[str, Any]:
             "## 上一轮 Verifier 反馈\n"
             f"- verdict: {last.get('verdict', '')}\n"
             f"- missing: {missing}\n"
-            f"- suggested_fix: {sf}\n"
-            "请据此调整 DAG（聚焦 missing 项，改写节点 desc 或增设修复节点）。"
+            f"- suggested_fix: {sf}"
         )
+        # 旧 DAG（让 Planner 知道哪些节点已被验证过，未列入 missing 的视为已完成）
+        prev_dag = state.get("task_dag") or {}
+        prev_nodes = prev_dag.get("nodes") or []
+        if prev_nodes:
+            try:
+                dag_brief = json.dumps(
+                    [
+                        {
+                            "id": n.get("id"),
+                            "name": n.get("name"),
+                            "depends_on": n.get("depends_on") or [],
+                            "expected_artifacts": n.get("expected_artifacts") or [],
+                        }
+                        for n in prev_nodes
+                    ],
+                    ensure_ascii=False,
+                )
+            except Exception:
+                dag_brief = str(prev_nodes)
+            user_msg_parts.append(f"## 上一轮 task_dag（节点摘要）\n{dag_brief[:1500]}")
+        # workspace 现有产物清单（仅相对路径，不读文件内容——Verifier 阶段已读过）
+        try:
+            from pathlib import Path as _P
+            import os as _os
+            ws = _P(_os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
+            files = []
+            for p in ws.rglob("*"):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(ws)
+                if any(part.startswith(".") or part == "__pycache__" for part in rel.parts):
+                    continue
+                files.append(str(rel))
+            if files:
+                files.sort()
+                user_msg_parts.append(
+                    "## workspace 现有产物（文件已存在；若该文件相关约束未列入 missing，视为已完成，不要重新生成）\n"
+                    + "\n".join(f"- {f}" for f in files[:50])
+                )
+        except Exception:
+            pass
 
     user_msg = "\n\n".join(user_msg_parts)
 
     llm = get_llm()
     resp = llm.invoke(
-        [SystemMessage(content=inject_for_agent("planner", _PLANNER_SYSTEM)), HumanMessage(content=user_msg)]
+        [SystemMessage(content=inject_for_agent("planner", PLANNER_SYSTEM)), HumanMessage(content=user_msg)]
     )
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
 
@@ -151,6 +190,11 @@ def run_planner(state: HwState) -> dict[str, Any]:
                 "agent": str(n.get("agent") or "coder").lower(),
                 "depends_on": list(n.get("depends_on") or []),
                 "desc": str(n.get("desc") or ""),
+                # Plan-and-Execute Lite：Coder 单步执行参考的 3 字段
+                # （prompts.PLANNER_SYSTEM 强制要求 LLM 给出这 3 项）
+                "acceptance_criteria": list(n.get("acceptance_criteria") or []),
+                "expected_artifacts": list(n.get("expected_artifacts") or []),
+                "suggested_tools": list(n.get("suggested_tools") or []),
             }
         )
 
@@ -163,6 +207,7 @@ def run_planner(state: HwState) -> dict[str, Any]:
     return {
         "task_dag": task_dag,
         "iteration": int(state.get("iteration", 0)) + 1,  # Replan 计数
+        "current_step_idx": 0,  # ★ Plan-and-Execute：每次 planner 都从 step 0 重新开始（含 Replan）
         "progress_log": [
             {
                 "node": "planner",
@@ -187,22 +232,32 @@ def _fallback_dag(skill: str, title: str, reason: str) -> dict[str, Any]:
 
     Verifier / Summarizer 是主图固定的收尾节点，不由 planner 拆——
     fallback 也只产 coder 节点。
+
+    Plan-and-Execute Lite 兼容：fallback 节点也补上 acceptance_criteria /
+    expected_artifacts / suggested_tools 三字段（即便都是空 list 让 Coder 自决），
+    保持 schema 一致，避免下游 _format_current_step_detail 拿到 KeyError。
     """
+    _empty = {
+        "acceptance_criteria": [],
+        "expected_artifacts": [],
+        "suggested_tools": [],
+    }
     if skill == "coding":
         nodes = [
             {"id": "n1", "name": "实现", "agent": "coder", "depends_on": [],
-             "desc": f"在沙箱实现 {title}（文件名按主题命名）"},
+             "desc": f"在沙箱实现 {title}（文件名按主题命名）", **_empty},
             {"id": "n2", "name": "测试", "agent": "coder", "depends_on": ["n1"],
-             "desc": "编写并跑通 pytest 测试"},
+             "desc": "编写并跑通 pytest 测试", **_empty},
         ]
     elif skill in {"essay", "lab_report"}:
         nodes = [
             {"id": "n1", "name": "起草", "agent": "coder", "depends_on": [],
-             "desc": f"写 {title}"},
+             "desc": f"写 {title}", **_empty},
         ]
     else:
         nodes = [
-            {"id": "n1", "name": "执行", "agent": "coder", "depends_on": [], "desc": title},
+            {"id": "n1", "name": "执行", "agent": "coder", "depends_on": [], "desc": title,
+             **_empty},
         ]
     return {
         "skill": skill,

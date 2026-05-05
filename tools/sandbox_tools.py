@@ -15,7 +15,7 @@
 - sandbox_get_packages
 
 **路径约定**（Fix 2B）：
-- 宿主 WORKSPACE_DIR 通过 `-v` 挂载到容器 /workspace（见 _internal/sandbox_boot.py）
+- 宿主 WORKSPACE_DIR 通过 `-v` 挂载到容器 /workspace（见 infra/sandbox_boot.py）
 - agent 给 sandbox 工具的 path / file_path 形参可以是宿主绝对路径，本模块自动翻译为 /workspace/<rel>
 - 已经是 /workspace/... 或相对路径或非 workspace 下的绝对路径 → 原样转发
 """

@@ -1,18 +1,27 @@
-"""LangGraph 主图 - hwHandler 编排层（P5.1）
+"""LangGraph 主图 - hwHandler 编排层（Plan-and-Execute Lite）
 
-节点结构（用户决策"单 Coder 节点 ReAct 全包"）：
-  START → Intake → Planner → Coder → Verifier → [conditional]
-                                                  ├ replan ─ → Planner（loop）
-                                                  └ done   ─ → Compile → Summarizer → END
+节点结构（Coder 单步执行 + step_router 自循环 + Replan loop）：
+
+  START → Intake → Planner → coder_step ──→ step_router
+                    ↑                            │
+                    │  fail (iter<MAX,            ├ next ─→ coder_step（跑下一个 step）
+                    │  reset idx=0)               └ done ─→ Verifier
+                    │                                          │
+                    └──────────────────────────────────────────┤
+                                pass / fail (iter≥MAX)         │
+                                       → Compile → Summarizer → END
+
+关键约束：
+- coder_step **单步执行**：每次只跑 task_dag.nodes[current_step_idx] 那一个 step
+- step_router 控制 step 循环：current_step_idx < len(nodes) → 回 coder_step；否则 → verifier
+- iteration 由 Planner 节点 +1；planner 节点同时 reset current_step_idx=0（含 Replan）
+- HwState 多个字段用 Annotated[list, add] 让 LangGraph 自动累加：
+  progress_log / verifier_runs / artifacts / user_constraints / step_outputs
 
 路由规则（详见 orchestrator/replan.py）：
   pass                           → "compile"
-  fail 且 iteration < MAX_REPLAN → "planner"
+  fail 且 iteration < MAX_REPLAN → "planner"（reset idx=0 重拆 DAG）
   fail 且 iteration ≥ MAX_REPLAN → "compile"（标 partial=true）
-
-关键约束：
-- iteration 由 Planner 节点 +1（每次进 Planner 都计数）
-- HwState 多个字段用 Annotated[list, add] 让 LangGraph 自动累加（progress_log / verifier_runs / artifacts / user_constraints）
 """
 
 from __future__ import annotations
@@ -21,7 +30,7 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
-from agents.coder import run_coder
+from agents.coder import run_coder_step
 from agents.intake import run_intake
 from agents.planner import run_planner
 from agents.summarizer import run_summarizer
@@ -37,6 +46,17 @@ def _entry_router(state: HwState) -> Literal["intake", "planner"]:
     return "planner" if state.get("intake_result") else "intake"
 
 
+def step_router(state: HwState) -> Literal["next", "done"]:
+    """coder_step 完成后的条件路由（Plan-and-Execute Lite）：
+
+    - "next" → 还有未做的 step（current_step_idx < len(nodes)），回到 coder_step
+    - "done" → 全部 step 跑完，进 verifier
+    """
+    nodes = (state.get("task_dag") or {}).get("nodes") or []
+    idx = int(state.get("current_step_idx", 0))
+    return "next" if idx < len(nodes) else "done"
+
+
 def build_graph() -> Any:
     """构建并 compile 主图。"""
     graph = StateGraph(HwState)
@@ -44,7 +64,7 @@ def build_graph() -> Any:
     # 节点
     graph.add_node("intake", run_intake)
     graph.add_node("planner", run_planner)
-    graph.add_node("coder", run_coder)
+    graph.add_node("coder_step", run_coder_step)
     graph.add_node("verifier", run_verifier)
     graph.add_node("compile", run_compile)
     graph.add_node("summarizer", run_summarizer)
@@ -56,15 +76,24 @@ def build_graph() -> Any:
         {"intake": "intake", "planner": "planner"},
     )
     graph.add_edge("intake", "planner")
-    graph.add_edge("planner", "coder")
-    graph.add_edge("coder", "verifier")
+    graph.add_edge("planner", "coder_step")
+
+    # ★ Plan-and-Execute Lite：coder_step 自循环
+    # 每跑完一轮 coder_step（idx+1）后，step_router 决定：
+    # - "next" → 回到 coder_step 跑下一个 step
+    # - "done" → 全部 step 完成，进 verifier 校验
+    graph.add_conditional_edges(
+        "coder_step",
+        step_router,
+        {"next": "coder_step", "done": "verifier"},
+    )
 
     # 条件边：Verifier 后看 verdict 决定 Replan 或 Compile
     graph.add_conditional_edges(
         "verifier",
         replan_router,
         {
-            "planner": "planner",  # fail 且未到 MAX → 重拆 DAG
+            "planner": "planner",  # fail 且未到 MAX → 重拆 DAG（planner 节点会 reset current_step_idx=0）
             "compile": "compile",  # pass / fail 超限 → 收尾
         },
     )

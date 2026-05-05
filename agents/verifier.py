@@ -23,10 +23,8 @@ verdict 规则（二元化）：
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +33,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm import get_llm
 from memory.profile import inject_for_agent, load_profile
 from orchestrator.state import HwState
-from prompts import VERIFIER_COVERAGE_SYSTEM, extract_result
+from config.prompts import VERIFIER_COVERAGE_SYSTEM, extract_result
 
 WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
 
@@ -83,19 +81,29 @@ def _split_deliverables(deliverables: list[str]) -> tuple[list[str], list[str]]:
 def _check_files_exist(deliverables: list[str]) -> list[str]:
     """检查"文件名类"交付物是否在 workspace 内存在。
 
+    路径规整：剥掉常见的 "workspace/" 前缀（intake LLM 经常从题面里直抄
+    "workspace/x.py" 这种带前缀的写法），再做存在检查；rglob 兜底用 basename，
+    避免 pattern 含路径分隔符不匹配。
+
     描述性 deliverable（如「源代码文件（含 ZUC_Init...）」）跳过严格匹配，
     交给阶段 2 LLM 语义覆盖判官判（避免硬指标误报缺失）。
     """
     failures: list[str] = []
-    file_names, _descs = _split_deliverables(deliverables)
+    file_names, _ = _split_deliverables(deliverables)
     for d in file_names:
-        # deliverables 可能是文件名或相对路径；都按 workspace 内查
-        path = WORKSPACE_DIR / d
-        if not path.exists():
-            # 尝试 rglob 模糊匹配（用户可能把文件丢在子目录）
-            matches = list(WORKSPACE_DIR.rglob(d))
-            if not matches:
-                failures.append(f"交付物缺失：{d}")
+        # 剥前缀: "workspace/x" / "./workspace/x" / "/workspace/x" → "x"
+        d_norm = d
+        for prefix in ("workspace/", "./workspace/", "/workspace/"):
+            if d_norm.startswith(prefix):
+                d_norm = d_norm[len(prefix):]
+                break
+        path = WORKSPACE_DIR / d_norm
+        if path.exists():
+            continue
+        # rglob 兜底用 basename（pattern 含 "/" 时 rglob 不匹配）
+        matches = list(WORKSPACE_DIR.rglob(Path(d_norm).name))
+        if not matches:
+            failures.append(f"交付物缺失：{d}")
     return failures
 
 
@@ -129,13 +137,13 @@ def _run_pytest_in_workspace(timeout: int = 60) -> tuple[bool, str]:
     try:
         from tools.fs_tools import host_bash
         # 用 host_bash 跑，自动 cwd=WORKSPACE_DIR
+        # host_bash 越界不再 raise，而是返回 "[ERROR/PermissionError] ..." 字符串，
+        # 这里靠下面的 "[exit=0]" not in out 自然兜住（视为失败）
         out = host_bash.invoke({"cmd": "pytest -q --tb=short", "timeout": timeout})
         # exit=0 视为通过
         if "[exit=0]" in out:
             return True, out[-500:]
         return False, out[-1000:]
-    except PermissionError as e:
-        return False, f"host_bash 越界：{e}"
     except Exception as e:
         return False, f"pytest 调用异常：{type(e).__name__}: {e}"
 
@@ -173,9 +181,6 @@ def _stage1_hard_checks(state: HwState) -> tuple[list[str], dict[str, Any]]:
 
 
 # ─── 阶段 2：LLM 语义覆盖 ────────────────────────────────────────
-
-
-_COVERAGE_SYSTEM = VERIFIER_COVERAGE_SYSTEM  # 局部引用名兼容
 
 
 def _gather_artifacts_text(state: HwState, max_chars: int = 6000) -> str:
@@ -232,6 +237,8 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
     intake = state.get("intake_result") or {}
     constraints = list(intake.get("constraints") or [])
     user_cons = list(state.get("user_constraints") or [])
+    task_type = str(intake.get("type") or "other")
+    task_title = str(intake.get("title") or "")
 
     # 描述性 deliverables（非文件名）转交阶段 2：加 [交付物] 前缀混入约束列表，
     # 让 LLM 判官按"workspace 里有没有满足这个产物的描述"判覆盖；
@@ -300,10 +307,41 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
     except Exception:
         pass
 
+    # 约束分节展示 + 覆盖优先级声明：
+    # user_constraints 按 append 时序编号（最末条 = 最新一轮用户指令）；
+    # 让 LLM 自行处理"后令覆盖前令"和"用户指令覆盖题面"的语义，避免被作废条目仍判 missing。
+    cons_block_lines: list[str] = [
+        "## 约束条目（已分节；判定前先读下方覆盖规则）",
+        "",
+        f"### 当前任务类型：{task_type}（title={task_title or '（空）'}）",
+        "",
+        "### 覆盖规则（必读）",
+        "- 用户补充约束按对话时间顺序编号；**编号靠后者**与靠前者矛盾时，以靠后者为准，靠前者作废。",
+        "- 用户补充约束整体覆盖题面约束中的同主题条目（用户后续的修订指令可推翻题面默认要求）。",
+        "- 被覆盖作废的条目**不计入 missing，也不要为其找证据**；在 covered/missing 数组里直接省略。",
+        "- 描述性交付物（[交付物]）独立判定。",
+        "- 长期规则（[长期规则]）独立判定；但若该规则与当前任务**完全不相关**"
+        "（例如「实验报告截图占位」对一道纯算法题），直接判 covered，evidence 写"
+        "「N/A：与当前任务不相关」，不要列入 missing。",
+        "",
+        "### 题面约束（intake.constraints）",
+    ]
+    cons_block_lines += [f"- {c}" for c in constraints] or ["- （无）"]
+    cons_block_lines += ["", "### 用户补充约束（user_constraints，按时间顺序）"]
+    if user_cons:
+        for i, c in enumerate(user_cons, 1):
+            tag = "（最新一轮用户指令）" if i == len(user_cons) else ""
+            cons_block_lines.append(f"- {i}) {c}{tag}")
+    else:
+        cons_block_lines.append("- （无）")
+    cons_block_lines += ["", "### 描述性交付物（[交付物]）"]
+    cons_block_lines += [f"- {c}" for c in deliv_cons] or ["- （无）"]
+    cons_block_lines += ["", "### 长期规则（[长期规则]）"]
+    cons_block_lines += [f"- {c}" for c in profile_cons] or ["- （无）"]
+
     user_msg = (
         stage1_block
-        + "## 约束条目（题面 + 用户补充 + 长期规则）\n"
-        + "\n".join(f"- {c}" for c in all_cons)
+        + "\n".join(cons_block_lines)
         + "\n\n"
         + hist_block
         + "## 产物内容\n\n"
@@ -312,7 +350,7 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
     llm = get_llm()
     try:
         resp = llm.invoke(
-            [SystemMessage(content=inject_for_agent("verifier", _COVERAGE_SYSTEM)), HumanMessage(content=user_msg)]
+            [SystemMessage(content=inject_for_agent("verifier", VERIFIER_COVERAGE_SYSTEM)), HumanMessage(content=user_msg)]
         )
         content = resp.content if isinstance(resp.content, str) else str(resp.content)
         data = _parse_json(content)
