@@ -1,4 +1,4 @@
-# hwHandler 用户画像（占位默认；首次启动 / Phase 7.2 自修改时会覆盖）
+# labHandler 用户画像（占位默认；首次启动 / Phase 7.2 自修改时会覆盖）
 # - identity.* 改动需用户二次确认（敏感字段）
 # - preferences.* 可由 agent 直接 update_field 写回
 identity:

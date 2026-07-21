@@ -66,7 +66,7 @@ class IntakeRejectError(Exception):
 
 
 def _scan_workspace() -> dict[str, list[Path]]:
-    """递归扫 workspace，按文件性质分类（忽略 .hwhandler / __pycache__）
+    """递归扫 workspace，按文件性质分类（忽略 .labhandler / __pycache__）
 
     Returns:
         dict 包含三个键：

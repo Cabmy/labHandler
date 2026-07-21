@@ -70,7 +70,7 @@ avg_sentence_len（平均句长，中文字符数）：
 
 ## 5. 学术诚信（写作类硬要求）
 
-参见 hwHandler 全局学术诚信约束（agents/coder.py 内 _ACADEMIC_INTEGRITY_PROMPT 已注入）：
+参见 labHandler 全局学术诚信约束（agents/coder.py 内 _ACADEMIC_INTEGRITY_PROMPT 已注入）：
 - 全部内容须本人创作；引用须标来源
 - 题目原文可直接引用作分析对象
 - 单条引用 ≤ 30 字

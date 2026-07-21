@@ -1,4 +1,4 @@
-"""hwHandler LLM 模块入口。"""
+"""labHandler LLM 模块入口。"""
 
 from .provider import (
     DS_V4_PRO_KWARGS,

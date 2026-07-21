@@ -1,4 +1,4 @@
-"""LangGraph 主图 - hwHandler 编排层（Plan-and-Execute Lite）
+"""LangGraph 主图 - labHandler 编排层（Plan-and-Execute Lite）
 
 节点结构（Coder 单步执行 + step_router 自循环 + Replan loop）：
 

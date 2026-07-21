@@ -11,7 +11,7 @@ import os
 import sqlite3
 from typing import Any, Optional
 
-MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./.hwhandler_data/memory.db")
+MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./.labhandler_data/memory.db")
 
 # card_type 白名单
 VALID_CARD_TYPES = frozenset({"lesson", "strategy", "pattern"})

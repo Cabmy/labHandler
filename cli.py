@@ -1,4 +1,4 @@
-"""hwHandler CLI - REPL + 命令（PLAN §12 / STEPS P6.1 / P6.3）
+"""labHandler CLI - REPL + 命令（PLAN §12 / STEPS P6.1 / P6.3）
 
 启动流程：
 1. dotenv 加载 → 检测 profile 占位（hint 但不强制交互）
@@ -38,7 +38,7 @@ from rich.prompt import Prompt  # noqa: E402
 
 SETTINGS = get_settings()
 WORKSPACE_DIR: Path = SETTINGS.workspace_dir
-META_DIR: Path = WORKSPACE_DIR / ".hwhandler"
+META_DIR: Path = WORKSPACE_DIR / ".labhandler"
 TRASH_DIR: Path = WORKSPACE_DIR.parent / ".trash"
 
 console = Console()
@@ -130,7 +130,7 @@ def _append_user_message(state: dict[str, Any], text: str) -> None:
 
 
 _HELP_TEXT = """
-[bold]hwHandler 命令：[/]
+[bold]labHandler 命令：[/]
   /help                  本帮助
   /quit                  退出（不沉淀）
   /done                  归档当前任务 → 清场 workspace → 重建 sandbox → 退出
@@ -343,7 +343,7 @@ def _run_task(state: dict[str, Any], user_input: str) -> dict[str, Any]:
 
 
 def _startup_checks() -> None:
-    # AIO Sandbox 容器：未跑则自动拉起（HW_AUTOSTART_SANDBOX=false 可禁用）
+    # AIO Sandbox 容器：未跑则自动拉起（LAB_AUTOSTART_SANDBOX=false 可禁用）
     try:
         from infra.sandbox_boot import ensure_sandbox
         ensure_sandbox(log=lambda m: console.print(f"[dim]{m}[/]"))
@@ -382,7 +382,7 @@ def _startup_checks() -> None:
     if not WORKSPACE_DIR.exists():
         WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
-    items = [p for p in WORKSPACE_DIR.iterdir() if p.name != ".hwhandler"]
+    items = [p for p in WORKSPACE_DIR.iterdir() if p.name != ".labhandler"]
     if not items:
         console.print(
             "[yellow]提示：workspace/ 当前为空。"
@@ -395,7 +395,7 @@ def _startup_checks() -> None:
 
 def repl() -> None:
     console.print(
-        "[bold cyan]hwHandler[/] · type [bold]/help[/] for commands · "
+        "[bold cyan]labHandler[/] · type [bold]/help[/] for commands · "
         "[dim]Ctrl-D / /quit to exit[/]"
     )
     _startup_checks()

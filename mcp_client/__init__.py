@@ -1,4 +1,4 @@
-"""hwHandler MCP 模块入口。"""
+"""labHandler MCP 模块入口。"""
 
 from .client import (
     AIO_SANDBOX_MCP_URL,

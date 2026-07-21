@@ -87,7 +87,7 @@ _PATH_KW = {"path", "file_path"}  # 沙箱工具中代表"文件路径"的形参
 
 # sandbox_execute_code Jupyter kernel ack-only 提示
 _ACK_ONLY_HINT = (
-    "\n\n[hwhandler] ack-only: Jupyter kernel 异步派发 ack"
+    "\n\n[labhandler] ack-only: Jupyter kernel 异步派发 ack"
     "（stdout/stderr/exit_code 均 null），代码可能尚未执行完毕。"
     "如需同步获取结果，改用 sandbox_execute_bash 执行命令。"
 )

@@ -1,4 +1,4 @@
-"""hwHandler orchestrator 模块入口
+"""labHandler orchestrator 模块入口
 
 注意：graph 相关延迟 import 避免与 agents 形成环引用
 （agents/coder.py 用 from orchestrator.state import HwState 会触发本 __init__.py 加载，

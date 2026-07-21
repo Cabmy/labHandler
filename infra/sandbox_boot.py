@@ -5,7 +5,7 @@
 2. 探活不通 → `docker inspect`：容器存在但停了就 `docker start`；不存在就 `docker run`
 3. 轮询端口最多 60s
 4. 没装 docker / docker 失败 → 打印友好错误，不 raise（让 mcp_client 后续给一致报错）
-5. opt-out：HW_AUTOSTART_SANDBOX=false 跳过整个流程（保留手动控制权）
+5. opt-out：LAB_AUTOSTART_SANDBOX=false 跳过整个流程（保留手动控制权）
 6. 容器参数从 .env 读：AIO_SANDBOX_IMAGE / AIO_SANDBOX_PORT / AIO_SANDBOX_MCP_URL
 7. **workspace bind-mount**：宿主 WORKSPACE_DIR → 容器 /workspace（让 sandbox_convert_to_markdown 等
    能直接读 PDF/DOCX）；老容器若没有此挂载会打印一次性迁移提示
@@ -152,7 +152,7 @@ def _docker_run(image: str, port: int, host_workspace: Path, log=print) -> bool:
 
 def ensure_sandbox(log=print) -> bool:
     """检测并按需拉起 sandbox 容器；返回端口最终是否通。"""
-    if os.getenv("HW_AUTOSTART_SANDBOX", "true").lower() in {"false", "0", "no"}:
+    if os.getenv("LAB_AUTOSTART_SANDBOX", "true").lower() in {"false", "0", "no"}:
         return True  # 用户禁用了自动启动；交给 mcp_client 探活报错
 
     url = os.getenv("AIO_SANDBOX_MCP_URL", "http://127.0.0.1:8080/mcp")
@@ -235,8 +235,8 @@ def recreate_sandbox(log=print) -> bool:
     用途：`/done --clear` 不仅清宿主 workspace，也清容器内的 pip 全局包 / /tmp /
     长跑进程残留，让下次任务从干净容器开始。
     """
-    if os.getenv("HW_AUTOSTART_SANDBOX", "true").lower() in {"false", "0", "no"}:
-        log("[sandbox] HW_AUTOSTART_SANDBOX=false，跳过重建（请手动 docker rm 后重启 cli）")
+    if os.getenv("LAB_AUTOSTART_SANDBOX", "true").lower() in {"false", "0", "no"}:
+        log("[sandbox] LAB_AUTOSTART_SANDBOX=false，跳过重建（请手动 docker rm 后重启 cli）")
         return True
     if not _docker_available():
         log("[sandbox] 未检测到 docker，跳过重建")
