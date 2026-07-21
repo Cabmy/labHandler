@@ -26,7 +26,7 @@ SUMMARY_PATH = WORKSPACE_DIR / "SUMMARY.md"
 
 
 def _list_artifacts_from_workspace() -> list[str]:
-    """workspace 当前可见的"用户产物"（排除 .hwhandler 内部 + __pycache__ + 自己写的 SUMMARY.md）"""
+    """workspace 当前可见的"用户产物"（排除 .labhandler 内部 + __pycache__ + 自己写的 SUMMARY.md）"""
     out: list[str] = []
     for p in sorted(WORKSPACE_DIR.rglob("*")):
         if not p.is_file():

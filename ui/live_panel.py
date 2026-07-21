@@ -2,7 +2,7 @@
 
 将 LangGraph 主图执行过程中的节点事件、LLM 输出与工具调用按时间顺序流式呈现。
 完整消息与工具历史由 compile_node 落盘至
-workspace/.hwhandler/runs/<ts>/transcript.jsonl + tool_history.jsonl。
+workspace/.labhandler/runs/<ts>/transcript.jsonl + tool_history.jsonl。
 
 输出格式（逐行追加，无边框、无重绘）：
 
@@ -133,7 +133,7 @@ async def stream_graph(graph: Any, state: dict[str, Any], recursion_limit: int =
     所有 LLM（含 Coder 内部的 create_react_agent）。
     """
     final_state: dict[str, Any] = dict(state)
-    console.print(f"[bold cyan]hwHandler[/] start ··· question = {state.get('question','')!r}")
+    console.print(f"[bold cyan]labHandler[/] start ··· question = {state.get('question','')!r}")
     t0 = time.time()
 
     last_node: str | None = None
@@ -284,7 +284,7 @@ async def stream_graph(graph: Any, state: dict[str, Any], recursion_limit: int =
     elapsed = time.time() - t0
     console.print(
         f"[dim]elapsed: {elapsed:.1f}s · 日志见 "
-        f"workspace/.hwhandler/runs/<latest>/[/]"
+        f"workspace/.labhandler/runs/<latest>/[/]"
     )
     return final_state
 
@@ -327,7 +327,7 @@ def print_completion_panel(state: dict[str, Any]) -> None:
         if sf:
             body.append(f"\n建议：{sf}\n", style="yellow")
 
-    console.print(Panel(body, title="hwHandler", border_style="green" if not partial else "yellow"))
+    console.print(Panel(body, title="labHandler", border_style="green" if not partial else "yellow"))
 
 
 def print_crash_panel(exc: BaseException, crash_log_path: Path) -> None:
@@ -335,4 +335,4 @@ def print_crash_panel(exc: BaseException, crash_log_path: Path) -> None:
     body.append("❌ 主图异常退出\n", style="bold red")
     body.append(f"{type(exc).__name__}: {exc}\n", style="red")
     body.append(f"\nCRASH 详情：{crash_log_path}\n", style="dim")
-    console.print(Panel(body, title="hwHandler crash", border_style="red"))
+    console.print(Panel(body, title="labHandler crash", border_style="red"))

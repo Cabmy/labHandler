@@ -6,7 +6,7 @@ import chromadb
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./.hwhandler_data/chroma")
+CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./.labhandler_data/chroma")
 CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "task_archive_glm_embedding_3")
 
 

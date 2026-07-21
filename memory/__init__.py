@@ -1,4 +1,4 @@
-"""hwHandler memory 模块入口。"""
+"""labHandler memory 模块入口。"""
 
 from .archive import TaskArchive, get_task_archive
 from .profile import (

@@ -1,4 +1,4 @@
-"""hwHandler agents 模块入口"""
+"""labHandler agents 模块入口"""
 
 from .coder import build_coder_agent, run_coder_step
 from .intake import run_intake

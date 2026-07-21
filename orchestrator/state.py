@@ -16,7 +16,7 @@ from typing import Annotated, Any, TypedDict
 
 
 class HwState(TypedDict, total=False):
-    """hwHandler 主图共享状态"""
+    """labHandler 主图共享状态"""
 
     # ─── 基础字段（沿用自 deep_search ResearchState） ────────
     question: str                             # 用户当前请求
