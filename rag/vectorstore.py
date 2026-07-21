@@ -20,9 +20,9 @@ class VectorStore:
 
     @property
     def vectorstore(self) -> Chroma:
-        """懒加载 vectorstore（embeddings 也延迟 import，避免 P1.1 阶段 llm 模块未建时 import 报错）"""
+        """懒加载 vectorstore（embeddings 延迟 import，避免模块初始化时序问题）"""
         if self._vectorstore is None:
-            from llm import get_embeddings  # 延迟 import：P1.2 建 llm/ 包后此处自动通
+            from llm import get_embeddings
             self._vectorstore = Chroma(
                 collection_name=self.collection_name,
                 embedding_function=get_embeddings(),
@@ -52,15 +52,3 @@ class VectorStore:
         except Exception:
             pass  # Collection 不存在
         self._vectorstore = None
-
-
-# 全局单例
-_default_store: Optional[VectorStore] = None
-
-
-def get_vectorstore() -> VectorStore:
-    """获取全局 VectorStore 实例"""
-    global _default_store
-    if _default_store is None:
-        _default_store = VectorStore()
-    return _default_store

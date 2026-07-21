@@ -1,14 +1,9 @@
-"""MCP Client - MultiServerMCPClient 封装
+"""MCP 客户端构建与访问入口。
 
-设计要点（PLAN §6.1 / STEPS P2.3）：
-1. **当前只注册 aio_sandbox 一个 MCP server**：AIO Sandbox 容器自带 33 个 tools
-   （browser_* + sandbox_convert_to_markdown 已是 fetch MCP 的超集；fetch MCP 已裁掉，
-    见 PLAN §6.1 决策记录）
-2. transport 用 streamable_http
-3. URL 默认 127.0.0.1（避免 IPv6 解析失败）
-4. HTTP header 必须带 `Accept: application/json, text/event-stream`（Phase 0 P0.5 实测）
-5. **运行时降级**：build 时探活 server URL（TCP connect 1s 超时）；连不通的剔除并告警。
-   单 server 时 alive 为空会直接 RuntimeError 提醒起容器。
+负责：
+1. 维护 AIO Sandbox MCP 服务的连接配置；
+2. 在构建客户端前执行可达性探测并剔除不可用服务；
+3. 以模块级单例对外提供客户端与工具列表访问。
 """
 
 from __future__ import annotations
@@ -23,7 +18,7 @@ AIO_SANDBOX_MCP_URL = os.getenv("AIO_SANDBOX_MCP_URL", "http://127.0.0.1:8080/mc
 
 
 def _probe(url: str, timeout: float = 1.0) -> bool:
-    """TCP connect 探活；通就 True"""
+    """基于 TCP 连接检测目标 URL 对应端口是否可达。"""
     try:
         u = urlparse(url)
         host = u.hostname or "127.0.0.1"
@@ -35,7 +30,7 @@ def _probe(url: str, timeout: float = 1.0) -> bool:
 
 
 def build_mcp_client() -> Any:
-    """构建 MultiServerMCPClient（懒 import + 探活降级）"""
+    """构建 MultiServerMCPClient，并过滤不可达的 MCP 服务。"""
     from langchain_mcp_adapters.client import MultiServerMCPClient
 
     candidates: dict[str, dict[str, Any]] = {
@@ -66,7 +61,7 @@ def build_mcp_client() -> Any:
     return MultiServerMCPClient(alive)
 
 
-# 全局单例
+# 模块级单例缓存
 _default_client: Optional[Any] = None
 
 
@@ -78,12 +73,12 @@ def get_mcp_client() -> Any:
 
 
 async def get_tools() -> list[Any]:
-    """异步获取所有 MCP tools（已归一为 LangChain Tool）"""
+    """异步获取所有 MCP 工具（LangChain Tool 形态）。"""
     client = get_mcp_client()
     return await client.get_tools()
 
 
 def reset_mcp_client() -> None:
-    """重置单例（探活拓扑变了想重 build 时调用）"""
+    """重置模块级客户端缓存，供连接拓扑变化后重建使用。"""
     global _default_client
     _default_client = None

@@ -9,7 +9,7 @@
 state 管理（用户决策：单进程单任务）：
 - 整个进程共享一份 HwState；每条 user 输入累加到 messages / user_constraints
 - 第二次起的 REPL 输入由 graph 入口路由直接进 planner（复用 prior intake_result + verifier_runs 做修订）
-- /done：archive_task → workspace 内容 mv .trash/<ts>/ → 重建 sandbox 容器 → 退出 REPL（结束进程）
+- /done：归档经验卡片 → workspace 内容 mv .trash/<ts>/ → 重建 sandbox 容器 → 退出 REPL（结束进程）
 
 命令清单：/help /quit /done /show /show summary /skills /profile /remember
 """
@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import shutil
 import sys
@@ -28,15 +27,17 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from config.runtime import get_settings
 
-# .env 集中管理在 config/ 目录（任务 3 重构）；显式指定路径，
+# .env 集中管理在 config/ 目录；显式指定路径，
 # 这样从任何 cwd 启动 cli.py 都能读到（不再依赖 cwd == 项目根）。
 load_dotenv(Path(__file__).resolve().parent / "config" / ".env")
 
 from rich.console import Console  # noqa: E402
 from rich.prompt import Prompt  # noqa: E402
 
-WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
+SETTINGS = get_settings()
+WORKSPACE_DIR: Path = SETTINGS.workspace_dir
 META_DIR: Path = WORKSPACE_DIR / ".hwhandler"
 TRASH_DIR: Path = WORKSPACE_DIR.parent / ".trash"
 
@@ -61,12 +62,9 @@ def _clean_input(s: str) -> str:
     return _INVISIBLE_RE.sub("", s).strip()
 
 
-# ─── REPL 持久 event loop（修 Ctrl-C 后回调对死循环狂打的问题）───────
+# ─── REPL 持久 event loop───────
 #
-# 原方案：每次 _run_task 用 asyncio.run(...) 新建 loop，但 ChatOpenAI 是
-# llm/provider.py 模块级单例，httpx 流式连接 + LangChain 回调线程持着旧 loop
-# 引用；旧 loop 关闭后回调还在派发 → "Event loop is closed" 刷屏。
-# 改为整个 REPL session 共用一个 loop：Ctrl-C 只取消当前 task，loop 不关，
+# 整个 REPL session 共用一个 loop：Ctrl-C 只取消当前 task，loop 不关，
 # 缓存的 LLM 客户端继续在同一 loop 上工作，下一个任务接着用。
 _REPL_LOOP: asyncio.AbstractEventLoop | None = None
 
@@ -122,7 +120,7 @@ def _new_state(question: str = "") -> dict[str, Any]:
 def _append_user_message(state: dict[str, Any], text: str) -> None:
     state.setdefault("messages", []).append({"role": "user", "content": text})
     state["question"] = text  # 当前请求始终是最新 user 输入
-    # Fix 3：每条 REPL 输入都累加到 user_constraints，让 Verifier 阶段 2 能比对到。
+    # 每条 REPL 输入都累加到 user_constraints，让 Verifier 阶段 2 能比对到。
     # HwState.user_constraints 用 Annotated[list[str], add]（state.py:39），多轮自动累加；
     # 重复约束在 Verifier 语义判官那一步会被 LLM 自然 dedup。
     state.setdefault("user_constraints", []).append(text)
@@ -171,13 +169,16 @@ def _cmd_show(state: dict[str, Any], args: list[str]) -> None:
 
 
 def _cmd_skills() -> None:
-    skills_dir = Path(os.getenv("SKILLS_DIR", "./skills")).resolve()
-    files = sorted(skills_dir.glob("*.md"))
-    if not files:
+    from skills.repository import list_skill_documents
+
+    skills = list_skill_documents()
+    if not skills:
         console.print("[yellow](skills/ 为空)[/]")
         return
-    for f in files:
-        console.print(f"  • [cyan]{f.stem}[/]  ({f.relative_to(WORKSPACE_DIR.parent)})")
+    skills_dir = SETTINGS.skills_dir
+    for s in skills:
+        path = (skills_dir / s.get("file_name", f"{s['name']}.md")).resolve()
+        console.print(f"  • [cyan]{s['name']}[/]  ({path.relative_to(WORKSPACE_DIR.parent)})")
 
 
 def _cmd_profile() -> None:
@@ -217,29 +218,34 @@ def _cmd_remember(rule: str) -> None:
 def _cmd_done(state: dict[str, Any]) -> None:
     """归档 → workspace 清场 → 重建 sandbox。调用方应在调完后退出 REPL。
 
-    summary / lessons 直接来自 state（Summarizer 双轨产出），不再从 SUMMARY.md
-    字符串中抽 "## 6. 教训与心得" 章节。
+    归档流程：memory.archive.create_task → create_cards → rag.archive_retriever.index_cards
     """
-    from memory import archive_task
+    from memory.archive import get_task_archive
+    from rag.archive_retriever import index_cards
 
     intake = state.get("intake_result") or {}
     title = intake.get("title") or state.get("question") or "未命名任务"
     ttype = intake.get("type") or "other"
-
     summary_text = state.get("summary") or ""
-    lessons = state.get("lessons") or ""
+    knowledge_cards = state.get("knowledge_cards") or []
 
     try:
-        rid = archive_task(
-            task_title=title,
-            task_type=ttype,
-            summary=summary_text[:4000],
-            lessons=lessons[:2000],
-            workspace_snapshot=summary_text,  # 用户决策：存 SUMMARY 全文
-        )
-        console.print(f"[green]✓ archive_task 写入 row_id={rid}[/]")
+        archive = get_task_archive()
+        task_id = archive.create_task(title, ttype, summary_text[:4000])
+        card_ids = archive.create_cards(task_id, knowledge_cards, title, ttype)
+        console.print(f"[green]✓ task_id={task_id}, card_ids={card_ids}[/]")
+
+        if card_ids:
+            result = index_cards(card_ids)
+            indexed = result.get("indexed", 0)
+            failed = result.get("failed", 0)
+            if failed:
+                console.print(f"[yellow]Chroma 索引失败 {failed}/{len(card_ids)} 张卡片: {result.get('errors', [])}[/]")
+            console.print(f"[green]✓ 卡片索引完成：{indexed} 成功, {failed} 失败[/]")
+        else:
+            console.print("[yellow]无有效知识卡片（跳过索引）[/]")
     except Exception as e:
-        console.print(f"[red]archive_task 失败：{type(e).__name__}: {e}[/]")
+        console.print(f"[red]归档失败：{type(e).__name__}: {e}[/]")
 
     # workspace 内容 mv 到 .trash/<ts>
     ts = time.strftime("%Y%m%d_%H%M%S")

@@ -49,9 +49,17 @@ def _entry_router(state: HwState) -> Literal["intake", "planner"]:
 def step_router(state: HwState) -> Literal["next", "done"]:
     """coder_step 完成后的条件路由（Plan-and-Execute Lite）：
 
-    - "next" → 还有未做的 step（current_step_idx < len(nodes)），回到 coder_step
-    - "done" → 全部 step 跑完，进 verifier
+    - "done" → 上一步执行有 error（依赖检查失败/执行异常等），
+               跳过剩余 step 直接进 verifier；或全部 step 已跑完
+    - "next" → 还有未做的 step 且上一步无 error，回到 coder_step
     """
+    # 上一步有 error 则短路进 verifier，不让下游 step 在空中楼阁上浪费 LLM 调用
+    step_outputs = state.get("step_outputs") or []
+    if step_outputs:
+        last = step_outputs[-1]
+        if last.get("error"):
+            return "done"
+
     nodes = (state.get("task_dag") or {}).get("nodes") or []
     idx = int(state.get("current_step_idx", 0))
     return "next" if idx < len(nodes) else "done"

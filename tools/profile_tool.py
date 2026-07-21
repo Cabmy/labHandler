@@ -1,6 +1,6 @@
 """profile_tool - 读 / 改 profile/me.yaml
 
-PLAN §13 / Phase 7.2 自修改用。
+面向运行时 profile 读取与更新的工具集合。
 """
 
 from __future__ import annotations

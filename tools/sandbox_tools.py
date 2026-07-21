@@ -1,12 +1,9 @@
 """sandbox_tools - AIO Sandbox MCP 包装
 
-**抽象层目的（PLAN §14）**：
-1. agent 代码通过本模块的 6 个函数调沙箱，未来切 CubeSandbox/E2B 时只换实现层
-2. 当前实现走 langchain-mcp-adapters 拿 MCP tool 后调用
-3. **当前阶段不实连**：函数体都用懒加载 + 异步包装，import 不报错；
-   真实跑要在 Phase 4 Coder（容器已起）时才会发生
+抽象层：agent 通过本模块的 6 个函数调沙箱，未来切 CubeSandbox/E2B 时只换实现层。
+当前实现走 langchain-mcp-adapters 拿 MCP tool 后调用。
 
-实测工具名（Phase 0 P0.4，AIO Sandbox 33 tools 子集）：
+工具名：
 - sandbox_execute_code
 - sandbox_execute_bash
 - sandbox_file_operations
@@ -14,19 +11,20 @@
 - sandbox_convert_to_markdown
 - sandbox_get_packages
 
-**路径约定**（Fix 2B）：
-- 宿主 WORKSPACE_DIR 通过 `-v` 挂载到容器 /workspace（见 infra/sandbox_boot.py）
-- agent 给 sandbox 工具的 path / file_path 形参可以是宿主绝对路径，本模块自动翻译为 /workspace/<rel>
+路径约定：
+- 宿主 WORKSPACE_DIR 通过 -v 挂载到容器 /workspace（见 infra/sandbox_boot.py）
+- agent 传入宿主绝对路径时，本模块自动翻译为 /workspace/<rel>
 - 已经是 /workspace/... 或相对路径或非 workspace 下的绝对路径 → 原样转发
 """
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
 
-# 工具名常量（Phase 0 实测；如沙箱版本变化需要在这里调）
+# 工具名常量（与 MCP server 对齐；沙箱版本变化时在此更新）
 SANDBOX_TOOL_NAMES = [
     "sandbox_execute_code",
     "sandbox_execute_bash",
@@ -53,16 +51,15 @@ def _translate_path(p: str) -> str:
     """
     if not p or not isinstance(p, str):
         return p
-    # 已是容器路径
     if p.startswith(_SANDBOX_WORKSPACE):
         return p
-    # 非绝对路径（agent 用相对路径时也常发生）→ 不翻译
+    # 相对路径不翻译
     if not p.startswith("/"):
         return p
     try:
         host_ws = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
         target = Path(p).resolve()
-        # 仅当 path 在 host_ws 内时翻译；is_relative_to 在 py3.9+ 可用
+        # 仅 workspace 内路径翻译
         try:
             rel = target.relative_to(host_ws)
         except ValueError:
@@ -88,13 +85,72 @@ async def _load_sandbox_tools() -> dict[str, Any]:
 _PATH_KW = {"path", "file_path"}  # 沙箱工具中代表"文件路径"的形参名
 
 
-def _wrap_tool_with_path_translation(orig_tool: Any) -> Any:
-    """构造一个新 StructuredTool，调用前对 path / file_path 形参跑 _translate_path。
+# sandbox_execute_code Jupyter kernel ack-only 提示
+_ACK_ONLY_HINT = (
+    "\n\n[hwhandler] ack-only: Jupyter kernel 异步派发 ack"
+    "（stdout/stderr/exit_code 均 null），代码可能尚未执行完毕。"
+    "如需同步获取结果，改用 sandbox_execute_bash 执行命令。"
+)
 
-    为什么要构造新 tool 而不是改原 tool：langchain-mcp-adapters 给的 BaseTool 是 Pydantic v2
-    BaseModel，不允许给非 field 赋值（如 `tool.ainvoke = ...` 会 ValueError）。所以我们用
-    工厂法新建一个 StructuredTool，name/description/args_schema 复用原 tool（让 LLM 看到的
-    schema 不变），coroutine 实现里翻译完 path 再转发到原 tool 的 ainvoke。
+
+def _annotate_ack_only_if_needed(result: Any) -> Any:
+    """检测 sandbox_execute_code 返回是否为 Jupyter kernel ack-only 响应。
+
+    ack-only 形态：status=ok 且 stdout/stderr/exit_code 均为 null。
+    命中时在 text 块末尾追加提示，引导 LLM 切换至同步执行工具。
+    """
+    try:
+        if not isinstance(result, list) or not result:
+            return result
+        new_list: list[Any] = []
+        modified = False
+        for item in result:
+            new_item = item
+            if isinstance(item, dict) and item.get("type") == "text":
+                txt = item.get("text") or ""
+                if isinstance(txt, str) and txt:
+                    try:
+                        payload = json.loads(txt)
+                    except Exception:
+                        payload = None
+                    if (
+                        isinstance(payload, dict)
+                        and payload.get("status") == "ok"
+                        and payload.get("stdout") is None
+                        and payload.get("stderr") is None
+                        and payload.get("exit_code") is None
+                    ):
+                        new_item = dict(item)
+                        new_item["text"] = txt + _ACK_ONLY_HINT
+                        modified = True
+            new_list.append(new_item)
+        return new_list if modified else result
+    except Exception:
+        return result
+
+
+# ─── 沙箱连续失败检测 ──────────────────────────────────────────────
+
+_SANDBOX_MAX_FAILURES = 3
+"""沙箱工具连续失败阈值。超过此阈值后工具返回 `[SANDBOX_UNREACHABLE]` 致命标记，
+Coder 节点检测到此标记后终止当前 step 的 ReAct 循环，不再继续重试。"""
+
+_sandbox_failures: dict[str, int] = {}
+"""tool_name → 当前连续失败次数（每步开始前由 reset_sandbox_failure_counter() 清空）。"""
+
+
+def reset_sandbox_failure_counter() -> None:
+    """每步开始前调用，重置所有沙箱工具的连续失败计数。"""
+    _sandbox_failures.clear()
+
+
+def _wrap_tool_with_path_translation(orig_tool: Any) -> Any:
+    """构造 StructuredTool，调用前对 path/file_path 形参执行 _translate_path。
+
+    不直接修改原 tool 的原因：langchain-mcp-adapters 返回的 BaseTool 基于
+    Pydantic v2 BaseModel，不允许对非 field 赋值。因此通过工厂法新建
+    StructuredTool，复用原 tool 的 name/description/args_schema，
+    coroutine 中完成路径翻译后转发至原 tool 的 ainvoke。
     """
     from langchain_core.tools import StructuredTool
 
@@ -103,13 +159,24 @@ def _wrap_tool_with_path_translation(orig_tool: Any) -> Any:
             if k in _PATH_KW and isinstance(kwargs[k], str):
                 kwargs[k] = _translate_path(kwargs[k])
         try:
-            return await orig_tool.ainvoke(kwargs)
+            result = await orig_tool.ainvoke(kwargs)
         except Exception as e:
-            # 单次工具失败不爆 Coder 节点：把错误当 Observation 回灌，让 ReAct 的
-            # LLM 看到错误并自适应（换工具 / 换站点 / 跳过）。`[tool_error]` 前缀
-            # 让 LLM 一眼识别。覆盖范围：33 个 sandbox MCP 工具的偶发失败
-            # （browser_* ERR_CONNECTION_REFUSED / execute_code timeout / 等）。
+            tool_name = orig_tool.name
+            _sandbox_failures[tool_name] = _sandbox_failures.get(tool_name, 0) + 1
+            count = _sandbox_failures[tool_name]
+            if count >= _SANDBOX_MAX_FAILURES:
+                return (
+                    f"[SANDBOX_UNREACHABLE] 沙箱工具 {tool_name} 连续 {count} 次失败"
+                    f"（{type(e).__name__}: {e}），沙箱可能已不可用，终止当前 step"
+                )
             return f"[tool_error] {type(e).__name__}: {e}"
+        # 成功后重置计数器
+        _sandbox_failures[orig_tool.name] = 0
+        # sandbox_execute_code 走 Jupyter kernel 异步派发，可能仅返回 ack。
+        # 命中时追加提示，引导 LLM 切换至同步执行工具。
+        if orig_tool.name == "sandbox_execute_code":
+            result = _annotate_ack_only_if_needed(result)
+        return result
 
     return StructuredTool(
         name=orig_tool.name,
@@ -127,47 +194,43 @@ async def _call(tool_name: str, **kwargs: Any) -> Any:
             f"沙箱工具 {tool_name} 未在 MCP server 暴露的工具列表里"
             f"（已知：{list(tools.keys())[:5]}...）"
         )
-    # 翻译 path 形参（与 agent 走 react 的 wrap 逻辑保持一致）
+    # 翻译 path 形参（与 _wrap_tool_with_path_translation 逻辑一致）
     for k in list(kwargs.keys()):
         if k in _PATH_KW and isinstance(kwargs[k], str):
             kwargs[k] = _translate_path(kwargs[k])
     return await tools[tool_name].ainvoke(kwargs)
 
 
-# ─── 6 个抽象接口（Phase 4 Coder 主调） ───────────────────────────
+# ─── 6 个抽象接口（供 Coder 节点主流程调用） ───────────────────────────
 
 
 async def sandbox_execute_code(code: str, language: str = "python") -> str:
-    """在沙箱内执行代码片段。返回 stdout/stderr 合并文本。"""
+    """在沙箱内执行代码片段，返回 stdout/stderr 合并文本。"""
     return await _call("sandbox_execute_code", code=code, language=language)
 
 
 async def sandbox_execute_bash(cmd: str) -> str:
-    """在沙箱内执行 bash 命令（如 pytest / pip install）。"""
+    """在沙箱内执行 bash 命令。"""
     return await _call("sandbox_execute_bash", cmd=cmd)
 
 
 async def sandbox_file_operations(action: str, path: str, **kwargs: Any) -> Any:
-    """沙箱内文件操作（read / write / mkdir / delete 等，具体动作看 MCP schema）。"""
+    """沙箱内文件操作（read/write/mkdir/delete 等，具体动作见 MCP schema）。"""
     return await _call("sandbox_file_operations", action=action, path=path, **kwargs)
 
 
 async def sandbox_str_replace_editor(
     command: str, path: str, **kwargs: Any
 ) -> Any:
-    """沙箱内字符串替换编辑器（精确改代码用）。"""
+    """沙箱内字符串替换编辑器。"""
     return await _call("sandbox_str_replace_editor", command=command, path=path, **kwargs)
 
 
 async def sandbox_convert_to_markdown(file_path: str) -> str:
-    """把沙箱内 PDF/DOCX/PPT 解析为 markdown。Intake 节点解析作业指导用。
+    """将沙箱内 PDF/DOCX/PPT 解析为 markdown，供 Intake 节点解析作业指导。
 
-    MCP 工具 schema 要求参数名是 `uri`（且需要 file:/http:/https:/data: URI 形态）。
-    形参名保留 file_path 是为了向后兼容（Intake 直调 sandbox_convert_to_markdown(host_path) 不变）。
-    内部翻译：host 路径 → /workspace/<rel>（_translate_path）→ 加 file:// 前缀 → uri= 传 MCP。
-
-    返回值：MCP server 实际返回 content 数组形如 [{'type':'text','text':'...'}]；
-    本函数把所有 text 拼成一个 str 返回，方便上层（Intake）直接喂给 LLM。
+    形参名保留 file_path 以兼容既有调用方；内部翻译为容器路径并加 file:// 前缀，
+    以 uri= 传入 MCP 工具。返回值将 MCP content 数组中所有 text 拼合为单个字符串。
     """
     container_path = _translate_path(file_path)
     if not container_path.startswith(("file://", "http://", "https://", "data:")):
@@ -182,16 +245,16 @@ async def sandbox_convert_to_markdown(file_path: str) -> str:
 
 
 async def sandbox_get_packages() -> list[str]:
-    """列沙箱内已装 python 包（version 信息可能在 stdout 文本里）。"""
+    """列出沙箱内已安装的 Python 包。"""
     return await _call("sandbox_get_packages")
 
 
-# Phase 4 ReAct 循环希望直接 bind_tools 时拿到 LangChain Tool
-# 所以提供一个 async helper 返回 raw tool 列表
+# ReAct 循环通过 bind_tools 需要 LangChain Tool 实例，
+# 此接口返回已包装路径翻译的 tool 列表。
 async def get_sandbox_tools() -> list[Any]:
-    """返回 AIO Sandbox 暴露的所有 MCP tools（已归一为 LangChain Tool）。
+    """返回 AIO Sandbox 暴露的所有 MCP tools（已包装为 LangChain Tool）。
 
-    每个工具被包了一层 path 翻译：宿主 workspace 路径 → /workspace/...
+    每个工具包含路径翻译层：宿主 workspace 路径 → /workspace/...
     """
     tools = await _load_sandbox_tools()
     return [_wrap_tool_with_path_translation(t) for t in tools.values()]

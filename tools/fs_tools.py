@@ -1,45 +1,46 @@
-"""fs_tools - host workspace 文件操作 + host_bash
+"""fs_tools - 负责宿主机工作空间 (Workspace) 的文件操作与受限命令执行。
 
-**安全边界（PLAN §14 / STEPS P3.1）**：
-1. 所有路径入参先 `_safe_path(p)` 解析 + `is_relative_to(WORKSPACE_DIR)` 校验
-2. host_bash 用 `subprocess.run(["bash","-c",cmd], cwd=WORKSPACE_DIR, timeout=30)`
-3. host_bash 命令字符串 regex 黑名单：
-   - 含 `..` token（`/^|\s\.\.[/\\\s]` 形式）→ 拒
-   - 含 `~` 展开 → 拒
-   - 含以 `/` 开头的可能绝对路径（如 `cat /etc/passwd`）→ 拒
-4. 越界**拒绝执行**（危险命令永不进 subprocess.run）+ 返回 `[ERROR/PermissionError] ...`
-   字符串，让 ReAct 在下一轮自我纠正。
-   注意：内部 helper `_safe_path` / `_check_cmd` **仍然 raise PermissionError**，
-   方便单元测试 / verifier 直调断言；只有 @tool 包装层把异常翻译成观测字符串
-   （langgraph 1.x 的 ToolNode 默认会把 Exception 重抛，不翻译，所以必须工具层自捕）。
+该模块提供了在宿主环境下安全操作作业文件的工具集，并通过严格的安全边界机制防止非预期的系统越权。
 
-**越权 4 用例（DoD）**：
-  外部（@tool 调用）       → 返回字符串，以 "[ERROR/PermissionError]" 起头
-  ① read_file("/etc/passwd")
-  ② read_file("../../etc/passwd")
-  ③ host_bash("cat /etc/passwd")
-  ④ host_bash("cd .. && ls")
+安全保障机制：
+1. 路径沙箱化：所有路径参数均通过 `_safe_path` 解析，强制要求必须位于 `WORKSPACE_DIR` 范围内。
+2. 命令白名单：`host_bash` 在执行前会进行命令名白名单校验和路径逃逸正则检查，只允许预定义的基础命令集，
+   并禁止包含 `..` 路径回溯、`~` 家目录展开及以 `/` 开头的绝对路径访问，确保命令执行被锁定在工作空间。
+3. 超时与权限隔离：所有 Bash 命令均在指定的工作目录中运行，并设有硬性超时限制（30秒）。
+4. 错误自纠正：当探测到越权操作时，工具层会拦截异常并返回结构化的错误提示，引导 LLM Agent 
+   自动切换为合法的相对路径或转移至沙箱环境执行。
 
-  内部 helper（直调）       → 仍 raise PermissionError
-  · _safe_path("/etc/passwd")
-  · _check_cmd("cat /etc/passwd")
+核心功能：
+- read_file / write_file / patch_file：对工作空间内的文件进行读、写及局部修补。
+- list_dir：查看工作空间目录结构。
+- host_bash：在宿主端执行安全的 shell 命令（如 pytest、代码扫描等）。
 """
 
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 from pathlib import Path
 
 from langchain_core.tools import tool
+from config.runtime import get_settings
 
-WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
+WORKSPACE_DIR: Path = get_settings().workspace_dir
 WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
-# host_bash 命令黑名单（regex）
-# 原则：粗粒度拒绝；越界靠 cwd=WORKSPACE_DIR 兜底，黑名单防止 cmd 字符串显式越界
-_BAD_CMD_PATTERNS = [
+# host_bash 命令白名单：只允许以下基础命令
+# 原则：白名单优先，命令名不在白名单中直接拒绝；
+# 路径逃逸模式作为第二道防线（cwd=WORKSPACE_DIR 是第三道）
+_ALLOWED_COMMANDS = frozenset({
+    'pytest', 'python', 'python3', 'ls', 'mkdir', 'rm', 'cp', 'mv',
+    'cat', 'echo', 'git', 'pip', 'pip3', 'conda', 'chmod', 'touch',
+    'head', 'tail', 'wc', 'sort', 'uniq', 'diff', 'which', 'type',
+    'docker', 'ln', 'find', 'grep', 'sed', 'awk', 'tree', 'env',
+    'python2', 'pypy', 'bash', 'sh',
+})
+
+# 路径逃逸防护（无论命令是否在白名单中，都检查逃逸模式）
+_ESCAPE_PATTERNS = [
     re.compile(r"(^|\s)\.\.([/\\\s]|$)"),   # 独立 .. token / ../ / ..\\ / ..<EOL>
     re.compile(r"(^|\s)/[a-zA-Z]"),         # 空白后跟 / 开头的绝对路径（cat /etc/x）
     re.compile(r"(^|\s|=)~/"),              # ~/path 家目录展开
@@ -62,20 +63,46 @@ def _safe_path(p: str) -> Path:
     return resolved
 
 
+def _extract_cmd_names(cmd: str) -> list[str]:
+    """从命令字符串中提取所有基础命令名（处理 | && || ; 链式调用）。"""
+    names: list[str] = []
+    for segment in re.split(r'\s*&&\s*|\s*\|\|\s*|\s*\|\s*|\s*;\s*', cmd):
+        segment = segment.strip()
+        if not segment:
+            continue
+        parts = segment.split()
+        if not parts:
+            continue
+        name = parts[0].lstrip('./')
+        if name:
+            names.append(name)
+    return names
+
+
 def _check_cmd(cmd: str) -> None:
-    """host_bash cmd 字符串 regex 黑名单预检"""
+    """host_bash cmd 字符串白名单预检 + 路径逃逸防护"""
     if not isinstance(cmd, str) or not cmd.strip():
         raise PermissionError(f"非法命令：{cmd!r}")
-    for pat in _BAD_CMD_PATTERNS:
+
+    cmd_names = _extract_cmd_names(cmd)
+    for name in cmd_names:
+        if name not in _ALLOWED_COMMANDS:
+            raise PermissionError(
+                f"host_bash 命令不在白名单中：{name!r}"
+                f"（允许的命令：{sorted(_ALLOWED_COMMANDS)}）"
+            )
+
+    for pat in _ESCAPE_PATTERNS:
         if pat.search(cmd):
             raise PermissionError(
-                f"host_bash 命令命中越界黑名单：{cmd!r}（pattern={pat.pattern}）"
+                f"host_bash 命令包含路径逃逸：{cmd!r}（pattern={pat.pattern}）"
             )
 
 
 # Coder 看到 [ERROR/PermissionError] 后的统一改写提示（作为 ToolMessage observation）
 _PERM_HINT = (
-    "host fs 工具只能在 WORKSPACE_DIR 内运行；host_bash 还禁用 ..、绝对路径前缀、~ 展开。"
+    "host fs 工具只能在 WORKSPACE_DIR 内运行；host_bash 仅允许白名单内命令（pytest、python、git 等），"
+    "且禁用 ..、绝对路径前缀、~ 展开。"
     "请改用相对路径（如 'solution.py' 而非 '/workspace/solution.py'，"
     "`pytest -q test_x.py` 而非 `cd /workspace && pytest`），"
     "或改用 sandbox_run_python / sandbox_file_operations 在容器内访问 /workspace/*。"
@@ -152,8 +179,8 @@ def patch_file(path: str, old: str, new: str) -> str:
 def host_bash(cmd: str, timeout: int = 30) -> str:
     """在宿主 workspace 目录下执行 bash 命令（cwd=WORKSPACE_DIR）。
 
-    安全约束：cmd 字符串预检黑名单（拒 ..、绝对路径前缀、~ 展开等）；
-    cwd 强制为 WORKSPACE_DIR；timeout 默认 30s。
+    安全约束：cmd 命令名白名单校验（只允许 pytest / python / git / ls 等预定义命令）；
+    路径逃逸正则检查（拒 ..、绝对路径前缀、~ 展开等）；cwd 强制为 WORKSPACE_DIR；timeout 默认 30s。
 
     用例：`pytest -v` / `ls -la` / `python solution.py`
     返回 stdout + stderr 合并文本；越界时**命令不会被执行**，返回

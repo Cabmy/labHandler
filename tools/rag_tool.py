@@ -1,45 +1,44 @@
-"""rag_tool - task_archive 检索 + RAG hybrid 检索包装
+"""rag_tool - 跨任务经验知识卡片检索。
 
-提供两个工具：
-- archive_search: 检索历史任务归档（task_archive 表 + Chroma 同 collection）
-- rag_search: 通用 hybrid 检索（vector + bm25 + RRF）
-
-Planner / Coder 节点首轮调 archive_search 召回历史经验拼 prompt。
+只暴露 archive_search（检索历史任务归档中沉淀的知识卡片），
+不暴露通用文档检索（rag_search 已移除）。
 """
 
 from __future__ import annotations
 
 from langchain_core.tools import tool
 
-
-@tool
-def archive_search(query: str, limit: int = 3) -> list[dict]:
-    """检索历史任务归档（task_archive）。返回 [{id, task_title, task_type, summary, lessons, ...}]。
-
-    Planner 接到新作业时用：召回相似历史作业的 lessons 拼 prompt。
-    """
-    from memory import search_archive
-
-    return search_archive(query, limit=limit)
+from rag.archive_retriever import search_cards
 
 
 @tool
-def rag_search(query: str, k: int = 5) -> list[dict]:
-    """RAG 混合检索（BM25 + Vector + RRF）。返回 [{content, source, chunk_id}] 列表。
+def archive_search(
+    query: str,
+    limit: int = 5,
+    card_types: list[str] | None = None,
+    task_type: str | None = None,
+) -> list[dict]:
+    """检索历史任务归档中沉淀的跨任务经验卡片。
 
-    用于检索通用知识库（PDF 实验指导、教材片段等）。
+    返回的卡片包含 lesson（教训）、strategy（策略）、pattern（模式）三种类型。
+    Planner 接到新作业时用：召回相似历史作业的经验辅助规划。
+
+    Args:
+        query: 检索查询（任务标题、约束、需求描述等）
+        limit: 返回卡片上限（默认 5）
+        card_types: 过滤卡片类型，如 ["lesson", "strategy"]
+        task_type: 过滤任务类型，如 "coding"
+
+    Returns:
+        知识卡片列表，每张卡片含 card_id / card_type / content / task_title / rrf_score
     """
-    from rag import hybrid_retrieve
-
-    docs = hybrid_retrieve(query, k=k)
-    return [
-        {
-            "content": d.page_content,
-            "source": d.metadata.get("source", ""),
-            "chunk_id": d.metadata.get("chunk_id", ""),
-        }
-        for d in docs
-    ]
+    result = search_cards(
+        query=query,
+        limit=limit,
+        card_types=card_types,
+        task_type=task_type,
+    )
+    return result.get("items", [])
 
 
-RAG_TOOLS = [archive_search, rag_search]
+RAG_TOOLS = [archive_search]

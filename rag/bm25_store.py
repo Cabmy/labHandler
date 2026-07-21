@@ -4,8 +4,6 @@
 注意：必须分词，否则 BM25 会退化成字符级匹配，中文语义完全失效。
 """
 
-from typing import Optional
-
 import jieba
 import numpy as np
 from langchain_core.documents import Document
@@ -50,12 +48,3 @@ class BM25Store:
         self._bm25 = None
 
 
-_default_store: Optional[BM25Store] = None
-
-
-def get_bm25_store() -> BM25Store:
-    """全局单例 BM25Store"""
-    global _default_store
-    if _default_store is None:
-        _default_store = BM25Store()
-    return _default_store

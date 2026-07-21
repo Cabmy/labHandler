@@ -17,8 +17,8 @@ from langchain_core.tools import tool
 warnings.filterwarnings("ignore")
 
 PROXY = os.getenv("PROXY") or None
-MAX_RETRIES = 2
-RETRY_DELAY = 3
+MAX_RETRIES = int(os.getenv("SEARCH_MAX_RETRIES", "2"))
+RETRY_DELAY = int(os.getenv("SEARCH_RETRY_DELAY", "3"))
 
 
 @tool

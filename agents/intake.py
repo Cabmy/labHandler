@@ -1,37 +1,46 @@
-"""Intake agent - 扫 workspace + 关键字定位实验指导 + LLM 抽结构化字段
+"""Intake agent - 负责作业环境的初始化扫描、指导文件识别及任务需求的结构化提取。
 
-输出 intake_result（HwState 子结构）：
+该节点作为系统的入口，通过多级策略解析作业背景，并将其转化为后续节点可理解的 intake_result。
+
+核心逻辑：
+1. 工作空间扫描：递归扫描 workspace 目录，识别潜在的指导文档（如 README、PDF 实验指导等）和支撑材料。
+2. 指导文件分类：
+   - 文本类：直接在宿主端读取内容（.md, .txt）。
+   - 复合文档类：通过 AIO Sandbox 异步转换为 Markdown 格式（.pdf, .docx, .pptx）。
+3. 结构化提取：利用 LLM 从汇总后的背景文本中提取任务标题、类型（Coding/Essay/Report）、必交付物及核心约束。
+4. 质量预警：若识别到的信号不足以构成有效任务，主动抛出 IntakeRejectError 引导用户补充材料。
+
+输出 intake_result 结构：
   {
-    "title":        str,       # 任务标题（"实现二分查找" 等）
-    "type":         str,       # coding / essay / lab_report / other
-    "deliverables": list[str], # 必交付物的文件名/类型（如 ["solution.py", "test_solution.py"]）
-    "constraints":  list[str], # 题面/作业要求里抽出的约束（"不许使用 numpy" 等）
-    "instruction_files": list[str],  # 实验指导文件路径列表
-    "support_files":     list[str],  # 其他参考文件
+    "title": str,              # 任务核心标题
+    "type": str,               # 任务分类（coding/essay/lab_report/other）
+    "deliverables": list[str], # 预期的产物文件列表
+    "constraints": list[str],  # 抽取的业务逻辑与环境约束
+    "instruction_files": list[str], # 识别出的指导文档路径
+    "support_files": list[str],     # 识别出的代码或支撑数据路径
   }
-
-设计要点（PLAN §8.1 / STEPS P4.1）：
-1. 关键字定位：README* / requirements* / 实验指导* / lab*.md|pdf|docx / instruction* 等
-2. PDF/DOCX 不在 host 端解（不装 PyMuPDF），交给 sandbox_convert_to_markdown（P4.3 Coder 调）
-3. LLM 兜底分类：把指导文件全文喂 LLM，输出 JSON
-4. type 枚举：coding / essay / lab_report / other（4 选 1）
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from rich.console import Console
 
 from llm import get_llm
 from orchestrator.state import HwState
-from config.prompts import INTAKE_SYSTEM, extract_result
+from config.prompts import build_intake_system, parse_result_json
+from config.runtime import get_settings
 
-WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
+WORKSPACE_DIR: Path = get_settings().workspace_dir
+
+# 节点内的终端提示（如 retry）—— 和 ui.live_panel 同款 rich Console，
+# 自然嵌入到主流 "🔎 intake" 归属行之下，不破坏紧凑展示
+_console = Console()
 
 # 实验指导关键字（按优先级降序；命中即视为指导文件）
 _INSTRUCTION_PATTERNS = [
@@ -57,7 +66,19 @@ class IntakeRejectError(Exception):
 
 
 def _scan_workspace() -> dict[str, list[Path]]:
-    """递归扫 workspace，按文件性质分类（忽略 .hwhandler / __pycache__）"""
+    """递归扫 workspace，按文件性质分类（忽略 .hwhandler / __pycache__）
+
+    Returns:
+        dict 包含三个键：
+        - "instruction": 匹配指导文件模式且为纯文本后缀(.md/.txt/.rst)的文件，
+          可直接在宿主端读取内容喂给 LLM
+        - "needs_parse": 匹配指导文件模式但为需解析后缀(.pdf/.docx/.pptx)的文件，
+          须走 sandbox 转换为 Markdown 后再使用
+        - "support": 其余所有文件（代码/数据/图片等），作为支撑材料
+
+        若未匹配到任何指导文件，兜底逻辑会将 support 中的文本/可解析文档
+        全部升级为 instruction 或 needs_parse（避免因命名不规范而漏识）。
+    """
     instruction_files: list[Path] = []
     support_files: list[Path] = []
     needs_parse: list[Path] = []  # PDF/DOCX 等需要 sandbox 解析的指导文件
@@ -146,25 +167,52 @@ def _parse_with_sandbox(files: list[Path], max_chars_per_file: int = 6000) -> st
 
 
 def _llm_extract(instructions_text: str) -> dict[str, Any]:
-    """LLM 抽 title/type/deliverables/constraints（带 CoT 双段输出 + 容错抽取）"""
+    """LLM 抽 title/type/deliverables/constraints（CoT 双段输出 + 1 次自修复 retry）
+
+    第一次 LLM 返回的 <result> JSON 若解析失败（常见原因：复述题面示例时漏转义内嵌
+    双引号），不立刻抛——给 LLM 看一眼错误信息让它"只修格式不改语义"再试一次。
+    再失败才向上抛 JSONDecodeError，由 run_intake 转 IntakeRejectError。
+    """
+    # 加载 skill 元数据，动态构建 system prompt
+    try:
+        from tools.skill_tool import list_skill_meta
+        skill_meta = list_skill_meta()
+    except Exception:
+        skill_meta = []
+    system_prompt = build_intake_system(skill_meta)
+
     llm = get_llm()
     prompt = f"作业说明文档：\n\n{instructions_text}\n\n请按 system prompt 要求输出 <thinking> + <result>。"
     resp = llm.invoke(
-        [SystemMessage(content=INTAKE_SYSTEM), HumanMessage(content=prompt)]
+        [SystemMessage(content=system_prompt), HumanMessage(content=prompt)]
     )
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
 
-    # 从 <result> 抽 JSON 段（剥 thinking + 兼容 markdown 包裹）
-    text = extract_result(content)
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        # 兜底：找首末大括号再试
-        l, r = text.find("{"), text.rfind("}")
-        if l >= 0 and r > l:
-            data = json.loads(text[l : r + 1])
-        else:
-            raise
+        data = parse_result_json(content)
+    except (json.JSONDecodeError, ValueError) as e:
+        # 告诉用户在做什么，避免终端静默 10+ 秒
+        err_brief = str(e).split("\n", 1)[0][:80]
+        _console.print(
+            f"  [yellow]⚠️ JSON 解析失败（{err_brief}），让 LLM 修一次格式…[/]"
+        )
+        fix_system = (
+            "你刚才输出的 <result> 段内 JSON 解析失败。请只修复格式错误（最常见是字符串值"
+            "里未转义的双引号 \" 或反斜杠 \\ 或换行），**保留原内容语义不变**，"
+            "重新按 system prompt 的 schema 完整输出 <thinking>...</thinking><result>{...}</result>。"
+        )
+        fix_user = (
+            f"上次输出（解析失败）：\n```\n{content}\n```\n\n"
+            f"json.loads 错误信息：{e}\n\n"
+            f"请只修格式（字符串内 \" / \\ / 换行须转义为 \\\" / \\\\ / \\n），"
+            f"重新输出完整的 <thinking> + <result>。"
+        )
+        resp2 = llm.invoke(
+            [SystemMessage(content=fix_system), HumanMessage(content=fix_user)]
+        )
+        content2 = resp2.content if isinstance(resp2.content, str) else str(resp2.content)
+        data = parse_result_json(content2)  # 再炸就让外层 IntakeRejectError 接住
+        _console.print("  [green]✓ 修复成功，继续 intake[/]")
 
     # 字段标准化 + 默认值
     return {

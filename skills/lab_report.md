@@ -1,17 +1,18 @@
 ---
 name: lab_report
 description: |
-  Lab Report 类作业 SOP：实验报告（含实验目的 / 原理 / 步骤 / 结果 / 分析 / 结论 6+ 章节）。
-  特征：含实验过程、可能含代码 / 数据 / 截图证据；中文优先；助教按章节齐 + 复现性评分。
-  Use this skill whenever the user mentions: 实验报告、Lab N、实验 N、网络安全实验、
-  操作系统实验、计算机网络实验、做实验、SEED Lab、容器实验、抓包分析、
-  or whenever workspace contains 实验指导.pdf / lab_*.md / lab_*.docx 类文档；
-  even if 用户没明说 "lab_report"。
-  Do NOT use for: 纯算法实现 + 单元测试（用 coding skill）；
-  纯论述 / 读后感 / 议论文（用 essay skill）。
+  实验报告类作业：含实验目的 / 原理 / 步骤 / 结果 / 分析 / 结论 6+ 章节结构。
+  特征：含实验过程（做实验），可能含代码片段 / 数据 / 截图证据；助教按章节齐全 + 复现性评分。
+  典型产物：实验报告文档（.md/.docx/.pdf）+ 可能的代码 / 数据文件。
 when_to_use: |
-  intake_result.type == "lab_report"，或 deliverables 含 lab_report.md / lab_report.docx
-  + 可能的代码 / 数据文件。Verifier 阶段 1 强制查必备章节齐。
+  以下任一成立时选用：
+  - 作业要求"写实验报告 / Lab N / 实验 N"，或明确要求提交含实验过程的报告
+  - 作业涉及网络安全实验、操作系统实验、计算机网络实验、SEED Lab、抓包分析等实验课程
+  - workspace 含"实验指导.pdf / lab_*.md / lab_*.docx"类文档
+  - deliverables 含实验报告 + 可能的代码 / 数据文件
+  排除：
+  - 纯算法实现 + 单元测试（无实验报告要求）→ coding
+  - 纯论述 / 读后感 / 议论文（无实验过程）→ essay
 ---
 
 # Lab Report Skill SOP

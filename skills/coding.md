@@ -1,15 +1,17 @@
 ---
 name: coding
 description: |
-  Coding 类作业 SOP：实现算法 / 数据结构 / 工程脚本，含可执行代码 + pytest 单元测试。
-  Use this skill whenever the user mentions: 实现、编写程序、写代码、通过测试、binary search、
-  排序算法、数据结构、leetcode-style 题目，or whenever workspace contains test_*.py / *.py
-  作业说明，even if they don't explicitly say "coding skill"。
-  Do NOT use for: 实验报告（用 lab_report skill）、议论文 / 读后感（用 essay skill）、
-  纯算法分析无需实现的论述题。
+  编程类作业：实现算法、数据结构、工程脚本，产出可执行代码 + pytest 单元测试。
+  典型产物：.py / .cpp / .java 源文件 + test_*.py 测试文件。
 when_to_use: |
-  intake_result.type == "coding"，或 deliverables 含 .py / .cpp / .java / .js / .ts 文件
-  + test_*.py。Planner 节点选 skill 时优先匹配；Coder 节点 _build_system_prompt 自动 inject。
+  以下任一成立时选用：
+  - 作业要求"实现 / 编写程序 / 写代码 / 编程"且需要可执行产物
+  - 作业含编程题（如 LeetCode 风格）、排序算法、数据结构等
+  - deliverables 包含源代码文件（.py/.cpp/.java/.js/.ts）或测试文件（test_*.py）
+  排除：
+  - 含实验过程 + 实验报告要求 → lab_report
+  - 纯论述 / 读后感 / 议论文 → essay
+  - 纯算法分析论述题（无需实现代码）→ essay 或 other
 ---
 
 # Coding Skill SOP
@@ -65,8 +67,12 @@ exit_code != 0 时不要直接结束；回 step 2 修代码 / 修测试，直到
 
 ## 5. 风格收尾（按 profile.coding_style）
 
-如 type_hints=true：函数参数 + 返回值都加 type hints
-docstring 按 profile.coding_style.docstring 选 none / short / numpy 风格
+- 如 type_hints=true：函数参数 + 返回值都加 type hints
+- docstring 按 profile.coding_style.docstring 选 none / short / numpy 风格
+- **编译型语言额外清理**（.cpp/.c/.java）：测试全过后调 sandbox_execute_bash 跑
+  `rm -f *.o *.obj *.class` 以及编译出的可执行文件（同名无后缀或 `-o` 指定的名字）。
+  compile 节点的产物清单（_ARTIFACT_EXTS 白名单）只收源码与测试，中间编译件留在
+  workspace 只会让用户审阅时困惑。
 
 ## 6. 写 SUMMARY 时的「思考过程」段落要求
 

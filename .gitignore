@@ -20,7 +20,8 @@ workspace/.hwhandler/
 workspace/
 .trash/
 
-# 内部设计文档
+# 内部设计
+tests/
 docs/
 
 # IDE
@@ -29,8 +30,9 @@ docs/
 *.swp
 .claude/
 CLAUDE.md
-WALKTHROUGH.md
 log.md
+.codex
+AGENTS.md
 
 # OS
 .DS_Store

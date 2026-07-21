@@ -1,26 +1,32 @@
-"""Compile 节点 - 二阶段执行的"落地与转发"层
+"""Compile 节点 - 负责任务执行后的产物固化、元数据记录与状态整理。
 
-设计要点（PLAN §15 / STEPS P5.3，用户决策"只写元数据 + 路由转发"）：
-1. Coder 已直接用 host fs_tools 写到 workspace/，本节点不做容器 download
-2. 写元数据：
-   - workspace/.hwhandler/progress_log.jsonl   ← state["progress_log"] 全量
-   - workspace/.hwhandler/tool_history.jsonl   ← messages 里所有 tool_calls + tool 回应
-3. 扫 workspace（排除 .hwhandler / __pycache__ / .pytest_cache）刷新 artifacts 列表
-4. 在 progress_log 追加一条 compile 记录；如属"部分完成"，标记 partial=true 让 Summarizer 体感到
+该节点在 Verifier 之后、Summarizer 之前运行，作为执行阶段到总结阶段的过渡层。它不直接操作
+业务代码，而是专注于管理任务执行产生的副作用（日志、工具轨迹）和同步物理文件状态。
+
+核心职责：
+1. 元数据落盘：把任务的进度 (progress_log)、工具历史 (tool_history)、完整对话流水
+   (transcript) 写入 workspace/.hwhandler/runs/<ts>/ 子目录，多轮跑不互相覆盖；
+   `.hwhandler/latest.txt` 始终指向最近一次 run 的 ts。tool_history 不再截断，
+   完整保留 args 与 content，方便事后回放和审计。
+2. 产物清单扫描：递归扫描 workspace 目录，识别并刷新 state 中的 artifacts 列表，自动
+   排除系统目录（如 .git, __pycache__）及临时缓存文件。
+3. 状态标记：若任务因达到最大重试次数而提前终止，本节点会标记 "partial=true"，
+   提示 Summarizer 生成针对"部分完成"任务的总结报告。
+4. 路由转发：作为主图流水线中的整理层，确保后续的总结节点拥有最完整、最准确的物理环境视图。
 """
 
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any
 
+from config.runtime import get_settings
 from orchestrator.replan import is_partial
 from orchestrator.state import HwState
 
-WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
+WORKSPACE_DIR: Path = get_settings().workspace_dir
 META_DIR_NAME = ".hwhandler"
 
 # 产物扫描排除项
@@ -35,6 +41,13 @@ def _meta_dir() -> Path:
     return d
 
 
+def _run_dir(ts: str) -> Path:
+    """本次 run 的日志目录：.hwhandler/runs/<ts>/，多轮跑互不覆盖"""
+    d = _meta_dir() / "runs" / ts
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> int:
     """覆盖式写 jsonl（单次 Compile 输出最终全量；多轮的累加由 LangGraph state 完成）"""
     with path.open("w", encoding="utf-8") as f:
@@ -44,7 +57,7 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> int:
 
 
 def _extract_tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """从 HwState.messages 提取 tool_call 调用与对应 tool 返回结果"""
+    """从 HwState.messages 提取 tool_call 调用与对应 tool 返回结果（content 不截断）"""
     out: list[dict[str, Any]] = []
     for m in messages or []:
         role = m.get("role")
@@ -67,7 +80,7 @@ def _extract_tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]
                     "kind": "result",
                     "tool_call_id": m.get("tool_call_id", ""),
                     "name": m.get("name", ""),
-                    "content_excerpt": (m.get("content") or "")[:500],
+                    "content": m.get("content") or "",   # 完整保留，jsonl 不在乎行长
                 }
             )
     return out
@@ -102,16 +115,22 @@ def run_compile(state: HwState) -> dict[str, Any]:
     """LangGraph 节点入口。
 
     职责：
-      - 把 progress_log / tool_history 持久化到 workspace/.hwhandler/
+      - 把 progress_log / tool_history / transcript 持久化到 workspace/.hwhandler/runs/<ts>/
       - 扫 workspace 把产物清单注入 state.artifacts
       - 在 progress_log 追加 compile 记录（含 partial 标记）
     """
-    meta = _meta_dir()
-    progress = list(state.get("progress_log") or [])
-    n_progress = _write_jsonl(meta / "progress_log.jsonl", progress)
+    ts = time.strftime("%Y%m%dT%H%M%S")
+    run_d = _run_dir(ts)
 
-    tool_history = _extract_tool_history(state.get("messages") or [])
-    n_tools = _write_jsonl(meta / "tool_history.jsonl", tool_history)
+    progress = list(state.get("progress_log") or [])
+    n_progress = _write_jsonl(run_d / "progress_log.jsonl", progress)
+
+    messages = list(state.get("messages") or [])
+    n_tools = _write_jsonl(run_d / "tool_history.jsonl", _extract_tool_history(messages))
+    n_msgs = _write_jsonl(run_d / "transcript.jsonl", messages)
+
+    # latest.txt：指向当前 run 的 ts，让 cli / 外部工具能找到最近的日志目录
+    (_meta_dir() / "latest.txt").write_text(ts, encoding="utf-8")
 
     scanned = _scan_artifacts()
     # 现存 state.artifacts 已是累加（Annotated[list, add]）；compile 只补"扫描快照"作 attribute 区分
@@ -123,8 +142,10 @@ def run_compile(state: HwState) -> dict[str, Any]:
 
     compile_log = {
         "node": "compile",
+        "run_ts": ts,
         "n_progress_written": n_progress,
         "n_tool_history": n_tools,
+        "n_transcript": n_msgs,
         "n_artifacts": len(snapshot_artifacts),
         "partial": partial,
     }

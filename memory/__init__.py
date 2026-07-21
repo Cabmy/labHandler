@@ -1,11 +1,6 @@
 """hwHandler memory 模块入口。"""
 
-from .archive import (
-    TaskArchive,
-    archive_task,
-    get_task_archive,
-    search_archive,
-)
+from .archive import TaskArchive, get_task_archive
 from .profile import (
     Profile,
     add_field,
@@ -17,9 +12,7 @@ from .profile import (
 
 __all__ = [
     "TaskArchive",
-    "archive_task",
     "get_task_archive",
-    "search_archive",
     "Profile",
     "get_profile",
     "load_profile",

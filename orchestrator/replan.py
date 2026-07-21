@@ -1,12 +1,11 @@
-"""Replan 路由 - Verifier 之后的条件分支
+"""Verifier 之后的重规划路由逻辑。
 
-设计要点（PLAN §15 / STEPS P5.2）：
-- Verifier 出 verdict 后调用 replan_router 判分支：
-  - "pass"     → "compile"（正常通过，进 Compile→Summarizer）
-  - "fail" 且 iteration < MAX_REPLAN_ITER → "planner"（重拆 DAG）
-  - "fail" 且 iteration ≥ MAX_REPLAN_ITER → "compile"（标"部分完成"，进 Summarizer）
+分支规则：
+- verdict == "pass"：进入 compile
+- verdict == "fail" 且 iteration < MAX_REPLAN_ITER：回到 planner
+- verdict == "fail" 且 iteration >= MAX_REPLAN_ITER：进入 compile（后续按部分完成处理）
 
-iteration 含义：当前已运行过的 Planner 次数（首次进 Planner 后变 1）。
+iteration 表示已执行的 planner 轮次，首次进入 planner 后记为 1。
 """
 
 from __future__ import annotations
@@ -20,10 +19,10 @@ MAX_REPLAN_ITER = int(os.getenv("MAX_REPLAN_ITER", "2"))
 
 
 def replan_router(state: HwState) -> Literal["planner", "compile"]:
-    """LangGraph conditional_edges 用的路由函数。"""
+    """用于 LangGraph conditional_edges 的路由函数。"""
     runs = state.get("verifier_runs") or []
     if not runs:
-        # 罕见：没跑过 Verifier 就到这——保守走 compile 收尾
+        # 异常状态：缺少 verifier 结果时直接收敛到 compile。
         return "compile"
 
     verdict = runs[-1].get("verdict", "fail")

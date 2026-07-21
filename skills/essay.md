@@ -1,17 +1,17 @@
 ---
 name: essay
 description: |
-  Essay 类作业 SOP：议论文 / 读书笔记 / 课程小论文 / 综述论述题——纯文字论证，
-  无可执行代码、无实验过程、无截图。
-  Use this skill whenever the user mentions: 议论文、读书笔记、读后感、小论文、
-  课程论文、综述、谈谈你的看法、论述题、阅读 + 思考类作业；
-  or whenever workspace 里只有 .md / .docx / .pdf 文献材料且 README 要求"写一篇文章"，
-  even if 用户没明说 "essay"。
-  Do NOT use for: 含 .py / pytest / 算法实现的作业（用 coding skill）；
-  含实验过程 / 数据采集 / 截图证据的实验报告（用 lab_report skill）。
+  文字论述类作业：议论文、读书笔记、课程小论文、综述论述题。
+  纯文字论证，无可执行代码、无实验过程、无截图证据。
+  典型产物：.md / .docx / .pdf 文档。
 when_to_use: |
-  intake_result.type == "essay"，或 deliverables 仅为 .md / .docx / .pdf 类文档
-  且约束含"写一篇 / 论述 / 不少于 N 字"。
+  以下任一成立时选用：
+  - 作业要求"写一篇 / 论述 / 不少于 N 字 / 谈谈你的看法"
+  - 作业类型为议论文、读书笔记、读后感、小论文、综述、阅读+思考
+  - deliverables 仅为文档（.md/.docx/.pdf），无代码文件，无实验过程
+  排除：
+  - 含可执行代码 + 单元测试 → coding
+  - 含实验过程 / 数据采集 / 截图证据 + 实验报告要求 → lab_report
 ---
 
 # Essay Skill SOP

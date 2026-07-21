@@ -10,7 +10,7 @@
 
 输出：
     - 流式渲染主图节点事件（rich UI）
-    - 完成后打印关键 verification 检查（Phase C 全套）：
+    - 完成后打印关键 verification 检查：
       * coder_step 节点执行次数 == task_dag.nodes 数（每步独立 1 次）
       * step_outputs 累加，每个 id 对应一条简报
       * task_dag.nodes 含 acceptance_criteria / expected_artifacts / suggested_tools
@@ -61,9 +61,9 @@ async def main() -> int:
 
     print_completion_panel(final_state)
 
-    # ─── Phase C verification ──────────────────────────────────────
+    # ─── Step loop verification ────────────────────────────────────
     print("\n" + "=" * 70)
-    print("Phase C verification — 单步执行行为核查")
+    print("Step loop behavior check")
     print("=" * 70)
 
     nodes = (final_state.get("task_dag") or {}).get("nodes") or []
@@ -140,9 +140,9 @@ async def main() -> int:
         and runs
         and (runs[-1].get("verdict") in ("pass", "fail"))
     ):
-        print("✓ Phase C 通过：单步 loop 行为符合设计")
+        print("✓ 步骤 loop 行为符合设计")
     else:
-        print("✗ Phase C 异常：见上面具体项")
+        print("✗ 步骤 loop 异常：见上面具体项")
     print("=" * 70)
     return 0
 

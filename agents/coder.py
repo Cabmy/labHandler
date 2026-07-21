@@ -1,31 +1,20 @@
-"""Coder agent - ReAct in AIO Sandbox（langchain.agents.create_agent）
+"""Coder agent - 负责在沙箱环境中执行具体的任务步骤，通过 ReAct 循环调用工具完成实现。
 
-Plan-and-Execute Lite 单步执行：每次只完成 task_dag.nodes[current_step_idx] 那一个 step；
-主图（orchestrator/graph.py）通过 step_router 反复调用 run_coder_step 跑完所有 step，
-再进 verifier 统一校验。
+该节点采用 "Plan-and-Execute Lite" 架构，每次调用仅负责执行 task_dag 中 current_step_idx 指向的单一节点。
+主图通过控制 idx 的推进来实现多步骤的有序执行。
 
-设计要点：
-1. 用 langchain.agents.create_agent（替换已弃用的 langgraph.prebuilt.create_react_agent）
-2. 工具集 = 本地 fs_tools/skill_tool/profile_tool/rag_tool 子集 + sandbox MCP tools（异步加载）
-3. 入参 messages 拆三段（DeepSeek 前缀缓存友好）：
-   - SystemMessage：CODER_BASE_PROMPT + 学术诚信 + skill SOP + profile 注入（**静态/半静态**）
-   - HumanMessage（context）：intake / 全局 DAG 视野（高亮当前 step）/ 当前 step 详情
-     （acceptance_criteria + expected_artifacts + suggested_tools）/ 已完成 step 简报 /
-     user_constraints / lessons / Replan 反馈（**动态**，每 step 中变）
-   - HumanMessage（question）：触发 step 完成的问句（提醒 Final Answer 格式）
-4. 强制推进：每跑完一轮就 current_step_idx+1，不论 LLM 是否真说"step done"——
-   产物缺失留 Verifier 阶段 1 硬指标抓 → fail → Replan
-5. 思考模式参数（DS_V4_PRO_KWARGS）由 llm.provider 全局注入
-
-入口：
-- build_coder_agent()：异步构建 react agent（要 await sandbox tools 加载）
-- run_coder_step(state)：LangGraph 节点入口，单步执行
+核心机制：
+1. 混合工具链：集成本地文件系统工具与 AIO Sandbox MCP 工具，确保执行过程与宿主环境隔离。
+2. 上下文隔离：针对 DeepSeek 前缀缓存优化，将静态提示词（SOP、学术诚信、Profile）与动态任务状态（当前 Step、历史简报、反馈）解耦。
+3. 状态推进：每次执行完成后强制推进索引，将完整性校验留给后续的 Verifier 节点。
+4. 故障感知：在 Replan 周期内，Coder 会接收到上一轮的失败细节与最终草稿，以避免陷入重复错误的死循环。
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -34,6 +23,8 @@ from llm import get_llm
 from memory.profile import inject_for_agent
 from orchestrator.state import HwState
 from config.prompts import ACADEMIC_INTEGRITY_PROMPT, CODER_BASE_PROMPT
+from config.runtime import get_settings
+from tools.sandbox_tools import reset_sandbox_failure_counter
 
 MAX_REACT_ITER = int(os.getenv("MAX_REACT_ITER", "6"))
 
@@ -195,6 +186,63 @@ def _format_verifier_feedback(verifier_runs: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _check_dependency_artifacts(
+    current_node: dict[str, Any],
+    all_nodes: list[dict[str, Any]],
+    step_outputs: list[dict[str, Any]],
+) -> list[str]:
+    """检查当前 step 的 depends_on 依赖是否满足（预期产物存在 + 依赖 step 无 error）。
+
+    返回缺失原因列表（空 = 全部满足）。不满足时 _run_coder_async 会跳过当前 step，
+    不让 Coder 在空中楼阁上浪费 ReAct 迭代。
+    """
+    deps = current_node.get("depends_on") or []
+    if not deps:
+        return []
+
+    node_map = {n.get("id"): n for n in all_nodes}
+    output_map = {o.get("id"): o for o in step_outputs}
+    ws = get_settings().workspace_dir
+    missing: list[str] = []
+
+    for dep_id in deps:
+        dep_node = node_map.get(dep_id)
+        if not dep_node:
+            missing.append(f"依赖 step {dep_id} 未在 DAG 中定义")
+            continue
+
+        dep_out = output_map.get(dep_id)
+        if dep_out and dep_out.get("error"):
+            missing.append(
+                f"{dep_id} 执行失败（{dep_out['error']}），"
+                f"当前 step {current_node.get('id')} 依赖其产出"
+            )
+            # 有 error 就不用再查文件了（必然不存在）
+            continue
+
+        # 检查预期产物文件是否存在
+        artifacts = dep_node.get("expected_artifacts") or []
+        for art in artifacts:
+            if not (ws / art).exists():
+                missing.append(
+                    f"{dep_id} 的预期产物 {art} 不存在"
+                )
+
+    return missing
+
+
+def _detect_sandbox_fatal(messages: list[Any]) -> str:
+    """扫描 agent 返回消息列表，查找 `[SANDBOX_UNREACHABLE]` 致命标记。
+    返回标记所在的 ToolMessage 内容（空字符串 = 未触发）。"""
+    marker = "[SANDBOX_UNREACHABLE]"
+    for m in messages:
+        content = getattr(m, "content", "") or ""
+        if isinstance(content, str) and marker in content:
+            first_line = content.split("\n")[0][:200]
+            return first_line
+    return ""
+
+
 def _build_context_user_message(state: HwState, current_idx: int) -> str:
     """构建 Coder 第一条 HumanMessage — Plan-and-Execute 单步执行视图。
 
@@ -241,10 +289,10 @@ def _build_context_user_message(state: HwState, current_idx: int) -> str:
     if user_constraints:
         parts.append("## 用户补充约束\n- " + "\n- ".join(user_constraints))
 
-    # 历史经验
-    lessons = task_dag.get("lessons") or []
-    if lessons:
-        parts.append("## 相似历史任务经验\n- " + "\n- ".join(lessons))
+    # 历史经验卡片（当前 step 相关的 pattern/strategy）
+    step_cards = current_node.get("context_cards") or []
+    if step_cards:
+        parts.append("## 相关经验卡片\n- " + "\n- ".join(step_cards))
 
     # Replan 时附加：上一轮 Verifier 反馈 + 上一轮 Coder 终稿
     if verifier_runs:
@@ -303,7 +351,7 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
     每次只跑 task_dag.nodes[current_step_idx] 这一个 step。step_router（在 graph 里）
     检查 current_step_idx vs len(nodes) 决定回 coder_step 还是进 verifier。
 
-    强制推进策略（用户决策）：每跑完一轮就 idx+1，不论 LLM 是否真说"step done"——
+    强制推进策略：每跑完一轮就 idx+1，不论 LLM 是否真说"step done"——
     产物缺失留给 Verifier 阶段 1 硬指标抓 → fail → Replan。
     """
     nodes = (state.get("task_dag") or {}).get("nodes") or []
@@ -320,6 +368,35 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
         }
 
     current = nodes[idx]
+
+    # 依赖前置检查：如果当前 step 的 depends_on 尚未满足，跳过 agent 调用，
+    # 不让 Coder 在空中楼阁上浪费 ReAct 迭代。缺失信息会随 step_outputs
+    # 传给 Verifier / Replan，促使下次 Replan 调整 DAG 顺序或合并步骤。
+    missing_deps = _check_dependency_artifacts(
+        current, nodes, state.get("step_outputs") or []
+    )
+    if missing_deps:
+        reason = "；".join(missing_deps)
+        return {
+            "current_step_idx": idx + 1,
+            "step_outputs": [{
+                "id": current.get("id", f"n{idx+1}"),
+                "name": current.get("name", ""),
+                "summary": "",
+                "error": f"依赖前置不满足，跳过：{reason}",
+            }],
+            "progress_log": [{
+                "node": "coder_step",
+                "step_id": current.get("id", f"n{idx+1}"),
+                "step_idx": idx,
+                "skipped": "dependency_not_met",
+                "reason": reason,
+            }],
+        }
+
+    # 重置沙箱连续失败计数（每步独立计数）
+    reset_sandbox_failure_counter()
+
     agent = await build_coder_agent()
     system_prompt = _build_system_prompt(state)
     context_block = _build_context_user_message(state, current_idx=idx)
@@ -350,14 +427,41 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
             if cls in {"AIMessage", "AIMessageChunk"}:
                 final = m.content if isinstance(m.content, str) else str(m.content)
                 break
+
+        # 从 Final Answer 中提取 Lessons 段（格式：Final Answer...\nLessons:\n- ...）
+        step_lessons: list[str] = []
+        if "Lessons:" in final:
+            parts = final.split("Lessons:")
+            if len(parts) > 1:
+                lesson_block = parts[-1].strip()
+                for line in lesson_block.split("\n"):
+                    line = line.strip().lstrip("-").strip()
+                    if line:
+                        step_lessons.append(line)
+
+        # 沙箱致命错误检测：连续 N 次失败后工具返回 [SANDBOX_UNREACHABLE] 标记
+        # → 直接退出进程，等用户修复沙箱后重试
+        sandbox_fatal = _detect_sandbox_fatal(msgs)
+        if sandbox_fatal:
+            print(
+                "\n" + "=" * 60
+                + "\n[SANDBOX_FATAL] 沙箱连续不可用，任务无法继续。"
+                + "\n[SANDBOX_FATAL] 请检查容器状态：docker ps -a | grep aio-sandbox"
+                + "\n[SANDBOX_FATAL] 重启命令：docker rm -f aio-sandbox && python cli.py"
+                + f"\n[SANDBOX_FATAL] 失败详情：{sandbox_fatal}"
+                + "\n" + "=" * 60
+            )
+            sys.exit(1)
+
         return {
             "messages": [_msg_to_dict(m) for m in msgs],
-            "current_step_idx": idx + 1,  # 强制推进（不查 final 是否真 'step done'）
+            "current_step_idx": idx + 1,
             "step_outputs": [{
                 "id": current.get("id", f"n{idx+1}"),
                 "name": current.get("name", ""),
                 "summary": (final or "(no final answer)")[:500],
                 "iter_messages": len(msgs),
+                "step_lessons": step_lessons,
             }],
             "progress_log": [{
                 "node": "coder_step",

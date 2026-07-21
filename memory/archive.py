@@ -1,42 +1,32 @@
-"""task_archive - SQLite + Chroma 双写
+"""任务归档存储（SQLite 事实层）。
 
-字段（PLAN §10.1 / STEPS P2.1）：
-    (id, task_title, task_type, summary, lessons, workspace_snapshot, created_at)
-
-设计要点：
-1. SQLite 是 source of truth（结构化查询、按时间、事务一致性）
-2. Chroma 当语义索引（用 task_title+summary+lessons 拼成 embedding 文本）
-3. 双写一致性：先 SQLite 拿 row_id，再写 Chroma；Chroma 失败不影响主流程
-4. workspace_snapshot 存 SUMMARY.md 全文（用户决策；不打包二进制）
-5. Chroma collection 复用 .env 的 task_archive_glm_embedding_3（与 RAG 共用 embedding）
+只负责 SQLite 读写（task + cards），不涉及任何检索。
+Chroma / BM25 / RRF 全部在 rag/archive_retriever.py 中处理。
 """
 
 from __future__ import annotations
 
-import json
+import hashlib
 import os
 import sqlite3
 from typing import Any, Optional
 
-from langchain_chroma import Chroma
-
 MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./.hwhandler_data/memory.db")
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./.hwhandler_data/chroma")
-CHROMA_COLLECTION_NAME = os.getenv(
-    "CHROMA_COLLECTION_NAME", "task_archive_glm_embedding_3"
-)
+
+# card_type 白名单
+VALID_CARD_TYPES = frozenset({"lesson", "strategy", "pattern"})
 
 
 class TaskArchive:
-    """任务归档 - SQLite + Chroma 双写"""
+    """任务归档服务。"""
 
     def __init__(self, db_path: Optional[str] = None) -> None:
         self.db_path: str = db_path or MEMORY_DB_PATH
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
-        self._store: Optional[Chroma] = None
 
     def _init_db(self) -> None:
+        """创建或迁移数据表。"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -44,183 +34,163 @@ class TaskArchive:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_title TEXT NOT NULL,
                     task_type TEXT,
-                    summary TEXT,
-                    lessons TEXT,
-                    workspace_snapshot TEXT,
+                    user_summary TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS archive_cards (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    task_id INTEGER NOT NULL,
+                    card_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    search_text TEXT NOT NULL,
+                    vector_error TEXT,
+                    content_hash TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(task_id) REFERENCES task_archive(id),
+                    UNIQUE(task_id, card_type, content_hash)
                 )
                 """
             )
             conn.commit()
 
-    def _get_store(self) -> Chroma:
-        """懒加载 Chroma；embedding 也延迟 import 避免环依赖"""
-        if self._store is None:
-            from llm import get_embeddings  # 延迟 import，与 rag/vectorstore.py 同策略
-            self._store = Chroma(
-                collection_name=CHROMA_COLLECTION_NAME,
-                embedding_function=get_embeddings(),
-                persist_directory=CHROMA_PERSIST_DIR,
-            )
-        return self._store
+    # --- 写接口 -------------------------------------------------------
 
-    def archive_task(
-        self,
-        task_title: str,
-        task_type: str,
-        summary: str,
-        lessons: str = "",
-        workspace_snapshot: str = "",
-    ) -> int:
-        """归档任务：SQLite 落库 + Chroma 写索引
-
-        Args:
-            task_title: 任务标题（如"实现二分查找"）
-            task_type: 任务类型（coding/essay/lab_report 等）
-            summary: SUMMARY.md 主体或精简摘要
-            lessons: 教训/经验（Planner 后续 rag_search 主要用这个）
-            workspace_snapshot: SUMMARY.md 全文（用户决策：不打包二进制）
-
-        Returns:
-            row_id（SQLite 自增）
-        """
+    def create_task(self, task_title: str, task_type: str, user_summary: str) -> int:
+        """创建任务归档，返回 task_id。"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
-                """
-                INSERT INTO task_archive
-                    (task_title, task_type, summary, lessons, workspace_snapshot)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (task_title, task_type, summary, lessons, workspace_snapshot),
+                "INSERT INTO task_archive (task_title, task_type, user_summary) VALUES (?, ?, ?)",
+                (task_title, task_type, user_summary),
             )
             conn.commit()
-            row_id = cursor.lastrowid or 0
+            return cursor.lastrowid or 0
 
-        # Chroma 写索引：用 title+summary+lessons 拼起来做 embedding 输入
-        try:
-            embed_text = (
-                f"标题: {task_title}\n类型: {task_type}\n"
-                f"摘要: {summary[:1500]}\n教训: {lessons[:1000]}"
-            )
-            self._get_store().add_texts(
-                texts=[embed_text],
-                metadatas=[
-                    {
-                        "row_id": row_id,
-                        "task_title": task_title,
-                        "task_type": task_type,
-                    }
-                ],
-                ids=[f"archive_{row_id}"],
-            )
-        except Exception:
-            # Chroma 写失败静默：SQLite 已落，下次 reindex 可补
-            pass
+    def create_cards(
+        self, task_id: int, knowledge_cards: list[dict], task_title: str, task_type: str
+    ) -> list[int]:
+        """批量写入知识卡片，返回写入成功的 card_id 列表。
 
-        return row_id
-
-    def search_archive(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
-        """混合检索历史任务：Chroma 语义 + BM25 关键词 + RRF 融合（k=60）。
-
-        BM25 兜中文短关键词（向量在中文短串上不稳）；Chroma 兜语义泛化。
-        融合复用 rag.hybrid.rrf_fuse；BM25 复用 rag.bm25_store.BM25Store
-        （现场实例化而非用单例——单例是给 RAG 通用库用的，task_archive 是另一组语料）。
-        archive 量级 < 100 行，每次查询现场建 BM25 无性能压力。
-
-        Returns:
-            按 RRF 分数降序的 dict 列表（key 同 task_archive 表字段）
+        校验逻辑：
+        - card_type 不在白名单中 -> 丢弃
+        - content 为空 -> 丢弃
+        - 同 task 内 card_type + content_hash 重复 -> 跳过
         """
-        over = max(limit * 2, 10)
+        inserted_ids: list[int] = []
+        with sqlite3.connect(self.db_path) as conn:
+            for card in knowledge_cards:
+                card_type = str(card.get("type", "")).strip()
+                content = str(card.get("content", "")).strip()
+                if card_type not in VALID_CARD_TYPES or not content:
+                    continue
 
-        # 1) Chroma 语义召回 → row_id 排名
-        chroma_ranking: list[str] = []
-        try:
-            hits = self._get_store().similarity_search(query, k=over)
-            chroma_ranking = [
-                str(h.metadata["row_id"])
-                for h in hits
-                if isinstance(h.metadata.get("row_id"), int)
-            ]
-        except Exception:
-            pass
+                content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                search_text = (
+                    f"任务类型: {task_type}\n"
+                    f"卡片类型: {card_type}\n"
+                    f"任务标题: {task_title}\n"
+                    f"内容: {content}"
+                )
 
-        # 2) BM25 关键词召回 → row_id 排名
-        bm25_ranking = self._bm25_rank_ids(query, top_k=over)
+                try:
+                    cursor = conn.execute(
+                        """
+                        INSERT INTO archive_cards
+                            (task_id, card_type, content, search_text, content_hash)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (task_id, card_type, content, search_text, content_hash),
+                    )
+                    conn.commit()
+                    inserted_ids.append(cursor.lastrowid or 0)
+                except sqlite3.IntegrityError:
+                    pass
 
-        if not chroma_ranking and not bm25_ranking:
-            return []
+        return inserted_ids
 
-        # 3) RRF 融合（rank_bm25.BM25Okapi 在 N<5 时 IDF 会退化为 0 → BM25 单路返回空，
-        #    此时 fused 只取 Chroma 一路；archive 满 5 条以上即正常工作）
-        from rag.hybrid import rrf_fuse
-        fused = rrf_fuse([chroma_ranking, bm25_ranking])
-        fused_ids: list[int] = []
-        for rid_str, _ in fused[:limit]:
-            try:
-                fused_ids.append(int(rid_str))
-            except ValueError:
-                continue
+    def mark_card_vector_error(self, card_id: int, error: str) -> None:
+        """记录卡片 Chroma 写入失败的原因。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE archive_cards SET vector_error = ? WHERE id = ?",
+                (error[:500], card_id),
+            )
+            conn.commit()
 
-        if not fused_ids:
-            return []
+    def clear_card_vector_error(self, card_id: int) -> None:
+        """清除卡片的向量错误标记（重建用）。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE archive_cards SET vector_error = NULL WHERE id = ?",
+                (card_id,),
+            )
+            conn.commit()
 
-        # 4) SQLite 取原文（保持 fused 顺序）
-        placeholders = ",".join("?" * len(fused_ids))
+    # --- 读接口 -------------------------------------------------------
+
+    def get_cards_for_indexing(self, limit: int = 500) -> list[dict[str, Any]]:
+        """获取所有需要被索引的卡片（含所属任务信息）。"""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
-                f"SELECT * FROM task_archive WHERE id IN ({placeholders})",
-                fused_ids,
-            )
-            rows_by_id = {row["id"]: dict(row) for row in cursor.fetchall()}
-        return [rows_by_id[rid] for rid in fused_ids if rid in rows_by_id]
-
-    def _bm25_rank_ids(self, query: str, top_k: int) -> list[str]:
-        """对 task_archive 全表 jieba 分词 + BM25 排序，返回 row_id 字符串列表。"""
-        from langchain_core.documents import Document
-        from rag.bm25_store import BM25Store
-
-        rows = self.list_all(limit=1000)
-        if not rows:
-            return []
-        docs = [
-            Document(
-                page_content=(
-                    f"{r.get('task_title') or ''} "
-                    f"{r.get('lessons') or ''} "
-                    f"{(r.get('summary') or '')[:500]}"
-                ),
-                metadata={"rid_str": str(r["id"])},
-            )
-            for r in rows
-        ]
-        store = BM25Store()
-        store.add_documents(docs)
-        hits = store.search(query, k=top_k)
-        return [d.metadata["rid_str"] for d, _ in hits]
-
-    def get_by_id(self, row_id: int) -> Optional[dict[str, Any]]:
-        """按 id 直接取一条（管理用途）"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                "SELECT * FROM task_archive WHERE id = ?", (row_id,)
-            )
-            row = cursor.fetchone()
-            return dict(row) if row else None
-
-    def list_all(self, limit: int = 50) -> list[dict[str, Any]]:
-        """按时间倒序列全部（管理/调试用途）"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                "SELECT * FROM task_archive ORDER BY created_at DESC LIMIT ?",
+                """
+                SELECT c.id, c.card_type, c.content, c.search_text, c.vector_error,
+                       t.id as task_id, t.task_title, t.task_type
+                FROM archive_cards c
+                JOIN task_archive t ON c.task_id = t.id
+                ORDER BY c.id
+                LIMIT ?
+                """,
                 (limit,),
             )
             return [dict(row) for row in cursor.fetchall()]
 
+    def get_cards_by_ids(self, card_ids: list[int]) -> list[dict[str, Any]]:
+        """按 card_id 回表 hydrate 卡片和所属任务。"""
+        if not card_ids:
+            return []
+        placeholders = ",".join("?" * len(card_ids))
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                f"""
+                SELECT c.id as card_id, c.card_type, c.content, c.search_text,
+                       t.id as task_id, t.task_title, t.task_type
+                FROM archive_cards c
+                JOIN task_archive t ON c.task_id = t.id
+                WHERE c.id IN ({placeholders})
+                """,
+                card_ids,
+            )
+            rows_by_id = {row["card_id"]: dict(row) for row in cursor.fetchall()}
+            return [rows_by_id[rid] for rid in card_ids if rid in rows_by_id]
 
-# ─── 全局单例 ──────────────────────────────────────────────────────
+    def get_card_count(self) -> int:
+        """卡片总数（供索引重建判断用）。"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute("SELECT COUNT(*) FROM archive_cards")
+            return cursor.fetchone()[0]
+
+    def get_index_stats(self) -> dict[str, Any]:
+        """索引状态统计。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            total = conn.execute("SELECT COUNT(*) as n FROM archive_cards").fetchone()[0]
+            failed = conn.execute(
+                "SELECT COUNT(*) as n FROM archive_cards WHERE vector_error IS NOT NULL"
+            ).fetchone()[0]
+            return {
+                "total_cards": total,
+                "indexed": total - failed,
+                "failed": failed,
+                "pending": 0,
+            }
+
+
+# 模块级单例
 
 _default_archive: Optional[TaskArchive] = None
 
@@ -231,25 +201,3 @@ def get_task_archive() -> TaskArchive:
     if _default_archive is None:
         _default_archive = TaskArchive()
     return _default_archive
-
-
-# 便捷函数（让 tools/archive_tool.py / tools/rag_tool.py 调用更顺手）
-
-def archive_task(
-    task_title: str,
-    task_type: str,
-    summary: str,
-    lessons: str = "",
-    workspace_snapshot: str = "",
-) -> int:
-    return get_task_archive().archive_task(
-        task_title=task_title,
-        task_type=task_type,
-        summary=summary,
-        lessons=lessons,
-        workspace_snapshot=workspace_snapshot,
-    )
-
-
-def search_archive(query: str, limit: int = 5) -> list[dict[str, Any]]:
-    return get_task_archive().search_archive(query, limit=limit)

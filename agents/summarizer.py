@@ -1,24 +1,14 @@
-"""Summarizer agent - 双轨：用户面 SUMMARY.md + archive 面 lessons
+"""Summarizer agent - 负责生成最终的任务总结报告，并沉淀知识卡片。
 
-输出（B 改造，PLAN/STEPS 已不再准确）：
-- 写 `workspace/SUMMARY.md`（用户能直接看的人话提纲，4 节：我做了什么/文件清单/怎么验证/待办）
-- 返回 `{summary, lessons}` 写入 HwState；`/done` 时 archive_task 直接读 state.lessons
-  （不再从 SUMMARY.md 字符串中抽 "## 6. 教训与心得" 章节）
-
-ground truth 来源：
-- intake_result（题面）
-- artifacts / workspace 实际产物
-- verifier_runs[-1]（最后一次校验，含 missing）
-- progress_log（节点执行日志摘要）
-
-一次 LLM 调用产两段，由 prompts.SUMMARIZER_SYSTEM 强制 JSON schema：
-  {"user_summary": "# ...完整 markdown...", "lessons": "- bullet1\n- bullet2"}
+输出内容：
+1. SUMMARY.md (用户侧)：生成在 workspace 目录下，包含完成的任务摘要、产物清单、验证方法及剩余待办。
+2. knowledge_cards (系统侧)：从执行轨迹中蒸馏出 lesson/strategy/pattern 结构化知识卡片，
+   供 /done 归档后未来 Planner 检索使用。
 """
 
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -28,9 +18,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm import get_llm
 from memory.profile import inject_for_agent
 from orchestrator.state import HwState
-from config.prompts import SUMMARIZER_SYSTEM, extract_result
+from config.prompts import SUMMARIZER_SYSTEM, parse_result_json
+from config.runtime import get_settings
 
-WORKSPACE_DIR: Path = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
+WORKSPACE_DIR: Path = get_settings().workspace_dir
 SUMMARY_PATH = WORKSPACE_DIR / "SUMMARY.md"
 
 
@@ -57,16 +48,19 @@ def _build_facts(state: HwState) -> str:
     verifier_runs = state.get("verifier_runs") or []
     progress = state.get("progress_log") or []
     user_cons = state.get("user_constraints") or []
+    step_outputs = state.get("step_outputs") or []
+    messages = state.get("messages") or []
 
     artifact_paths = [str(a.get("path", "")) for a in artifacts if a.get("path")]
     if not artifact_paths:
         artifact_paths = _list_artifacts_from_workspace()
 
-    last_verifier = verifier_runs[-1] if verifier_runs else {}
-
     parts = [
         "## intake",
         json.dumps(intake, ensure_ascii=False, default=str)[:1500],
+        "",
+        "## messages（用户多轮对话，含纠正/反馈/补充）",
+        json.dumps(messages, ensure_ascii=False, default=str)[:2000],
         "",
         "## artifacts（实际 workspace 文件）",
         json.dumps(artifact_paths, ensure_ascii=False, default=str)[:1000],
@@ -74,25 +68,16 @@ def _build_facts(state: HwState) -> str:
         "## user_constraints（用户对话累加约束）",
         json.dumps(user_cons, ensure_ascii=False, default=str)[:1000],
         "",
-        "## verifier_runs[-1]（最后一次校验：verdict / missing / suggested_fix）",
-        json.dumps(last_verifier, ensure_ascii=False, default=str)[:2000],
+        "## verifier_runs（全部校验轮次）",
+        json.dumps(verifier_runs[-2:] if len(verifier_runs) > 1 else verifier_runs, ensure_ascii=False, default=str)[:2000],
         "",
-        "## progress_log（节点摘要，仅供参考；不要原文回填）",
-        json.dumps(progress, ensure_ascii=False, default=str)[:2500],
+        "## progress_log（节点摘要）",
+        json.dumps(progress, ensure_ascii=False, default=str)[:3000],
+        "",
+        "## step_outputs（每步执行记录：id / name / error / skipped）",
+        json.dumps(step_outputs, ensure_ascii=False, default=str)[:2500],
     ]
     return "\n".join(parts)
-
-
-def _parse_json(content: str) -> dict[str, Any]:
-    """从 <result> 抽 JSON；失败时退化到首末花括号。"""
-    text = extract_result(content)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        l, r = text.find("{"), text.rfind("}")
-        if l >= 0 and r > l:
-            return json.loads(text[l : r + 1])
-        raise
 
 
 def _fallback_user_summary(state: HwState, reason: str) -> str:
@@ -136,12 +121,12 @@ def _fallback_user_summary(state: HwState, reason: str) -> str:
 
 
 def run_summarizer(state: HwState) -> dict[str, Any]:
-    """一次 LLM 调用产 user_summary + lessons；user_summary 写到 workspace/SUMMARY.md。"""
+    """一次 LLM 调用产 user_summary + knowledge_cards；user_summary 写到 workspace/SUMMARY.md。"""
     user_msg = _build_facts(state)
 
     llm = get_llm()
     user_summary = ""
-    lessons = ""
+    knowledge_cards: list[dict] = []
     llm_error: str | None = None
 
     try:
@@ -152,16 +137,20 @@ def run_summarizer(state: HwState) -> dict[str, Any]:
             ]
         )
         text = resp.content if isinstance(resp.content, str) else str(resp.content)
-        data = _parse_json(text)
+        data = parse_result_json(text)
         user_summary = str(data.get("user_summary") or "").strip()
-        lessons = str(data.get("lessons") or "").strip()
+        cards_raw = data.get("knowledge_cards") or []
+        if isinstance(cards_raw, list):
+            knowledge_cards = [
+                {"type": str(c.get("type", "")).strip(), "content": str(c.get("content", "")).strip()}
+                for c in cards_raw
+                if isinstance(c, dict) and c.get("type") and c.get("content")
+            ]
     except Exception as e:
         llm_error = f"{type(e).__name__}: {e}"
 
     if not user_summary:
         user_summary = _fallback_user_summary(state, llm_error or "LLM 输出空 user_summary")
-    if not lessons:
-        lessons = "（本次执行较顺利，无特殊教训。）"
 
     SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
     SUMMARY_PATH.write_text(user_summary, encoding="utf-8")
@@ -170,13 +159,13 @@ def run_summarizer(state: HwState) -> dict[str, Any]:
         "node": "summarizer",
         "summary_path": str(SUMMARY_PATH.relative_to(WORKSPACE_DIR)),
         "n_chars": len(user_summary),
-        "lessons_chars": len(lessons),
+        "n_cards": len(knowledge_cards),
     }
     if llm_error:
         log_entry["llm_error"] = llm_error
 
     return {
         "summary": user_summary,
-        "lessons": lessons,
+        "knowledge_cards": knowledge_cards,
         "progress_log": [log_entry],
     }

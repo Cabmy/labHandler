@@ -1,24 +1,12 @@
-"""Planner agent - 拆子任务 DAG + 选 skill + 拼历史经验
+"""Planner agent - 负责任务拆解，将复杂作业转化为可执行的有向无环图 (DAG)，并召回相关经验。
 
-输出 task_dag（HwState 子结构）：
-  {
-    "skill":  str,           # 选中的 skill 名（coding/essay/lab_report/other）
-    "nodes":  list[dict],    # [{id, name, agent, depends_on, desc}]
-    "lessons": list[str],    # archive_search 召回的历史经验摘要
-  }
-
-设计要点（PLAN §8.2 / STEPS P4.2）：
-1. skill 选择：直接读 intake_result.type；type=other 时跳过 skill 加载
-2. archive_search 召回 Top-3 历史相似任务的 lessons 拼进 prompt
-3. LLM 一次性输出 JSON DAG（节点带 id / agent / depends_on）
-4. 节点 agent 取值：coder / verifier / summarizer（Phase 4 范围内）
+该节点通过分析 Intake 提取的任务信息，构建一个包含多个步骤的 task_dag。每个步骤指定了依赖关系、
+验收标准及预期产出。此外，它还会从历史库中检索相似任务的知识卡片（lesson/strategy/pattern）。
 """
 
 from __future__ import annotations
 
 import json
-import os
-import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -26,23 +14,35 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from llm import get_llm
 from memory.profile import inject_for_agent
 from orchestrator.state import HwState
-from config.prompts import PLANNER_SYSTEM, extract_result
+from config.prompts import PLANNER_SYSTEM, parse_result_json
+from config.runtime import get_settings
 
-ARCHIVE_TOP_K = int(os.getenv("PLANNER_ARCHIVE_TOP_K", "3"))
+ARCHIVE_TOP_K = get_settings().planner_archive_top_k
 
 
-def _format_lessons(lessons: list[dict]) -> str:
-    if not lessons:
-        return "（无相似历史任务）"
+def _format_cards(items: list[dict]) -> str:
+    """格式化知识卡片列表为 prompt 文本。"""
+    if not items:
+        return "（无相关历史经验卡片）"
     lines = []
-    for i, item in enumerate(lessons, 1):
+    for i, item in enumerate(items, 1):
+        card_type = item.get("card_type", "")
+        content = item.get("content", "")
         title = item.get("task_title", "")
         ttype = item.get("task_type", "")
-        lesson = (item.get("lessons") or "").strip()
-        if not lesson:
-            continue
-        lines.append(f"{i}. [{ttype}] {title}：{lesson[:300]}")
-    return "\n".join(lines) or "（历史任务存在但未沉淀有效 lessons）"
+        type_label = {"lesson": "教训", "strategy": "策略", "pattern": "模式"}.get(card_type, card_type)
+        lines.append(f"{i}. [{type_label}] [{ttype}] {title}")
+        lines.append(f"   {content[:300]}")
+    return "\n".join(lines)
+
+
+def _compact_card(item: dict[str, Any]) -> str:
+    """压缩卡片为单行管道字符串（写进 task_dag 给下游）。"""
+    card_type = item.get("card_type", "")
+    content = (item.get("content") or "").strip()[:200]
+    title = item.get("task_title", "")
+    ttype = item.get("task_type", "")
+    return f"[{card_type}][{ttype}] {title} | {content}"
 
 
 def _format_intake(intake: dict[str, Any]) -> str:
@@ -59,39 +59,35 @@ def _format_intake(intake: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
-def _parse_json(content: str) -> dict[str, Any]:
-    """容错 JSON 解析：先抽 <result> 段，再退化到老路径"""
-    text = extract_result(content)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        l, r = text.find("{"), text.rfind("}")
-        if l >= 0 and r > l:
-            return json.loads(text[l : r + 1])
-        raise
-
-
 def run_planner(state: HwState) -> dict[str, Any]:
     """LangGraph 节点入口。"""
     intake = state.get("intake_result") or {}
     user_constraints = state.get("user_constraints") or []
     skill_name = (intake.get("type") or "other").lower()
 
-    # 召回历史经验
+    # 召回历史经验卡片
     try:
         from tools.rag_tool import archive_search
 
         query = intake.get("title") or state.get("question", "")
-        lessons = archive_search.invoke({"query": query, "limit": ARCHIVE_TOP_K})
-    except Exception:
-        lessons = []
+        card_types = ["lesson", "strategy"]
+        if skill_name == "coding":
+            card_types.append("pattern")
 
-    # 加载 skill SOP（other 类型跳过）
+        retrieved_cards: list[dict] = archive_search.invoke({
+            "query": query,
+            "limit": ARCHIVE_TOP_K,
+            "card_types": card_types,
+            "task_type": None,
+        })
+    except Exception:
+        retrieved_cards = []
+
+    # 加载 skill SOP
     skill_body = ""
     if skill_name in {"coding", "essay", "lab_report"}:
         try:
             from tools.skill_tool import get_skill_body
-
             skill_body = get_skill_body(skill_name) or ""
         except Exception:
             skill_body = ""
@@ -100,54 +96,66 @@ def run_planner(state: HwState) -> dict[str, Any]:
     user_msg_parts = [
         f"## intake_result\n{_format_intake(intake)}",
         f"## 用户补充约束\n{user_constraints if user_constraints else '（无）'}",
-        f"## 历史相似任务\n{_format_lessons(lessons)}",
+        f"## 相关历史经验卡片\n{_format_cards(retrieved_cards)}",
     ]
     if skill_body:
         user_msg_parts.append(f"## skill SOP（{skill_name}）\n{skill_body[:2000]}")
 
-    # Replan: 把上一轮 Verifier 反馈 + 旧 DAG + workspace 现有产物塞进 prompt
-    # ① 让 DAG 真的能基于失败信号调整（否则 2 次 Planner 输出几乎一致）
-    # ② 输入与首轮不同，避开 langchain SQLite cache 命中导致 stream_mode='messages'
-    #    无 chunk 流出 → live_panel 拿不到 token → CLI 看不到第 2 次 Planner 的思考过程
-    # ③ 进入 PLANNER_SYSTEM 的「Replan 修补模式」：让 Planner 只产针对 missing 的最小修补 DAG，
-    #    不再重复拆已通过的 step（避免 Coder 对已存在产物做无效自证）。
+    # Replan: 加上 Verifier 反馈 + 旧 DAG + workspace 产物
     verifier_runs = state.get("verifier_runs") or []
+    replan_query = query  # 默认用首轮 query
     if verifier_runs:
         last = verifier_runs[-1]
         cov = last.get("coverage") or {}
         missing = [m.get("constraint", "") for m in (cov.get("missing") or [])]
         sf = last.get("suggested_fix") or ""
-        user_msg_parts.append(
-            "## 上一轮 Verifier 反馈\n"
-            f"- verdict: {last.get('verdict', '')}\n"
-            f"- missing: {missing}\n"
-            f"- suggested_fix: {sf}"
-        )
-        # 旧 DAG（让 Planner 知道哪些节点已被验证过，未列入 missing 的视为已完成）
+        stage1 = last.get("stage1_failures") or []
+        evidence = last.get("evidence") or {}
+        feedback_parts = [
+            "## 上一轮 Verifier 反馈",
+            f"- verdict: {last.get('verdict', '')}",
+            f"- stage1_failures: {stage1}",
+            f"- missing: {missing}",
+            f"- suggested_fix: {sf}",
+        ]
+        pytest_tail = evidence.get("pytest_output_tail", "")
+        if pytest_tail:
+            feedback_parts.append("- pytest_output（末段）:\n```\n" + pytest_tail[:500] + "\n```")
+        user_msg_parts.append("\n".join(feedback_parts))
+
+        # Replan 时也用缺漏信息重新检索卡片
+        try:
+            replan_query = f"{query} {' '.join(missing)} {sf}"
+            replan_cards = archive_search.invoke({
+                "query": replan_query,
+                "limit": ARCHIVE_TOP_K,
+                "card_types": card_types,
+                "task_type": None,
+            })
+            if replan_cards:
+                retrieved_cards = replan_cards  # 替换为更相关的卡片
+        except Exception:
+            pass
+
+        # 旧 DAG
         prev_dag = state.get("task_dag") or {}
         prev_nodes = prev_dag.get("nodes") or []
         if prev_nodes:
             try:
                 dag_brief = json.dumps(
-                    [
-                        {
-                            "id": n.get("id"),
-                            "name": n.get("name"),
-                            "depends_on": n.get("depends_on") or [],
-                            "expected_artifacts": n.get("expected_artifacts") or [],
-                        }
-                        for n in prev_nodes
-                    ],
+                    [{"id": n.get("id"), "name": n.get("name"),
+                      "depends_on": n.get("depends_on") or [],
+                      "expected_artifacts": n.get("expected_artifacts") or []}
+                     for n in prev_nodes],
                     ensure_ascii=False,
                 )
             except Exception:
                 dag_brief = str(prev_nodes)
             user_msg_parts.append(f"## 上一轮 task_dag（节点摘要）\n{dag_brief[:1500]}")
-        # workspace 现有产物清单（仅相对路径，不读文件内容——Verifier 阶段已读过）
+
+        # workspace 现有产物
         try:
-            from pathlib import Path as _P
-            import os as _os
-            ws = _P(_os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
+            ws = get_settings().workspace_dir
             files = []
             for p in ws.rglob("*"):
                 if not p.is_file():
@@ -159,8 +167,7 @@ def run_planner(state: HwState) -> dict[str, Any]:
             if files:
                 files.sort()
                 user_msg_parts.append(
-                    "## workspace 现有产物（文件已存在；若该文件相关约束未列入 missing，视为已完成，不要重新生成）\n"
-                    + "\n".join(f"- {f}" for f in files[:50])
+                    "## workspace 现有产物\n" + "\n".join(f"- {f}" for f in files[:50])
                 )
         except Exception:
             pass
@@ -174,74 +181,52 @@ def run_planner(state: HwState) -> dict[str, Any]:
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
 
     try:
-        data = _parse_json(content)
+        data = parse_result_json(content)
     except Exception as e:
-        # 兜底 DAG：直接按 type 给一个 2-3 节点的最小流
         data = _fallback_dag(skill_name, intake.get("title", "任务"), str(e))
 
     nodes = data.get("nodes") or []
-    # 标准化节点字段
     cleaned_nodes = []
     for n in nodes:
-        cleaned_nodes.append(
-            {
-                "id": str(n.get("id") or f"n{len(cleaned_nodes)+1}"),
-                "name": str(n.get("name") or "未命名节点"),
-                "agent": str(n.get("agent") or "coder").lower(),
-                "depends_on": list(n.get("depends_on") or []),
-                "desc": str(n.get("desc") or ""),
-                # Plan-and-Execute Lite：Coder 单步执行参考的 3 字段
-                # （prompts.PLANNER_SYSTEM 强制要求 LLM 给出这 3 项）
-                "acceptance_criteria": list(n.get("acceptance_criteria") or []),
-                "expected_artifacts": list(n.get("expected_artifacts") or []),
-                "suggested_tools": list(n.get("suggested_tools") or []),
-            }
-        )
+        cleaned_nodes.append({
+            "id": str(n.get("id") or f"n{len(cleaned_nodes)+1}"),
+            "name": str(n.get("name") or "未命名节点"),
+            "agent": str(n.get("agent") or "coder").lower(),
+            "depends_on": list(n.get("depends_on") or []),
+            "desc": str(n.get("desc") or ""),
+            "acceptance_criteria": list(n.get("acceptance_criteria") or []),
+            "expected_artifacts": list(n.get("expected_artifacts") or []),
+            "suggested_tools": list(n.get("suggested_tools") or []),
+            # 当前 step 相关的 pattern/strategy 卡片（给 Coder 参考）
+            "context_cards": [_compact_card(c) for c in retrieved_cards
+                             if c.get("card_type") in ("pattern", "strategy")],
+        })
+
+    # 保留所有卡片（lesson 给 Verifier 参考）
+    all_compact = [_compact_card(c) for c in retrieved_cards]
 
     task_dag = {
         "skill": data.get("skill") or skill_name,
         "nodes": cleaned_nodes,
-        "lessons": [_compact_lesson(l) for l in lessons],
+        "retrieved_cards": all_compact,
     }
 
     return {
         "task_dag": task_dag,
-        "iteration": int(state.get("iteration", 0)) + 1,  # Replan 计数
-        "current_step_idx": 0,  # ★ Plan-and-Execute：每次 planner 都从 step 0 重新开始（含 Replan）
-        "progress_log": [
-            {
-                "node": "planner",
-                "iteration": int(state.get("iteration", 0)) + 1,
-                "skill": task_dag["skill"],
-                "n_nodes": len(cleaned_nodes),
-                "n_lessons": len(task_dag["lessons"]),
-            }
-        ],
+        "iteration": int(state.get("iteration", 0)) + 1,
+        "current_step_idx": 0,
+        "progress_log": [{
+            "node": "planner",
+            "iteration": int(state.get("iteration", 0)) + 1,
+            "skill": task_dag["skill"],
+            "n_nodes": len(cleaned_nodes),
+            "n_cards": len(all_compact),
+        }],
     }
-
-
-def _compact_lesson(item: dict[str, Any]) -> str:
-    return (
-        f"[{item.get('task_type','')}] {item.get('task_title','')}："
-        f"{(item.get('lessons') or '').strip()[:200]}"
-    )
 
 
 def _fallback_dag(skill: str, title: str, reason: str) -> dict[str, Any]:
-    """LLM 解析失败时的兜底 DAG（保证主图能跑下去）
-
-    Verifier / Summarizer 是主图固定的收尾节点，不由 planner 拆——
-    fallback 也只产 coder 节点。
-
-    Plan-and-Execute Lite 兼容：fallback 节点也补上 acceptance_criteria /
-    expected_artifacts / suggested_tools 三字段（即便都是空 list 让 Coder 自决），
-    保持 schema 一致，避免下游 _format_current_step_detail 拿到 KeyError。
-    """
-    _empty = {
-        "acceptance_criteria": [],
-        "expected_artifacts": [],
-        "suggested_tools": [],
-    }
+    _empty = {"acceptance_criteria": [], "expected_artifacts": [], "suggested_tools": []}
     if skill == "coding":
         nodes = [
             {"id": "n1", "name": "实现", "agent": "coder", "depends_on": [],
@@ -256,11 +241,6 @@ def _fallback_dag(skill: str, title: str, reason: str) -> dict[str, Any]:
         ]
     else:
         nodes = [
-            {"id": "n1", "name": "执行", "agent": "coder", "depends_on": [], "desc": title,
-             **_empty},
+            {"id": "n1", "name": "执行", "agent": "coder", "depends_on": [], "desc": title, **_empty},
         ]
-    return {
-        "skill": skill,
-        "nodes": nodes,
-        "_fallback_reason": reason,
-    }
+    return {"skill": skill, "nodes": nodes, "_fallback_reason": reason}
