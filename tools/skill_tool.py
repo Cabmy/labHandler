@@ -61,6 +61,3 @@ def list_skill_meta() -> list[dict[str, str]]:
         }
         for s in list_skill_documents()
     ]
-
-
-SKILL_TOOLS = [load_skill, list_skills]

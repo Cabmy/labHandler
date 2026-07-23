@@ -16,11 +16,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import socket
 import subprocess
 import time
 from pathlib import Path
-from urllib.parse import urlparse
+
+from infra.net_probe import probe_port
 
 CONTAINER_NAME = "aio-sandbox"
 SANDBOX_WORKSPACE_MOUNT = "/workspace"  # 容器内的统一工作目录
@@ -28,17 +28,6 @@ SANDBOX_WORKSPACE_MOUNT = "/workspace"  # 容器内的统一工作目录
 
 def _host_workspace_dir() -> Path:
     return Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
-
-
-def _probe(url: str, timeout: float = 1.0) -> bool:
-    try:
-        u = urlparse(url)
-        host = u.hostname or "127.0.0.1"
-        port = u.port or 80
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 def _docker_available() -> bool:
@@ -174,7 +163,7 @@ def ensure_sandbox(log=print) -> bool:
         )
         # 继续执行：旧容器仍可运行，只是文件读不到；让用户主动决定是否重建。
 
-    if _probe(url):
+    if probe_port(url):
         return True
 
     if not _docker_available():
@@ -201,7 +190,7 @@ def ensure_sandbox(log=print) -> bool:
 
     # 轮询端口最多 60s
     for _ in range(60):
-        if _probe(url):
+        if probe_port(url):
             log(f"[sandbox] 就绪（{url}）")
             return True
         time.sleep(1)

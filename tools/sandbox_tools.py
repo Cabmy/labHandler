@@ -1,6 +1,7 @@
 """sandbox_tools - AIO Sandbox MCP 包装
 
-抽象层：agent 通过本模块的 6 个函数调沙箱，未来切 CubeSandbox/E2B 时只换实现层。
+抽象层：Coder 通过 get_sandbox_tools 取得 MCP 工具集（已包装路径翻译）在 ReAct 循环内调用，
+Intake 通过 sandbox_convert_to_markdown 解析作业指导文档；未来切 CubeSandbox/E2B 时只换实现层。
 当前实现走 langchain-mcp-adapters 拿 MCP tool 后调用。
 
 工具名：
@@ -23,16 +24,6 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Optional
-
-# 工具名常量（与 MCP server 对齐；沙箱版本变化时在此更新）
-SANDBOX_TOOL_NAMES = [
-    "sandbox_execute_code",
-    "sandbox_execute_bash",
-    "sandbox_file_operations",
-    "sandbox_str_replace_editor",
-    "sandbox_convert_to_markdown",
-    "sandbox_get_packages",
-]
 
 
 _tools_cache: Optional[dict[str, Any]] = None
@@ -201,29 +192,7 @@ async def _call(tool_name: str, **kwargs: Any) -> Any:
     return await tools[tool_name].ainvoke(kwargs)
 
 
-# ─── 6 个抽象接口（供 Coder 节点主流程调用） ───────────────────────────
-
-
-async def sandbox_execute_code(code: str, language: str = "python") -> str:
-    """在沙箱内执行代码片段，返回 stdout/stderr 合并文本。"""
-    return await _call("sandbox_execute_code", code=code, language=language)
-
-
-async def sandbox_execute_bash(cmd: str) -> str:
-    """在沙箱内执行 bash 命令。"""
-    return await _call("sandbox_execute_bash", cmd=cmd)
-
-
-async def sandbox_file_operations(action: str, path: str, **kwargs: Any) -> Any:
-    """沙箱内文件操作（read/write/mkdir/delete 等，具体动作见 MCP schema）。"""
-    return await _call("sandbox_file_operations", action=action, path=path, **kwargs)
-
-
-async def sandbox_str_replace_editor(
-    command: str, path: str, **kwargs: Any
-) -> Any:
-    """沙箱内字符串替换编辑器。"""
-    return await _call("sandbox_str_replace_editor", command=command, path=path, **kwargs)
+# ─── 抽象接口 ───────────────────────────
 
 
 async def sandbox_convert_to_markdown(file_path: str) -> str:
@@ -242,11 +211,6 @@ async def sandbox_convert_to_markdown(file_path: str) -> str:
             for item in result
         )
     return result if isinstance(result, str) else str(result)
-
-
-async def sandbox_get_packages() -> list[str]:
-    """列出沙箱内已安装的 Python 包。"""
-    return await _call("sandbox_get_packages")
 
 
 # ReAct 循环通过 bind_tools 需要 LangChain Tool 实例，

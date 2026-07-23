@@ -3,7 +3,7 @@
 设计要点：
 1. 用 ddgs 库（P0 验过）；PROXY 走 .env，可空
 2. 带最简重试（2 次，3s 间隔）
-3. @tool 装饰输出 OpenAI schema 给 registry / bind_tools
+3. @tool 装饰输出 OpenAI schema 给 bind_tools
 """
 
 from __future__ import annotations
@@ -51,6 +51,3 @@ def web_search(query: str, max_results: int = 5) -> list[dict]:
     if last_err:
         return [{"title": "", "url": "", "snippet": f"[搜索失败: {type(last_err).__name__}]"}]
     return []
-
-
-SEARCH_TOOLS = [web_search]

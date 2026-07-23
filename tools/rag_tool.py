@@ -39,6 +39,3 @@ def archive_search(
         task_type=task_type,
     )
     return result.get("items", [])
-
-
-RAG_TOOLS = [archive_search]

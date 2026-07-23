@@ -40,11 +40,15 @@ _ALLOWED_COMMANDS = frozenset({
 })
 
 # 路径逃逸防护（无论命令是否在白名单中，都检查逃逸模式）
+# 边界类含引号/括号/等号：拦截藏在字符串里的绝对路径（如 python -c "open('/etc/passwd')"），
+# 不再仅靠"空白前缀"，避免命令用引号包裹绝对路径 / .. 回溯绕过检测。
+_BOUNDARY = r"(^|[\s'\"=(])"
 _ESCAPE_PATTERNS = [
-    re.compile(r"(^|\s)\.\.([/\\\s]|$)"),   # 独立 .. token / ../ / ..\\ / ..<EOL>
-    re.compile(r"(^|\s)/[a-zA-Z]"),         # 空白后跟 / 开头的绝对路径（cat /etc/x）
-    re.compile(r"(^|\s|=)~/"),              # ~/path 家目录展开
-    re.compile(r"(^|\s)~($|\s)"),           # 单独 ~ token
+    re.compile(_BOUNDARY + r"\.\.([/\\\s'\")]|$)"),  # 独立 .. token / 路径回溯（含引号、括号内）
+    re.compile(_BOUNDARY + r"/[a-zA-Z]"),            # / 开头的绝对路径（cat /etc/x、open('/etc/x')）
+    re.compile(r"(?<![\w.])/(?:etc|usr|var|root|proc|sys|bin|sbin|boot|dev|lib|opt|home)(?:/|\b)"),  # 系统绝对路径（任意前缀，如 +/etc；相对子目录 foo/etc 不误伤）
+    re.compile(_BOUNDARY + r"~/"),                   # ~/path 家目录展开
+    re.compile(_BOUNDARY + r"~($|[\s'\")])"),        # 单独 ~ token
 ]
 
 
@@ -207,7 +211,3 @@ def host_bash(cmd: str, timeout: int = 30) -> str:
     if err:
         return f"{out}\n--- stderr ---\n{err}{tail}"
     return out + tail
-
-
-# 暴露工具列表给 registry
-FS_TOOLS = [read_file, write_file, list_dir, patch_file, host_bash]

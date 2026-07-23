@@ -9,24 +9,12 @@
 from __future__ import annotations
 
 import os
-import socket
 import warnings
 from typing import Any, Optional
-from urllib.parse import urlparse
+
+from infra.net_probe import probe_port
 
 AIO_SANDBOX_MCP_URL = os.getenv("AIO_SANDBOX_MCP_URL", "http://127.0.0.1:8080/mcp")
-
-
-def _probe(url: str, timeout: float = 1.0) -> bool:
-    """基于 TCP 连接检测目标 URL 对应端口是否可达。"""
-    try:
-        u = urlparse(url)
-        host = u.hostname or "127.0.0.1"
-        port = u.port or (443 if u.scheme == "https" else 80)
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
 
 
 def build_mcp_client() -> Any:
@@ -43,7 +31,7 @@ def build_mcp_client() -> Any:
 
     alive: dict[str, dict[str, Any]] = {}
     for name, cfg in candidates.items():
-        if _probe(cfg["url"]):
+        if probe_port(cfg["url"]):
             alive[name] = cfg
         else:
             warnings.warn(

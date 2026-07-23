@@ -36,6 +36,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from config.runtime import get_settings
+from orchestrator.state import REDUCER_LIST_FIELDS
 
 console = Console()
 
@@ -225,7 +226,14 @@ async def stream_graph(graph: Any, state: dict[str, Any], recursion_limit: int =
                     _close_content_line()
                     print_node_event(node, diff or {})
                     for k, v in (diff or {}).items():
-                        final_state[k] = v
+                        # 归约字段（Annotated[list, add]）需累加而非覆盖，
+                        # 否则 final_state 只保留最后一个节点 return 的增量，丢失历史。
+                        if k in REDUCER_LIST_FIELDS and isinstance(v, list):
+                            existing = final_state.get(k)
+                            base = existing if isinstance(existing, list) else []
+                            final_state[k] = base + v
+                        else:
+                            final_state[k] = v
 
             elif mode == "messages":
                 # payload = (message_chunk, metadata)

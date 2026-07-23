@@ -23,6 +23,7 @@ workspace/
 # 内部设计
 tests/
 docs/
+tmp/
 
 # IDE
 .vscode/

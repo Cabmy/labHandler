@@ -37,6 +37,3 @@ def add_profile_field(path: str, value: Any) -> dict:
     from memory import add_field
 
     return add_field(path, value)
-
-
-PROFILE_TOOLS = [read_profile, update_profile, add_profile_field]

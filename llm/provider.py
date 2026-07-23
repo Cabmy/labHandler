@@ -7,12 +7,10 @@ from __future__ import annotations
 
 import os
 import threading
-import warnings
-from typing import Any, Generator, Optional
+from typing import Any
 
 from langchain_core.caches import InMemoryCache
 from langchain_core.globals import set_llm_cache
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import SecretStr
@@ -75,20 +73,6 @@ def _init_llm_cache_once() -> None:
             return
         set_llm_cache(InMemoryCache())
         _CACHE_INITIALIZED = True
-
-
-def reset_llm_singletons() -> None:
-    """清空所有进程内缓存（实例 + 全局 cache 钩子）。
-
-    该函数用于隔离运行上下文或切换 provider 后的显式重置，
-    下一次 get_llm/get_embeddings 会按最新配置重建实例并重挂 InMemoryCache。
-    """
-    global _CACHE_INITIALIZED
-    with _LOCK:
-        _LLM_INSTANCES.clear()
-        _EMBEDDINGS_INSTANCES.clear()
-        _CACHE_INITIALIZED = False
-        set_llm_cache(None)
 
 
 # ─── 实例工厂（内部构造 + 公开单例入口） ─────────────────────────
@@ -170,67 +154,3 @@ def get_embeddings() -> Any:
         inst = _build_embeddings(provider)
         _EMBEDDINGS_INSTANCES[provider] = inst
         return inst
-
-
-# ─── 调用入口 ─────────────────────────────────────────────────────
-
-
-def chat(prompt: str, system: str = "") -> str:
-    """单轮 chat，返回 content 文本。"""
-    llm = get_llm()
-    messages: list[BaseMessage] = []
-    if system:
-        messages.append(SystemMessage(content=system))
-    messages.append(HumanMessage(content=prompt))
-    resp = llm.invoke(messages)
-    content = resp.content
-    return content if isinstance(content, str) else str(content)
-
-
-def chat_with_tools(messages: list[BaseMessage], tools: list[Any]) -> AIMessage:
-    """绑定工具后单次 invoke，返回 AIMessage（含 tool_calls）。"""
-    llm = get_llm().bind_tools(tools)
-    return llm.invoke(messages)
-
-
-def stream_chat(
-    messages: list[BaseMessage], tools: Optional[list[Any]] = None
-) -> Generator[dict[str, str], None, None]:
-    """流式 chat。yield {"reasoning": str, "content": str} chunk。
-
-    当前 langchain-openai 版本通常不会在 AIMessageChunk 中暴露 reasoning_content；
-    本函数保持前向兼容，若 additional_kwargs 出现该字段会自动分流返回。
-    """
-    llm = get_llm(streaming=True)
-    if tools:
-        llm = llm.bind_tools(tools)
-    for chunk in llm.stream(messages):
-        text = chunk.content if isinstance(chunk.content, str) else ""
-        ak = getattr(chunk, "additional_kwargs", {}) or {}
-        reasoning = ak.get("reasoning_content", "") or ""
-        if text or reasoning:
-            yield {"reasoning": reasoning, "content": text}
-
-
-# ─── messages 拼装辅助（缺少 reasoning_content 时仅告警，不中断流程） ──────────
-
-
-def append_assistant(
-    messages: list[BaseMessage], response: AIMessage
-) -> list[BaseMessage]:
-    """把 assistant 消息加进 messages 列表。
-
-    Paratera 在多数场景不强制 reasoning_content 回灌，且 langchain-openai
-    可能不暴露该字段。因此本函数仅在上层手工构造的 dict 缺字段且带 tool_calls
-    时发出 warnings.warn 提示，**不抛异常 / 不阻断流程**。
-    """
-    if isinstance(response, dict):
-        has_tool = bool(response.get("tool_calls"))
-        if has_tool and "reasoning_content" not in response:
-            warnings.warn(
-                "append_assistant: assistant 消息含 tool_calls 但缺 reasoning_content；"
-                "Paratera 实测不强制，但保留有助思维连贯（本警告不阻断流程）。",
-                stacklevel=2,
-            )
-    messages.append(response)
-    return messages

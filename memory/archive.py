@@ -168,27 +168,6 @@ class TaskArchive:
             rows_by_id = {row["card_id"]: dict(row) for row in cursor.fetchall()}
             return [rows_by_id[rid] for rid in card_ids if rid in rows_by_id]
 
-    def get_card_count(self) -> int:
-        """卡片总数（供索引重建判断用）。"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("SELECT COUNT(*) FROM archive_cards")
-            return cursor.fetchone()[0]
-
-    def get_index_stats(self) -> dict[str, Any]:
-        """索引状态统计。"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            total = conn.execute("SELECT COUNT(*) as n FROM archive_cards").fetchone()[0]
-            failed = conn.execute(
-                "SELECT COUNT(*) as n FROM archive_cards WHERE vector_error IS NOT NULL"
-            ).fetchone()[0]
-            return {
-                "total_cards": total,
-                "indexed": total - failed,
-                "failed": failed,
-                "pending": 0,
-            }
-
 
 # 模块级单例
 
