@@ -140,22 +140,20 @@ def _read_instructions(files: list[Path], max_chars: int = 8000) -> str:
     return full[:max_chars]
 
 
-def _parse_with_sandbox(files: list[Path], max_chars_per_file: int = 6000) -> str:
+async def _parse_with_sandbox(files: list[Path], max_chars_per_file: int = 6000) -> str:
     """把 PDF/DOCX 通过 sandbox_convert_to_markdown 转 markdown 再拼接。
 
     每个文件单独截断（max_chars_per_file），避免一篇长 PDF 吃掉整个 token 预算。
     沙箱不可达 / 单文件解析失败时单条标记，整体仍返回拼接结果（可能为空）。
     返回空串时 run_intake 会降级到「仅文件名提示」路径。
     """
-    import asyncio
-
     chunks: list[str] = []
     for f in files:
         try:
             # sandbox_convert_to_markdown 内部 _call → _translate_path 会把 host 绝对路径
             # 翻译为 /workspace/<rel>，沙箱可见。
             from tools.sandbox_tools import sandbox_convert_to_markdown
-            md = asyncio.run(sandbox_convert_to_markdown(str(f)))
+            md = await sandbox_convert_to_markdown(str(f))
         except Exception as e:
             chunks.append(f"### {f.name}\n[沙箱解析失败：{type(e).__name__}: {e}]")
             continue
@@ -224,11 +222,16 @@ def _llm_extract(instructions_text: str) -> dict[str, Any]:
     }
 
 
-def run_intake(state: HwState) -> dict[str, Any]:
-    """LangGraph 节点入口：扫描 workspace + 抽 intake_result。
+async def run_intake(state: HwState) -> dict[str, Any]:
+    """LangGraph 异步节点入口：扫描 workspace + 抽 intake_result。
+
+    异步化理由：沙箱解析直接 await（消除旧 asyncio.run 对“LangGraph 在线程池
+    跑 sync 节点”这一执行策略的隐式依赖）；同步 LLM 抽取丢线程池不卡事件循环。
 
     Returns: state diff（{intake_result: ..., progress_log: [...]}）
     """
+    import asyncio
+
     scan = _scan_workspace()
     instr_files = scan["instruction"]
     needs_parse = scan["needs_parse"]
@@ -240,7 +243,7 @@ def run_intake(state: HwState) -> dict[str, Any]:
     #   3) PDF/DOCX 正文：调 sandbox_convert_to_markdown 转 markdown（沙箱挂时降级到只给文件名）
     text = _read_instructions(instr_files)
     if needs_parse:
-        parsed = _parse_with_sandbox(needs_parse)
+        parsed = await _parse_with_sandbox(needs_parse)
         if parsed.strip():
             text = (
                 f"### 实验指导文件正文（已由沙箱解析为 markdown）\n\n"
@@ -255,13 +258,20 @@ def run_intake(state: HwState) -> dict[str, Any]:
             )
     if state.get("question"):
         text = f"### 用户当前请求\n{state['question']}\n\n---\n\n{text}"
+    # 支撑材料文件名清单（如 data.csv）：指导文档未点名数据文件时，
+    # 这是 LLM 推断 deliverables/constraints 的廉价信号
+    if support_files:
+        names = "\n".join(
+            f"- {p.relative_to(WORKSPACE_DIR)}" for p in support_files[:30]
+        )
+        text += f"\n\n---\n\n### workspace 支撑材料（仅文件名，供推断交付物/约束参考）\n{names}"
 
     # 只要有任一来源（指导文件 / PDF / 用户请求），就走 LLM 抽取；
     # 全空才退化到硬编码 "other"。
     has_signal = bool(instr_files or needs_parse or state.get("question"))
     if has_signal:
         try:
-            extracted = _llm_extract(text)
+            extracted = await asyncio.to_thread(_llm_extract, text)
             if extracted.get("suggestion"):
                 raise IntakeRejectError(extracted["suggestion"])
         except IntakeRejectError:

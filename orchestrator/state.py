@@ -42,10 +42,13 @@ class HwState(TypedDict, total=False):
 
     # ─── Plan-and-Execute Lite（Coder 单步执行循环） ────────
     # current_step_idx：coder_step 节点要执行 task_dag.nodes 中的第几个 step（0-based）；
-    #   每跑完一轮 coder_step → +1，由 step_router 判断是回 coder_step 还是进 verifier；
+    #   每跑完一轮 coder_step → +1（Final Answer 报 needs_retry 且未耗尽 MAX_STEP_RETRY
+    #   时保持不变，主图原地重跑同一 step），由 step_router 判断是回 coder_step 还是进 verifier；
     #   每次 planner 节点执行（含 Replan）都会 reset 回 0
-    # step_outputs：每跑完一个 step 的简报（[{id, name, summary, ...}]），用 Annotated[list, add]
-    #   累加保留——Replan 时旧轮的不会被清空，Verifier/Summarizer 能看到全部历史。
+    # step_outputs：每跑完一个 step 的简报（[{id, name, status, summary, ...}]），
+    #   status ∈ done|needs_retry|failed；用 Annotated[list, add] 累加保留——
+    #   同 id 条目数即该 step 的历史尝试数（重试计数依据），Replan 时旧轮的不会被清空，
+    #   Verifier/Summarizer 能看到全部历史。
     current_step_idx: int
     step_outputs: Annotated[list[dict], add]
 

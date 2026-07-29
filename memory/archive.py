@@ -26,7 +26,7 @@ class TaskArchive:
         self._init_db()
 
     def _init_db(self) -> None:
-        """创建或迁移数据表。"""
+        """创建数据表。"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -50,6 +50,7 @@ class TaskArchive:
                     vector_error TEXT,
                     content_hash TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    retired_at TIMESTAMP,
                     FOREIGN KEY(task_id) REFERENCES task_archive(id),
                     UNIQUE(task_id, card_type, content_hash)
                 )
@@ -129,27 +130,42 @@ class TaskArchive:
             )
             conn.commit()
 
+    def retire_cards(self, card_ids: list[int]) -> int:
+        """软删卡片（/dream 治理淘汰/被合并的卡）。返回实际标记条数。"""
+        if not card_ids:
+            return 0
+        placeholders = ",".join("?" * len(card_ids))
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE archive_cards SET retired_at = CURRENT_TIMESTAMP
+                WHERE id IN ({placeholders}) AND retired_at IS NULL
+                """,
+                card_ids,
+            )
+            conn.commit()
+            return cursor.rowcount
+
     # --- 读接口 -------------------------------------------------------
 
-    def get_cards_for_indexing(self, limit: int = 500) -> list[dict[str, Any]]:
-        """获取所有需要被索引的卡片（含所属任务信息）。"""
+    def get_cards_for_indexing(self) -> list[dict[str, Any]]:
+        """获取所有需要被索引的卡片（含所属任务信息；排除软删）。"""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 """
-                SELECT c.id, c.card_type, c.content, c.search_text, c.vector_error,
+                SELECT c.id as card_id, c.card_type, c.content, c.search_text, c.vector_error,
                        t.id as task_id, t.task_title, t.task_type
                 FROM archive_cards c
                 JOIN task_archive t ON c.task_id = t.id
+                WHERE c.retired_at IS NULL
                 ORDER BY c.id
-                LIMIT ?
-                """,
-                (limit,),
+                """
             )
             return [dict(row) for row in cursor.fetchall()]
 
     def get_cards_by_ids(self, card_ids: list[int]) -> list[dict[str, Any]]:
-        """按 card_id 回表 hydrate 卡片和所属任务。"""
+        """按 card_id 回表 hydrate 卡片和所属任务（排除软删）。"""
         if not card_ids:
             return []
         placeholders = ",".join("?" * len(card_ids))
@@ -161,12 +177,28 @@ class TaskArchive:
                        t.id as task_id, t.task_title, t.task_type
                 FROM archive_cards c
                 JOIN task_archive t ON c.task_id = t.id
-                WHERE c.id IN ({placeholders})
+                WHERE c.id IN ({placeholders}) AND c.retired_at IS NULL
                 """,
                 card_ids,
             )
             rows_by_id = {row["card_id"]: dict(row) for row in cursor.fetchall()}
             return [rows_by_id[rid] for rid in card_ids if rid in rows_by_id]
+
+    def get_all_active_cards(self) -> list[dict[str, Any]]:
+        """/dream 治理输入：全部未软删卡片（含 card_id / 分组键 / 内容）。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.execute(
+                """
+                SELECT c.id as card_id, c.card_type, c.content, c.task_id,
+                       t.task_title, t.task_type
+                FROM archive_cards c
+                JOIN task_archive t ON c.task_id = t.id
+                WHERE c.retired_at IS NULL
+                ORDER BY c.id
+                """
+            )
+            return [dict(row) for row in cursor.fetchall()]
 
 
 # 模块级单例

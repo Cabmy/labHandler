@@ -23,6 +23,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -222,10 +223,73 @@ def _stage1_hard_checks(state: HwState) -> tuple[list[str], dict[str, Any]]:
 # ─── 阶段 2：LLM 语义覆盖 ────────────────────────────────────────
 
 
-def _gather_artifacts_text(state: HwState, max_chars: int = 6000) -> str:
-    """把 artifacts + workspace 主要文本文件拼起来给 LLM"""
-    chunks: list[str] = []
-    total = 0
+def _build_execution_trace(state: HwState, max_chars: int = 1500) -> str:
+    """拼「执行轨迹摘要」块：让判官能判「约束是否在过程中被真正满足」。
+
+    内容：每个 step 的 id/status/error/retry 原因 + step_lessons 全量 +
+    从 progress_log 提取的 coder_step 关键动向（去重保序）。
+    """
+    lines: list[str] = []
+
+    for o in state.get("step_outputs") or []:
+        status = o.get("status") or ("failed" if o.get("error") else "done")
+        bits = [f"- step {o.get('id')}（{o.get('name','')}）: {status}"]
+        if o.get("error"):
+            bits.append(f"  error: {str(o['error'])[:200]}")
+        if o.get("retry_reason"):
+            bits.append(f"  retry原因: {o['retry_reason']}")
+        for lesson in o.get("step_lessons") or []:
+            bits.append(f"  lesson: {lesson}")
+        lines.extend(bits)
+
+    # coder_step 的 progress_log 摘要（attempt / final_excerpt，去重保序）
+    seen_excerpts: set[str] = set()
+    for entry in state.get("progress_log") or []:
+        if entry.get("node") != "coder_step":
+            continue
+        excerpt = str(entry.get("final_excerpt") or "")[:120]
+        if not excerpt or excerpt in seen_excerpts:
+            continue
+        seen_excerpts.add(excerpt)
+        lines.append(
+            f"- [轨迹] step {entry.get('step_id')} attempt={entry.get('attempt', 1)}: {excerpt}"
+        )
+
+    if not lines:
+        return ""
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars] + "\n…(轨迹截断)"
+    return "## 执行轨迹摘要（Coder 过程证据；与产物矛盾时以本块为准）\n" + text + "\n\n"
+
+
+def _priority_artifact_names(state: HwState) -> set[str]:
+    """交付物 + DAG expected_artifacts 的 basename 集合（分层预算的优先名单）。"""
+    intake = state.get("intake_result") or {}
+    names: set[str] = set()
+    for d in intake.get("deliverables") or []:
+        if isinstance(d, str) and d.strip():
+            names.add(Path(d.strip()).name)
+    for n in (state.get("task_dag") or {}).get("nodes") or []:
+        for a in n.get("expected_artifacts") or []:
+            if isinstance(a, str) and a.strip():
+                names.add(Path(a.strip()).name)
+    return names
+
+
+def _gather_artifacts_text(
+    state: HwState,
+    max_chars: int = 16000,
+    full_per_file: int = 4000,
+    head_per_file: int = 1000,
+) -> str:
+    """把 artifacts + workspace 主要文本文件拼起来给 LLM。
+
+    分层预算（替代旧版"到量硬截断"）：
+    - 优先文件（deliverables / expected_artifacts 命中）：每文件最多 full_per_file 字符
+    - 其余文件：只给开头 head_per_file 字符（判官通常只需确认其存在与大意）
+    - 总量 max_chars 兜底，防大作业 context 爆炸
+    """
     seen: set[Path] = set()
 
     # 优先取 artifacts 列表里登记的文件
@@ -247,20 +311,81 @@ def _gather_artifacts_text(state: HwState, max_chars: int = 6000) -> str:
         if p.suffix.lower() in {".py", ".md", ".txt", ".cpp", ".c", ".h", ".java"}:
             seen.add(p)
 
-    for p in sorted(seen):
+    priority_names = _priority_artifact_names(state)
+    ordered = sorted(seen, key=lambda p: (p.name not in priority_names, str(p)))
+
+    chunks: list[str] = []
+    total = 0
+    for p in ordered:
+        if total >= max_chars:
+            break
         try:
             text = p.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
+        budget = full_per_file if p.name in priority_names else head_per_file
+        budget = min(budget, max_chars - total)
+        clipped = text[:budget]
+        suffix = "\n…(截断)" if len(text) > len(clipped) else ""
         rel = p.relative_to(WORKSPACE_DIR)
-        chunks.append(f"### {rel}\n{text}")
-        total += len(text)
-        if total >= max_chars:
-            break
-    return "\n\n---\n\n".join(chunks)[:max_chars]
+        chunks.append(f"### {rel}\n{clipped}{suffix}")
+        total += len(clipped)
+    return "\n\n---\n\n".join(chunks)
+
+
+def _render_cons_block(
+    task_type: str,
+    task_title: str,
+    constraints: list[str],
+    user_cons: list[str],
+    deliv_cons: list[str],
+    profile_cons: list[str],
+) -> str:
+    """渲染约束分节展示块（单批 / 分批共用）。
+
+    覆盖优先级声明：user_constraints 按 append 时序编号（最末条 = 最新一轮用户指令）；
+    让 LLM 自行处理"后令覆盖前令"和"用户指令覆盖题面"的语义，避免被作废条目仍判 missing。
+    """
+    cons_block_lines: list[str] = [
+        "## 约束条目（已分节；判定前先读下方覆盖规则）",
+        "",
+        f"### 当前任务类型：{task_type}（title={task_title or '（空）'}）",
+        "",
+        "### 覆盖规则（必读）",
+        "- 用户补充约束按对话时间顺序编号；**编号靠后者**与靠前者矛盾时，以靠后者为准，靠前者作废。",
+        "- 用户补充约束整体覆盖题面约束中的同主题条目（用户后续的修订指令可推翻题面默认要求）。",
+        "- 被覆盖作废的条目**不计入 missing，也不要为其找证据**；在 covered/missing 数组里直接省略。",
+        "- 描述性交付物（[交付物]）独立判定。",
+        "- 长期规则（[长期规则]）独立判定；但若该规则与当前任务**完全不相关**"
+        "（例如「实验报告截图占位」对一道纯算法题），直接判 covered，evidence 写"
+        "「N/A：与当前任务不相关」，不要列入 missing。",
+        "",
+        "### 题面约束（intake.constraints）",
+    ]
+    cons_block_lines += [f"- {c}" for c in constraints] or ["- （无）"]
+    cons_block_lines += ["", "### 用户补充约束（user_constraints，按时间顺序）"]
+    if user_cons:
+        for i, c in enumerate(user_cons, 1):
+            tag = "（最新一轮用户指令）" if i == len(user_cons) else ""
+            cons_block_lines.append(f"- {i}) {c}{tag}")
+    else:
+        cons_block_lines.append("- （无）")
+    cons_block_lines += ["", "### 描述性交付物（[交付物]）"]
+    cons_block_lines += [f"- {c}" for c in deliv_cons] or ["- （无）"]
+    cons_block_lines += ["", "### 长期规则（[长期规则]）"]
+    cons_block_lines += [f"- {c}" for c in profile_cons] or ["- （无）"]
+    return "\n".join(cons_block_lines)
+
+
+# 单批约束条数上限：超过则按分节切批，防大量约束 + 产物全文挤爆单次调用
+_COVERAGE_BATCH_THRESHOLD = 12
 
 
 def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str, Any]:
+    # 消融开关（benchmark 用，见 benchmark/run_benchmark.py）：跳过语义覆盖判官
+    if os.getenv("ABLATION_NO_VERIFIER_S2", "").strip() == "1":
+        return {"covered": [], "missing": [], "suggested_fix": "", "_ablated": True}
+
     intake = state.get("intake_result") or {}
     constraints = list(intake.get("constraints") or [])
     user_cons = list(state.get("user_constraints") or [])
@@ -305,6 +430,9 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
         + "\n\n"
     )
 
+    # 执行轨迹摘要（P1-1：过程证据，与静态产物互补）
+    trace_block = _build_execution_trace(state)
+
     # 历史相似任务的卡片（reference block，不进硬清单——让 LLM 判断本次是否适用）
     hist_block = ""
     task_dag = state.get("task_dag") or {}
@@ -319,65 +447,48 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
             + "\n\n"
         )
 
-    # 约束分节展示 + 覆盖优先级声明：
-    # user_constraints 按 append 时序编号（最末条 = 最新一轮用户指令）；
-    # 让 LLM 自行处理"后令覆盖前令"和"用户指令覆盖题面"的语义，避免被作废条目仍判 missing。
-    cons_block_lines: list[str] = [
-        "## 约束条目（已分节；判定前先读下方覆盖规则）",
-        "",
-        f"### 当前任务类型：{task_type}（title={task_title or '（空）'}）",
-        "",
-        "### 覆盖规则（必读）",
-        "- 用户补充约束按对话时间顺序编号；**编号靠后者**与靠前者矛盾时，以靠后者为准，靠前者作废。",
-        "- 用户补充约束整体覆盖题面约束中的同主题条目（用户后续的修订指令可推翻题面默认要求）。",
-        "- 被覆盖作废的条目**不计入 missing，也不要为其找证据**；在 covered/missing 数组里直接省略。",
-        "- 描述性交付物（[交付物]）独立判定。",
-        "- 长期规则（[长期规则]）独立判定；但若该规则与当前任务**完全不相关**"
-        "（例如「实验报告截图占位」对一道纯算法题），直接判 covered，evidence 写"
-        "「N/A：与当前任务不相关」，不要列入 missing。",
-        "",
-        "### 题面约束（intake.constraints）",
-    ]
-    cons_block_lines += [f"- {c}" for c in constraints] or ["- （无）"]
-    cons_block_lines += ["", "### 用户补充约束（user_constraints，按时间顺序）"]
-    if user_cons:
-        for i, c in enumerate(user_cons, 1):
-            tag = "（最新一轮用户指令）" if i == len(user_cons) else ""
-            cons_block_lines.append(f"- {i}) {c}{tag}")
+    # 分批：约束超过阈值时按分节切 ≤2 批（题面+用户 / 交付物+长期规则），
+    # 各批独立调用后合并 covered/missing；多数任务约束 ≤12 条，单批不受影响
+    if len(all_cons) > _COVERAGE_BATCH_THRESHOLD:
+        batch_specs = [
+            (constraints, user_cons, [], []),
+            ([], [], deliv_cons, profile_cons),
+        ]
+        batch_specs = [b for b in batch_specs if any(b)]
     else:
-        cons_block_lines.append("- （无）")
-    cons_block_lines += ["", "### 描述性交付物（[交付物]）"]
-    cons_block_lines += [f"- {c}" for c in deliv_cons] or ["- （无）"]
-    cons_block_lines += ["", "### 长期规则（[长期规则]）"]
-    cons_block_lines += [f"- {c}" for c in profile_cons] or ["- （无）"]
+        batch_specs = [(constraints, user_cons, deliv_cons, profile_cons)]
 
-    user_msg = (
-        stage1_block
-        + "\n".join(cons_block_lines)
-        + "\n\n"
-        + hist_block
-        + "## 产物内容\n\n"
-        + artifacts_text
-    )
+    shared_suffix = trace_block + hist_block + "## 产物内容\n\n" + artifacts_text
     llm = get_llm()
-    try:
-        resp = llm.invoke(
-            [SystemMessage(content=inject_for_agent("verifier", VERIFIER_COVERAGE_SYSTEM)), HumanMessage(content=user_msg)]
-        )
-        content = resp.content if isinstance(resp.content, str) else str(resp.content)
-        data = parse_result_json(content)
-    except Exception as e:
-        return {
-            "covered": [],
-            "missing": [],
-            "suggested_fix": f"[语义覆盖 LLM 失败：{type(e).__name__}]",
-            "_llm_error": str(e),
-        }
+    covered: list[Any] = []
+    missing: list[Any] = []
+    suggested_fix = ""
+
+    for batch in batch_specs:
+        cons_block = _render_cons_block(task_type, task_title, *batch)
+        user_msg = stage1_block + cons_block + "\n\n" + shared_suffix
+        try:
+            resp = llm.invoke(
+                [SystemMessage(content=inject_for_agent("verifier", VERIFIER_COVERAGE_SYSTEM)), HumanMessage(content=user_msg)]
+            )
+            content = resp.content if isinstance(resp.content, str) else str(resp.content)
+            data = parse_result_json(content)
+        except Exception as e:
+            return {
+                "covered": covered,
+                "missing": missing,
+                "suggested_fix": f"[语义覆盖 LLM 失败：{type(e).__name__}]",
+                "_llm_error": str(e),
+            }
+        covered.extend(list(data.get("covered") or []))
+        missing.extend(list(data.get("missing") or []))
+        if not suggested_fix:
+            suggested_fix = str(data.get("suggested_fix") or "")
 
     return {
-        "covered": list(data.get("covered") or []),
-        "missing": list(data.get("missing") or []),
-        "suggested_fix": str(data.get("suggested_fix") or ""),
+        "covered": covered,
+        "missing": missing,
+        "suggested_fix": suggested_fix,
     }
 
 

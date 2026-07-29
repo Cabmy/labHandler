@@ -1,4 +1,4 @@
-"""labHandler CLI - REPL + 命令（PLAN §12 / STEPS P6.1 / P6.3）
+"""labHandler CLI - REPL + 命令
 
 启动流程：
 1. dotenv 加载 → 检测 profile 占位（hint 但不强制交互）
@@ -6,20 +6,20 @@
 3. 进 REPL：每行输入 → "/" 命令分支 / 否则 → 主图 stream
 4. 异常兜底：catch + dump CRASH.log
 
-state 管理（用户决策：单进程单任务）：
-- 整个进程共享一份 HwState；每条 user 输入累加到 messages / user_constraints
+state 管理：
+- 一个 lab 周期内共享一个 TaskSession（一份 HwState）；每条 user 输入累加到 messages / user_constraints
 - 第二次起的 REPL 输入由 graph 入口路由直接进 planner（复用 prior intake_result + verifier_runs 做修订）
-- /done：归档经验卡片 → workspace 内容 mv .trash/<ts>/ → 重建 sandbox 容器 → 退出 REPL（结束进程）
+- /done：归档经验卡片 → workspace 内容 mv .trash/<ts>/ → 重建 sandbox 容器 → 会话复位开新 lab（进程常驻）
 
-命令清单：/help /quit /done /show /show summary /skills /profile /remember
+命令清单：/help /quit /done /dream /edit_skill /skills /profile /remember
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
-import shutil
 import sys
 import time
 import traceback
@@ -36,10 +36,11 @@ load_dotenv(Path(__file__).resolve().parent / "config" / ".env")
 from rich.console import Console  # noqa: E402
 from rich.prompt import Prompt  # noqa: E402
 
+from orchestrator.session import TaskSession  # noqa: E402
+
 SETTINGS = get_settings()
 WORKSPACE_DIR: Path = SETTINGS.workspace_dir
 META_DIR: Path = WORKSPACE_DIR / ".labhandler"
-TRASH_DIR: Path = WORKSPACE_DIR.parent / ".trash"
 
 console = Console()
 
@@ -102,30 +103,6 @@ def _shutdown_repl_loop() -> None:
         pass
 
 
-# ─── state 管理 ────────────────────────────────────────────────────
-
-
-def _new_state(question: str = "") -> dict[str, Any]:
-    return {
-        "question": question,
-        "iteration": 0,
-        "progress_log": [],
-        "messages": [],
-        "user_constraints": [],
-        "verifier_runs": [],
-        "artifacts": [],
-    }
-
-
-def _append_user_message(state: dict[str, Any], text: str) -> None:
-    state.setdefault("messages", []).append({"role": "user", "content": text})
-    state["question"] = text  # 当前请求始终是最新 user 输入
-    # 每条 REPL 输入都累加到 user_constraints，让 Verifier 阶段 2 能比对到。
-    # HwState.user_constraints 用 Annotated[list[str], add]（state.py:39），多轮自动累加；
-    # 重复约束在 Verifier 语义判官那一步会被 LLM 自然 dedup。
-    state.setdefault("user_constraints", []).append(text)
-
-
 # ─── 命令处理 ──────────────────────────────────────────────────────
 
 
@@ -133,9 +110,12 @@ _HELP_TEXT = """
 [bold]labHandler 命令：[/]
   /help                  本帮助
   /quit                  退出（不沉淀）
-  /done                  归档当前任务 → 清场 workspace → 重建 sandbox → 退出
-  /show                  打印当前 state 关键字段摘要
-  /show summary          cat workspace/SUMMARY.md
+  /done                  归档当前任务 → 清场 workspace → 重建 sandbox → 开启新会话
+  /dream                 离线治理归档知识卡片（LLM 合并/去重/淘汰 + 重建索引）
+  /edit_skill <skill> <指令>
+                         自然语言编辑现有 skill（仅 coding/essay/lab_report）：
+                         LLM 产出修改 → 展示 diff → 确认后落盘；指令中提及
+                         workspace 内文件名可作为文风样本供其学习
   /skills                列出 skills/
   /profile               显示当前 profile（me.yaml）
   /remember <rule>       追加一条用户偏好规则到 profile.preferences.style_rules
@@ -147,27 +127,6 @@ _HELP_TEXT = """
 """
 
 
-def _cmd_show(state: dict[str, Any], args: list[str]) -> None:
-    if args and args[0] == "summary":
-        sp = WORKSPACE_DIR / "SUMMARY.md"
-        if sp.exists():
-            console.print(sp.read_text(encoding="utf-8"))
-        else:
-            console.print("[yellow](无 SUMMARY.md，先跑一次任务再看)[/]")
-        return
-    intake = state.get("intake_result") or {}
-    runs = state.get("verifier_runs") or []
-    arts = state.get("artifacts") or []
-    msgs = state.get("messages") or []
-    console.print("[bold]当前 state 摘要：[/]")
-    console.print(f"  question      : {state.get('question','')!r}")
-    console.print(f"  iteration     : {state.get('iteration', 0)}")
-    console.print(f"  intake.type   : {intake.get('type','-')} / title={intake.get('title','-')!r}")
-    console.print(f"  messages      : {len(msgs)} 条")
-    console.print(f"  artifacts     : {len(arts)} 件")
-    console.print(f"  verifier_runs : {[r.get('verdict') for r in runs]}")
-
-
 def _cmd_skills() -> None:
     from skills.repository import list_skill_documents
 
@@ -177,7 +136,7 @@ def _cmd_skills() -> None:
         return
     skills_dir = SETTINGS.skills_dir
     for s in skills:
-        path = (skills_dir / s.get("file_name", f"{s['name']}.md")).resolve()
+        path = (skills_dir / s["file_name"]).resolve()
         console.print(f"  • [cyan]{s['name']}[/]  ({path.relative_to(WORKSPACE_DIR.parent)})")
 
 
@@ -215,68 +174,172 @@ def _cmd_remember(rule: str) -> None:
         console.print(f"[red]写入失败：{type(e).__name__}: {e}[/]")
 
 
-def _cmd_done(state: dict[str, Any]) -> None:
-    """归档 → workspace 清场 → 重建 sandbox。调用方应在调完后退出 REPL。
+def _cmd_dream() -> None:
+    """离线知识治理（P3-2）：按 (card_type, task_type) 分组 LLM 判定合并/淘汰 → 软删 + 重建索引。"""
+    from memory.dream import run_dream
 
-    归档流程：memory.archive.create_task → create_cards → rag.archive_retriever.index_cards
-    """
-    from memory.archive import get_task_archive
-    from rag.archive_retriever import index_cards
-
-    intake = state.get("intake_result") or {}
-    title = intake.get("title") or state.get("question") or "未命名任务"
-    ttype = intake.get("type") or "other"
-    summary_text = state.get("summary") or ""
-    knowledge_cards = state.get("knowledge_cards") or []
-
+    console.print("[dim]开始离线治理归档卡片（每组一次 LLM 调用，可能需要一会儿）…[/]")
     try:
-        archive = get_task_archive()
-        task_id = archive.create_task(title, ttype, summary_text[:4000])
-        card_ids = archive.create_cards(task_id, knowledge_cards, title, ttype)
-        console.print(f"[green]✓ task_id={task_id}, card_ids={card_ids}[/]")
+        report = run_dream()
+    except Exception as e:
+        console.print(f"[red]/dream 失败：{type(e).__name__}: {e}[/]")
+        return
+    console.print(
+        f"[green]✓ 治理完成：{report['total_cards']} 卡 / {report['groups']} 组，"
+        f"判定 {report['judged']} 组 → 新增合并卡 {report['merged_created']}，"
+        f"软删 {report['retired']}[/]"
+    )
+    if report.get("reindex"):
+        ri = report["reindex"]
+        console.print(f"[green]✓ 索引重建：{ri.get('indexed', 0)}/{ri.get('total', 0)} 成功[/]")
+    for s in report.get("promotion_suggestions") or []:
+        console.print(f"[cyan]💡 晋升建议：{s}[/]")
+    for err in report.get("errors") or []:
+        console.print(f"[yellow]组治理失败：{err}[/]")
 
-        if card_ids:
-            result = index_cards(card_ids)
-            indexed = result.get("indexed", 0)
+
+def _cmd_edit_skill(rest: str) -> None:
+    """/edit_skill：LLM 编辑判官改写现有 skill → 终端 diff → y/n 确认 → 落盘。
+
+    入参 rest 是 line 原文中 "/edit_skill " 之后的整段（保留空白，同 /remember 模式）；
+    首 token 为 skill 名，余下为自然语言指令。
+    """
+    from skills.editor import apply_edit, existing_skill_names, propose_edit
+
+    rest = rest.strip()
+    parts = rest.split(maxsplit=1)
+    available = existing_skill_names()
+    if len(parts) < 2 or parts[0] not in available:
+        console.print(
+            "[yellow]用法：/edit_skill <skill> <自然语言指令>"
+            f"（可编辑的 skill：{available}，不支持新增）[/]"
+        )
+        return
+    skill_name, instruction = parts[0], parts[1]
+
+    console.print("[dim]编辑判官分析中（一次 LLM 调用，可能需要一会儿）…[/]")
+    try:
+        proposal = propose_edit(skill_name, instruction)
+    except Exception as e:
+        console.print(f"[red]/edit_skill 失败：{type(e).__name__}: {e}[/]")
+        return
+
+    if proposal.get("style_samples"):
+        console.print(f"[cyan]已读取文风样本：{proposal['style_samples']}[/]")
+    for fail in proposal.get("sample_failures") or []:
+        console.print(f"[yellow]⚠️ 文风样本未用上：{fail}[/]")
+    if proposal.get("summary"):
+        console.print(f"[bold]提案说明：[/]{proposal['summary']}")
+    if not proposal["operations"]:
+        console.print("[yellow]判官认为无需改动（operations 为空）。[/]")
+        return
+
+    from rich.panel import Panel
+    from rich.syntax import Syntax
+    for d in proposal["diffs"]:
+        console.print(Panel(
+            Syntax(d["diff"], "diff", word_wrap=True),
+            title=f"skills/{skill_name}/{d['file']}",
+            border_style="cyan",
+        ))
+
+    if Prompt.ask("应用以上修改？", choices=["y", "n"], default="n") != "y":
+        console.print("[dim]已取消，未落盘。[/]")
+        return
+    try:
+        report = apply_edit(skill_name, proposal["operations"])
+        console.print(f"[green]✓ 已应用：{report['applied']}[/]")
+    except Exception as e:
+        console.print(f"[red]落盘失败（未应用或部分应用，请检查 git diff）：{type(e).__name__}: {e}[/]")
+
+
+def _cmd_done(session: TaskSession) -> None:
+    """归档 → 清场 → 重建 sandbox → 会话复位（逻辑等效进程重启，REPL 继续）。
+
+    复位序列在 orchestrator/session.py:reset（与 Web 端共用）；本函数只做终端呈现。
+    """
+    report = session.reset(log=lambda m: console.print(f"[dim]{m}[/]"))
+
+    result = report["archive"]
+    if result.get("error"):
+        console.print(f"[red]归档失败：{result['error']}[/]")
+    else:
+        console.print(f"[green]✓ task_id={result['task_id']}, card_ids={result['card_ids']}[/]")
+        if result.get("card_ids"):
             failed = result.get("failed", 0)
             if failed:
-                console.print(f"[yellow]Chroma 索引失败 {failed}/{len(card_ids)} 张卡片: {result.get('errors', [])}[/]")
-            console.print(f"[green]✓ 卡片索引完成：{indexed} 成功, {failed} 失败[/]")
+                console.print(
+                    f"[yellow]Chroma 索引失败 {failed}/{len(result['card_ids'])} 张卡片: "
+                    f"{result.get('errors', [])}[/]"
+                )
+            console.print(
+                f"[green]✓ 卡片索引完成：{result.get('indexed', 0)} 成功, {failed} 失败[/]"
+            )
         else:
             console.print("[yellow]无有效知识卡片（跳过索引）[/]")
-    except Exception as e:
-        console.print(f"[red]归档失败：{type(e).__name__}: {e}[/]")
 
-    # workspace 内容 mv 到 .trash/<ts>
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    bucket = TRASH_DIR / ts
-    bucket.mkdir(parents=True, exist_ok=True)
-    moved: list[str] = []
-    for p in WORKSPACE_DIR.iterdir():
-        target = bucket / p.name
-        shutil.move(str(p), str(target))
-        moved.append(p.name)
     console.print(
-        f"[green]✓ workspace 清场，{len(moved)} 件 mv 到 "
-        f"{bucket.relative_to(WORKSPACE_DIR.parent)}[/]"
+        f"[green]✓ workspace 清场，{len(report['moved'])} 件 mv 到 "
+        f"{Path(report['trashed_to']).relative_to(WORKSPACE_DIR.parent)}[/]"
     )
 
-    # 一并重建 sandbox 容器，清掉 pip 全局包 / /tmp / 长跑进程残留
-    # ensure_sandbox 同步阻塞等就绪（最多 60s）；失败也让 REPL 正常退出
-    try:
-        from infra.sandbox_boot import recreate_sandbox
-        ok = recreate_sandbox(log=lambda m: console.print(f"[dim]{m}[/]"))
-        if ok:
-            console.print("[green]✓ sandbox 容器已重建[/]")
-        else:
-            console.print(
-                "[yellow]sandbox 重建未就绪；下次启动 cli 时会再次自检[/]"
-            )
-    except Exception as e:
-        console.print(f"[yellow]sandbox 重建失败：{type(e).__name__}: {e}[/]")
+    sandbox = report["sandbox"]
+    if sandbox == "ok":
+        console.print("[green]✓ sandbox 容器已重建[/]")
+    else:
+        console.print(f"[yellow]sandbox 重建未就绪（{sandbox}）；下次任务前会再次自检[/]")
+
+    console.print("[bold cyan]✓ 新会话已就绪，可直接开始下一个 lab（先往 workspace/ 放材料）[/]")
 
 
 # ─── 主图 stream + CRASH 兜底 ──────────────────────────────────────
+
+
+def _maybe_resume_last_task(session: TaskSession) -> None:
+    """启动时断点检测：上次进程崩溃/被 kill 时 checkpoint 停在非 END 节点 → 询问是否续跑。
+
+    设计哲学是会话级隔离（/done 复位会话、进程常驻），崩溃/被 kill 一定伴随进程死亡，
+    故不设常驻 resume 命令——续跑只发生在启动时刻。
+    用户确认后 graph.astream(None, config) 从断点继续；结束后用 graph.aget_state
+    取权威全量 state 回填 session（stream 的合并结果只含续跑期间的 diff）。
+    """
+    from orchestrator import get_graph
+    from orchestrator.session import find_resumable_thread
+    from ui import print_completion_panel, print_crash_panel, stream_graph
+
+    loop = _get_repl_loop()
+
+    async def _find():
+        # get_graph 必须在 loop 内调（AsyncSqliteSaver 绑定 running loop）
+        return get_graph(), await find_resumable_thread(get_graph())
+
+    try:
+        graph, info = loop.run_until_complete(_find())
+    except Exception:
+        return
+    if not info:
+        return
+    tid, next_nodes = info
+    console.print(
+        f"[yellow]检测到未完成任务（thread={tid}，停在 {'、'.join(next_nodes)}）。[/]"
+    )
+    if Prompt.ask("是否从断点续跑？", choices=["y", "n"], default="n") != "y":
+        return
+    session.thread_id = tid
+    try:
+        loop.run_until_complete(
+            stream_graph(graph, None, config=session.run_config())
+        )
+        snap = loop.run_until_complete(graph.aget_state(session.run_config()))
+        values = getattr(snap, "values", None) or {}
+        if values:
+            session.state = dict(values)
+        print_completion_panel(session.state)
+    except KeyboardInterrupt:
+        console.print("\n[yellow](已中断续跑，checkpoint 保留，下次启动可再续)[/]")
+    except Exception as e:
+        crash = _crash_dump(e, session.state)
+        print_crash_panel(e, crash)
 
 
 def _crash_dump(exc: BaseException, state: dict[str, Any]) -> Path:
@@ -303,7 +366,7 @@ def _get_intake_reject_msg(exc: BaseException) -> str | None:
     return None
 
 
-def _run_task(state: dict[str, Any], user_input: str) -> dict[str, Any]:
+def _run_task(session: TaskSession, user_input: str) -> None:
     """跑一次主图，stream 节点事件，异常 dump CRASH.log
 
     stream_graph 现在是 async（主图含 async 节点 run_coder，需走 graph.astream
@@ -314,29 +377,51 @@ def _run_task(state: dict[str, Any], user_input: str) -> dict[str, Any]:
     from orchestrator import get_graph
     from ui import print_completion_panel, print_crash_panel, stream_graph
 
-    _append_user_message(state, user_input)
-    # refine 路径（state 已有 prior 任务的 verifier_runs）：把 iteration 重置回 0，
-    # 让 planner.iteration += 1 后仍在 MAX_REPLAN_ITER 预算内（否则首轮跑满后第二次输入会立刻撞顶）。
-    if state.get("verifier_runs"):
-        state["iteration"] = 0
-    graph = get_graph()
+    # 任务前沙箱自检：/done 重建失败 / 容器中途被停时在此拉起（端口已通则仅一次探活，毫秒级）
+    try:
+        from infra.sandbox_boot import ensure_sandbox
+        ensure_sandbox(log=lambda m: console.print(f"[dim]{m}[/]"))
+    except Exception as e:
+        console.print(f"[yellow]沙箱自检异常（继续尝试任务）：{type(e).__name__}: {e}[/]")
+
+    state = session.prepare_task(user_input)
+
+    async def _go() -> dict[str, Any]:
+        # get_graph 必须在 loop 内调：首次编译时创建 AsyncSqliteSaver（绑定 running loop）
+        graph = get_graph()
+        return await stream_graph(graph, state, config=session.run_config())
+
     try:
         loop = _get_repl_loop()
-        new_state = loop.run_until_complete(stream_graph(graph, state))
+        new_state = loop.run_until_complete(_go())
+        session.state = new_state
         print_completion_panel(new_state)
-        return new_state
     except KeyboardInterrupt:
         console.print("\n[yellow](已中断本次任务，state 保留)[/]")
-        return state
     except Exception as e:
+        # 沙箱致命错误（agents.errors.SandboxFatalError）：图节点只抛异常，
+        # 进程退出决策收归 CLI 层——打印修复指引后退出
+        from agents.errors import SandboxFatalError
+        cur: BaseException | None = e
+        while cur is not None:
+            if isinstance(cur, SandboxFatalError):
+                console.print(
+                    "\n[bold red][SANDBOX_FATAL][/] 沙箱连续不可用，任务无法继续。\n"
+                    "  请检查容器状态：docker ps -a | grep aio-sandbox\n"
+                    "  重启命令：docker rm -f aio-sandbox && python cli.py\n"
+                    f"  失败详情：{cur.detail}"
+                )
+                sys.exit(1)
+            cur = cur.__cause__
+
         reject_msg = _get_intake_reject_msg(e)
         if reject_msg:
+            # 不退进程（会话级隔离）：用户补完材料后直接重试即可
             console.print(f"\n[yellow]💡 提示: {reject_msg}[/]")
-            sys.exit(1)
-            
+            return
+
         crash = _crash_dump(e, state)
         print_crash_panel(e, crash)
-        return state
 
 
 # ─── 启动检查 ──────────────────────────────────────────────────────
@@ -393,13 +478,35 @@ def _startup_checks() -> None:
 # ─── REPL 主循环 ───────────────────────────────────────────────────
 
 
+def _print_startup_banner() -> None:
+    """开屏信息框（Codex 风格）：模型 / workspace / 常用操作提示。"""
+    from rich.panel import Panel
+    from rich.text import Text
+
+    provider = os.getenv("LLM_PROVIDER", "paratera")
+    if provider == "ollama":
+        model = os.getenv("OLLAMA_MODEL", "qwen2.5:14b")
+    else:
+        model = os.getenv("PARATERA_LLM_MODEL", "DeepSeek-V4-Pro")
+
+    body = Text()
+    body.append("labHandler", style="bold")
+    body.append("  把作业材料丢进 workspace/，剩下的交给 agent\n\n", style="dim")
+    body.append("  model      ", style="dim")
+    body.append(f"{model} ({provider})\n")
+    body.append("  workspace  ", style="dim")
+    body.append(f"{WORKSPACE_DIR}\n")
+    body.append("  /help 查看命令 · Ctrl-D 或 /quit 退出", style="dim")
+    console.print(Panel(body, border_style="dim", padding=(1, 2), expand=False))
+
+
 def repl() -> None:
-    console.print(
-        "[bold cyan]labHandler[/] · type [bold]/help[/] for commands · "
-        "[dim]Ctrl-D / /quit to exit[/]"
-    )
+    _print_startup_banner()
     _startup_checks()
-    state: dict[str, Any] = _new_state()
+    session = TaskSession()
+
+    # 断点检测：有未跑完的任务则询问是否续跑（不设常驻 resume 命令）
+    _maybe_resume_last_task(session)
 
     try:
         while True:
@@ -415,14 +522,16 @@ def repl() -> None:
             if line.startswith("/"):
                 parts = line[1:].split()
                 cmd = parts[0] if parts else ""
-                args = parts[1:]
                 if cmd == "quit":
                     console.print("[dim]bye[/]")
                     return
                 elif cmd == "help":
                     console.print(_HELP_TEXT)
-                elif cmd == "show":
-                    _cmd_show(state, args)
+                elif cmd == "dream":
+                    _cmd_dream()
+                elif cmd == "edit_skill":
+                    # 用 line 原文截取 "/edit_skill " 之后的整段，保留指令中的空白
+                    _cmd_edit_skill(line[len("/edit_skill"):].lstrip())
                 elif cmd == "skills":
                     _cmd_skills()
                 elif cmd == "profile":
@@ -431,15 +540,14 @@ def repl() -> None:
                     # 用 line 原文截取 "/remember " 之后的整段，绕开 split+join 对零宽空白 / 多空格的折叠
                     _cmd_remember(line[len("/remember"):].lstrip())
                 elif cmd == "done":
-                    _cmd_done(state)
-                    console.print("[dim]bye[/]")
-                    return  # 单进程单任务：/done 后退出 REPL，finally 走 _shutdown_repl_loop
+                    _cmd_done(session)
+                    # 会话已复位（逻辑等效进程重启），REPL 继续接下一个 lab
                 else:
                     console.print(f"[yellow]未知命令：/{cmd}（试试 /help）[/]")
                 continue
 
             # 普通 user 输入：直接发到主图（偏好显式用 /remember 写入 profile，不再 LLM 判意图）
-            state = _run_task(state, line)
+            _run_task(session, line)
     finally:
         # REPL 任意路径退出（正常 /quit / Ctrl-D / 异常）都走这里关 loop，
         # 取消 pending tasks + 关 async generators，避免主程序退出后还在 trace。

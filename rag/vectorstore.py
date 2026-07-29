@@ -7,14 +7,13 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./.labhandler_data/chroma")
-CHROMA_COLLECTION_NAME = os.getenv("CHROMA_COLLECTION_NAME", "task_archive_glm_embedding_3")
 
 
 class VectorStore:
-    """ChromaDB 向量存储封装"""
+    """ChromaDB 向量存储封装（collection 名由调用方指定，唯一消费者在 rag/archive_retriever.py）"""
 
-    def __init__(self, collection_name: Optional[str] = None, persist_dir: Optional[str] = None) -> None:
-        self.collection_name: str = collection_name or CHROMA_COLLECTION_NAME
+    def __init__(self, collection_name: str, persist_dir: Optional[str] = None) -> None:
+        self.collection_name: str = collection_name
         self.persist_dir: str = persist_dir or CHROMA_PERSIST_DIR
         self._vectorstore: Optional[Chroma] = None
 

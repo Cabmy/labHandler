@@ -48,9 +48,6 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 os.chdir(str(_REPO))
 
-# 探针强制关闭 LLM cache，避免命中历史让结果失真
-os.environ["LLM_CACHE_ENABLED"] = "false"
-
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(_REPO / "config" / ".env")
@@ -121,7 +118,6 @@ async def main(guided: bool) -> int:
     mode = "GUIDED" if guided else "NEUTRAL"
     print(f"[probe] mode = {mode}")
     print(f"[probe] fixture dir = {PROBE_DIR.relative_to(_REPO)}")
-    print(f"[probe] LLM_CACHE_ENABLED = {os.getenv('LLM_CACHE_ENABLED', '?')}")
 
     print("[probe] building coder agent (no sandbox)...")
     agent = await _build_minimal_coder_no_sandbox()

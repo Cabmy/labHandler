@@ -1,0 +1,743 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>labHandler</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --border: #2a2f3a;
+      --text: #d7dae0;
+      --dim: #8b93a1;
+      --accent: #4da3ff;
+      --green: #4caf7d;
+      --yellow: #d9a33c;
+      --red: #e05c5c;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 24px 16px 60px;
+    }
+
+    /* ─── 头部 + tab ─────────────────────────────────── */
+
+    header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    h1 {
+      font-size: 20px;
+    }
+
+    h1 small {
+      color: var(--dim);
+      font-weight: normal;
+      font-size: 12px;
+      margin-left: 8px;
+    }
+
+    nav {
+      display: flex;
+      gap: 4px;
+    }
+
+    nav button {
+      background: transparent;
+      border: 0;
+      border-radius: 6px;
+      color: var(--dim);
+      font-size: 13px;
+      padding: 6px 14px;
+      cursor: pointer;
+    }
+
+    nav button.active {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    nav button:disabled {
+      opacity: .45;
+      cursor: not-allowed;
+    }
+
+    /* ─── 卡片 ───────────────────────────────────────── */
+
+    section {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      margin-top: 16px;
+    }
+
+    section h2 {
+      font-size: 13px;
+      color: var(--dim);
+      font-weight: normal;
+      margin-bottom: 10px;
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    /* ─── 上传区 ─────────────────────────────────────── */
+
+    #drop {
+      border: 2px dashed var(--border);
+      border-radius: 8px;
+      padding: 22px;
+      text-align: center;
+      color: var(--dim);
+      cursor: pointer;
+      transition: border-color .15s;
+    }
+
+    #drop.hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    #drop.disabled {
+      opacity: .5;
+      cursor: not-allowed;
+    }
+
+    ul.files {
+      margin-top: 10px;
+      font-size: 13px;
+    }
+
+    ul.files li {
+      list-style: none;
+      padding: 4px 0;
+      display: flex;
+      justify-content: space-between;
+      border-bottom: 1px dashed var(--border);
+    }
+
+    ul.files a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .del-btn {
+      background: transparent;
+      border: 0;
+      color: var(--dim);
+      font-size: 13px;
+      padding: 0 2px;
+      margin-left: 10px;
+      cursor: pointer;
+    }
+
+    .del-btn:hover {
+      color: var(--red);
+    }
+
+    /* ─── 输入行 / 按钮 ──────────────────────────────── */
+
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    input[type=text] {
+      flex: 1;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-size: 14px;
+    }
+
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: 0;
+      border-radius: 6px;
+      padding: 10px 18px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      background: var(--border);
+      color: var(--dim);
+      cursor: not-allowed;
+    }
+
+    button.ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--dim);
+    }
+
+    #status {
+      font-size: 12px;
+      color: var(--dim);
+    }
+
+    /* ─── 转录区（与 CLI 视觉语言呼应） ──────────────── */
+
+    #log {
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 12.5px;
+      max-height: 420px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.6;
+    }
+
+    #log .node {
+      color: var(--text);
+      font-weight: bold;
+      margin-top: 8px;
+      display: block;
+    }
+
+    #log .tool {
+      color: var(--text);
+      display: block;
+      padding-left: 14px;
+    }
+
+    #log .tool b {
+      font-weight: bold;
+    }
+
+    #log .tool i {
+      color: var(--dim);
+      font-style: normal;
+    }
+
+    #log .toolret {
+      color: var(--dim);
+      display: block;
+      padding-left: 28px;
+    }
+
+    #log .done {
+      color: var(--green);
+      display: block;
+      padding-left: 14px;
+      opacity: .8;
+    }
+
+    #log .err {
+      color: var(--red);
+      display: block;
+    }
+
+    #log .stream {
+      color: var(--text);
+      padding-left: 14px;
+    }
+
+    #log .reason {
+      color: var(--dim);
+      font-style: italic;
+      padding-left: 14px;
+    }
+
+    /* ─── 结果区 ─────────────────────────────────────── */
+
+    #verdict {
+      font-size: 15px;
+      font-weight: bold;
+      margin-bottom: 8px;
+    }
+
+    #verdict.pass {
+      color: var(--green);
+    }
+
+    #verdict.fail {
+      color: var(--yellow);
+    }
+
+    #summary {
+      white-space: pre-wrap;
+      font-size: 13px;
+      line-height: 1.6;
+      max-height: 360px;
+      overflow-y: auto;
+      margin-top: 10px;
+    }
+
+    /* ─── Skill 编辑 ─────────────────────────────────── */
+
+    select,
+    textarea {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 14px;
+    }
+
+    textarea {
+      width: 100%;
+      margin-top: 8px;
+      resize: vertical;
+      min-height: 60px;
+      font-family: inherit;
+    }
+
+    #skillNotice {
+      color: var(--yellow);
+      font-size: 13px;
+      margin-top: 16px;
+    }
+
+    #skillDiffs {
+      font-family: "SF Mono", Consolas, monospace;
+      font-size: 12.5px;
+      max-height: 360px;
+      overflow-y: auto;
+      margin-top: 10px;
+    }
+
+    #skillDiffs .diff-file {
+      color: var(--accent);
+      font-weight: bold;
+      margin: 8px 0 2px;
+    }
+
+    #skillDiffs pre {
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.5;
+    }
+
+    #skillDiffs .add {
+      color: var(--green);
+    }
+
+    #skillDiffs .del {
+      color: var(--red);
+    }
+
+    #skillMsg {
+      font-size: 12px;
+      color: var(--dim);
+      margin-top: 8px;
+    }
+  </style>
+</head>
+
+<body>
+
+  <header>
+    <h1>labHandler <small>把作业材料拖进来，剩下的交给 agent</small></h1>
+    <nav>
+      <button id="tabTask" class="active">任务</button>
+      <button id="tabSkill">Skill 编辑</button>
+    </nav>
+  </header>
+
+  <!-- ═══ 任务视图 ═══ -->
+  <div id="viewTask">
+
+    <section id="secUpload">
+      <h2>作业材料（等效放入 workspace）</h2>
+      <div id="drop">拖拽文件到这里，或点击选择（README / 实验指导 .md .pdf .docx 等）</div>
+      <input type="file" id="fileinput" multiple class="hidden">
+      <ul id="filelist" class="files"></ul>
+    </section>
+
+    <section id="secTask">
+      <h2>下达任务（首轮解析题面；后续输入作为补充/修订指令）</h2>
+      <div class="row">
+        <input type="text" id="question" placeholder="例：请按 README 完成作业" value="请按 README 完成作业">
+        <button id="run">开始</button>
+        <span id="status"></span>
+      </div>
+    </section>
+
+    <section id="secProgress" class="hidden">
+      <h2>执行进度</h2>
+      <div id="log"></div>
+    </section>
+
+    <section id="secResult" class="hidden">
+      <h2>结果</h2>
+      <div id="verdict"></div>
+      <ul id="filelist2" class="files"></ul>
+      <div id="summary"></div>
+      <div class="row" style="margin-top:12px">
+        <button id="donebtn" class="ghost">归档结束（清场 workspace）</button>
+        <button id="dreambtn" class="ghost">知识治理（/dream）</button>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- ═══ Skill 编辑视图 ═══ -->
+  <div id="viewSkill" class="hidden">
+
+    <div id="skillNotice" class="hidden">任务运行中，暂不能编辑 skill；等本次任务结束后再来。</div>
+
+    <section id="secSkill">
+      <h2>编辑现有 skill（自然语言描述改法；文风样本先在「任务」页上传进 workspace 并在指令中提及文件名）</h2>
+      <div class="row">
+        <select id="skillSel"></select>
+        <button id="skillPropose">生成修改提案</button>
+        <span id="skillStatus" style="font-size:12px;color:var(--dim)"></span>
+      </div>
+      <textarea id="skillInstr" rows="3" placeholder="例：删掉实验报告模板中的『实验心得』章节，以后都不要该章节；或：学习 我的报告.docx 的文风"></textarea>
+      <div id="skillMsg"></div>
+      <div id="skillDiffs"></div>
+      <div class="row hidden" id="skillActions" style="margin-top:10px">
+        <button id="skillApply">应用修改</button>
+        <button id="skillCancel" class="ghost">取消</button>
+      </div>
+    </section>
+
+    <section id="secProfile">
+      <h2>长期偏好规则（注入各 agent 提示词，Verifier 会逐条对账；等效 CLI /remember）</h2>
+      <ul id="ruleList" class="files"></ul>
+      <div class="row">
+        <input id="ruleInput" type="text" placeholder="例：所有实验报告结论章节必须含误差分析" style="flex:1">
+        <button id="ruleAdd">追加规则</button>
+      </div>
+    </section>
+
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let es = null;          // EventSource
+    let streamBuf = null;   // 当前流式文字 span
+    let running = false;    // 任务运行态（提交成功 → true；SSE final/error → false）
+
+    // ─── 运行态统一切换（tab 置灰 / 上传禁用 / 开始按钮禁用） ──
+    function setRunning(v) {
+      running = v;
+      $('run').disabled = v;
+      $('status').textContent = v ? '运行中…' : '';
+      $('drop').classList.toggle('disabled', v);
+      $('fileinput').disabled = v;
+      $('tabSkill').disabled = v;
+      $('skillNotice').classList.toggle('hidden', !v);
+      $('secSkill').classList.toggle('hidden', v);
+      if (v && !$('viewSkill').classList.contains('hidden')) switchTab('task');
+    }
+
+    // ─── tab 切换 ───────────────────────────────────────────────
+    function switchTab(name) {
+      const task = name === 'task';
+      $('viewTask').classList.toggle('hidden', !task);
+      $('viewSkill').classList.toggle('hidden', task);
+      $('tabTask').classList.toggle('active', task);
+      $('tabSkill').classList.toggle('active', !task);
+    }
+    $('tabTask').onclick = () => switchTab('task');
+    $('tabSkill').onclick = () => { if (!running) switchTab('skill'); };
+
+    // ─── 文件上传 / 删除 ────────────────────────────────────────
+    async function refreshFiles(listEl) {
+      const files = await (await fetch('/api/files')).json();
+      listEl.innerHTML = files.map(f =>
+        `<li><a href="/api/files/${encodeURIComponent(f.name)}" download>${f.name}</a>` +
+        `<span style="color:var(--dim)">${f.size} B` +
+        `<button class="del-btn" data-name="${encodeURIComponent(f.name)}" title="删除（移入 .trash/）">✕</button></span></li>`).join('');
+      listEl.querySelectorAll('.del-btn').forEach(btn => {
+        btn.onclick = () => deleteFile(decodeURIComponent(btn.dataset.name));
+      });
+    }
+    async function deleteFile(name) {
+      if (!confirm(`删除 ${name}？（会移入 .trash/，不真删）`)) return;
+      const resp = await fetch('/api/files/' + encodeURIComponent(name), { method: 'DELETE' });
+      if (!resp.ok) { alert('删除失败：' + (await resp.json()).detail); return; }
+      await refreshFiles($('filelist'));
+      if (!$('secResult').classList.contains('hidden')) await refreshFiles($('filelist2'));
+    }
+    async function uploadFiles(files) {
+      if (!files.length || running) return;
+      const fd = new FormData();
+      for (const f of files) fd.append('files', f);
+      const resp = await fetch('/api/files', { method: 'POST', body: fd });
+      if (!resp.ok) alert('上传失败：' + (await resp.json()).detail);
+      await refreshFiles($('filelist'));
+    }
+    $('drop').onclick = () => { if (!running) $('fileinput').click(); };
+    $('fileinput').onchange = (e) => uploadFiles([...e.target.files]);
+    $('drop').ondragover = (e) => { e.preventDefault(); if (!running) $('drop').classList.add('hover'); };
+    $('drop').ondragleave = () => $('drop').classList.remove('hover');
+    $('drop').ondrop = (e) => {
+      e.preventDefault(); $('drop').classList.remove('hover');
+      uploadFiles([...e.dataTransfer.files]);
+    };
+
+    // ─── 转录渲染（Codex 风格：节点 bullet / 工具行 / dim 结果） ─
+    function logLine(cls, text) {
+      streamBuf = null;
+      const s = document.createElement('span');
+      s.className = cls; s.textContent = text;
+      $('log').appendChild(s);
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+    function logTool(name, args) {
+      streamBuf = null;
+      const s = document.createElement('span');
+      s.className = 'tool';
+      const b = document.createElement('b');
+      b.textContent = '• ' + name;
+      s.appendChild(b);
+      if (args) {
+        const i = document.createElement('i');
+        i.textContent = '(' + args + ')';
+        s.appendChild(i);
+      }
+      $('log').appendChild(s);
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+    function logStream(text, reasoning) {
+      if (!streamBuf) {
+        streamBuf = document.createElement('span');
+        streamBuf.className = reasoning ? 'reason' : 'stream';
+        $('log').appendChild(streamBuf);
+      }
+      streamBuf.textContent += text;
+      // 流式文字只保留末尾 2000 字符，防 DOM 膨胀
+      if (streamBuf.textContent.length > 2000)
+        streamBuf.textContent = streamBuf.textContent.slice(-2000);
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+
+    // ─── SSE 订阅（提交成功后 / 刷新页面时 running 恢复共用） ──
+    function attachStream() {
+      $('secProgress').classList.remove('hidden');
+      $('secResult').classList.add('hidden');
+      es = new EventSource('/api/task/stream');
+      es.addEventListener('node_start', (e) => {
+        const d = JSON.parse(e.data);
+        logLine('node', '• ' + d.node);
+      });
+      es.addEventListener('content', (e) => {
+        const d = JSON.parse(e.data);
+        logStream(d.text, d.reasoning);
+      });
+      es.addEventListener('tool', (e) => {
+        const d = JSON.parse(e.data);
+        logTool(d.name, (d.args || '').slice(0, 80));
+        if (d.result) logLine('toolret', '└ ' + d.result.slice(0, 140));
+      });
+      es.addEventListener('node_done', (e) => {
+        const d = JSON.parse(e.data);
+        const bits = (d.log || []).map(en =>
+          Object.entries(en).filter(([k]) => k !== 'node')
+            .map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 60)}`).join(' · '));
+        logLine('done', '✓ ' + (bits.join(' | ') || 'done'));
+      });
+      es.addEventListener('error', (e) => {
+        if (e.data) { const d = JSON.parse(e.data); logLine('err', '✗ ' + d.detail); }
+        finish(null);
+      });
+      es.addEventListener('final', async (e) => {
+        const d = JSON.parse(e.data);
+        finish(d);
+      });
+    }
+
+    // ─── 任务提交 ───────────────────────────────────────────────
+    $('run').onclick = async () => {
+      const q = $('question').value.trim();
+      if (!q) return;
+      const resp = await fetch('/api/task', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question: q }),
+      });
+      if (!resp.ok) { alert((await resp.json()).detail); return; }
+      setRunning(true);
+      $('log').innerHTML = '';
+      attachStream();
+    };
+
+    async function finish(final) {
+      if (es) { es.close(); es = null; }
+      setRunning(false);
+      if (!final) return;
+      $('secResult').classList.remove('hidden');
+      const v = $('verdict');
+      v.textContent = (final.verdict === 'pass' ? '✓ 通过' : '⚠ ' + final.verdict) +
+        ` · iteration=${final.iteration} · ${final.elapsed}s`;
+      v.className = final.verdict === 'pass' ? 'pass' : 'fail';
+      await refreshFiles($('filelist2'));
+      await refreshFiles($('filelist'));
+      const s = await (await fetch('/api/summary')).json();
+      $('summary').textContent = s.summary || '（无 SUMMARY.md）';
+    }
+
+    // ─── 归档结束 ───────────────────────────────────────────────
+    $('donebtn').onclick = async () => {
+      if (!confirm('归档当前任务并清场 workspace？（文件移入 .trash/，沙箱容器将重建，约几十秒）')) return;
+      const resp = await fetch('/api/done', { method: 'POST' });
+      const d = await resp.json();
+      if (!resp.ok) { alert(d.detail); return; }
+      alert('已归档：' + JSON.stringify(d.archive));
+      $('secResult').classList.add('hidden');
+      $('secProgress').classList.add('hidden');
+      await refreshFiles($('filelist'));
+    };
+
+    // ─── 知识治理（/dream） ─────────────────────────────────────
+    $('dreambtn').onclick = async () => {
+      if (!confirm('对归档知识卡片做一轮 LLM 合并/去重/淘汰？（可能需要几分钟）')) return;
+      $('dreambtn').disabled = true;
+      try {
+        const resp = await fetch('/api/dream', { method: 'POST' });
+        const d = await resp.json();
+        if (!resp.ok) { alert(d.detail); return; }
+        alert(`治理完成：共 ${d.total_cards} 张卡 / 判定 ${d.judged} 组 / 新建合并卡 ${d.merged_created} / 淘汰 ${d.retired}`);
+      } finally { $('dreambtn').disabled = false; }
+    };
+
+    // ─── Skill 编辑（提案 → diff → 确认/取消） ──────────────────
+    let editId = null;   // 当前 pending 提案 id
+
+    async function loadSkills() {
+      try {
+        const skills = await (await fetch('/api/skills')).json();
+        $('skillSel').innerHTML = skills.map(s =>
+          `<option value="${s.name}">${s.name}</option>`).join('');
+      } catch (e) { /* 服务未就绪时静默 */ }
+    }
+    function renderDiffs(diffs) {
+      $('skillDiffs').innerHTML = '';
+      for (const d of diffs) {
+        const title = document.createElement('div');
+        title.className = 'diff-file'; title.textContent = '📄 ' + d.file;
+        const pre = document.createElement('pre');
+        for (const ln of d.diff.split('\n')) {
+          const span = document.createElement('span');
+          if (ln.startsWith('+') && !ln.startsWith('+++')) span.className = 'add';
+          else if (ln.startsWith('-') && !ln.startsWith('---')) span.className = 'del';
+          span.textContent = ln + '\n';
+          pre.appendChild(span);
+        }
+        $('skillDiffs').append(title, pre);
+      }
+    }
+    $('skillPropose').onclick = async () => {
+      const instr = $('skillInstr').value.trim();
+      if (!instr) { alert('请填写编辑指令'); return; }
+      $('skillPropose').disabled = true;
+      $('skillStatus').textContent = 'LLM 分析中…';
+      $('skillMsg').textContent = ''; $('skillDiffs').innerHTML = '';
+      $('skillActions').classList.add('hidden'); editId = null;
+      try {
+        const resp = await fetch('/api/edit_skill', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ skill_name: $('skillSel').value, instruction: instr }),
+        });
+        const d = await resp.json();
+        if (!resp.ok) { alert(d.detail); return; }
+        let msg = d.summary || '';
+        if (d.style_samples && d.style_samples.length)
+          msg += `　（已读取文风样本：${d.style_samples.join('、')}）`;
+        if (d.sample_failures && d.sample_failures.length)
+          msg += `　⚠️ 文风样本未用上：${d.sample_failures.join('；')}`;
+        $('skillMsg').textContent = msg;
+        if (!d.n_operations) {
+          $('skillMsg').textContent += '　—— 判官认为无需改动';
+          return;
+        }
+        renderDiffs(d.diffs);
+        editId = d.edit_id;
+        $('skillActions').classList.remove('hidden');
+      } finally {
+        $('skillPropose').disabled = false;
+        $('skillStatus').textContent = '';
+      }
+    };
+    async function applyEdit(confirm) {
+      if (!editId) return;
+      const resp = await fetch('/api/edit_skill/apply', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ edit_id: editId, confirm }),
+      });
+      const d = await resp.json();
+      if (!resp.ok) { alert(d.detail); return; }
+      $('skillMsg').textContent = confirm ? ('✓ 已应用：' + (d.applied || []).join('、')) : '已取消，未落盘';
+      $('skillDiffs').innerHTML = '';
+      $('skillActions').classList.add('hidden');
+      editId = null;
+    }
+    $('skillApply').onclick = () => applyEdit(true);
+    $('skillCancel').onclick = () => applyEdit(false);
+
+    // ─── 长期偏好规则（/api/profile + /api/remember） ──────────
+    async function loadRules() {
+      try {
+        const prof = await (await fetch('/api/profile')).json();
+        const rules = (prof.preferences || {}).style_rules || [];
+        const ul = $('ruleList');
+        ul.innerHTML = '';
+        if (!rules.length) {
+          const li = document.createElement('li');
+          li.style.color = 'var(--dim)'; li.textContent = '（暂无规则；在下方输入追加）';
+          ul.appendChild(li); return;
+        }
+        for (const r of rules) {
+          const li = document.createElement('li'); li.textContent = r; ul.appendChild(li);
+        }
+      } catch (e) { /* 服务未就绪时静默 */ }
+    }
+    $('ruleAdd').onclick = async () => {
+      const rule = $('ruleInput').value.trim();
+      if (!rule) return;
+      const resp = await fetch('/api/remember', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ rule }),
+      });
+      const d = await resp.json();
+      if (!resp.ok) { alert(d.detail); return; }
+      $('ruleInput').value = '';
+      await loadRules();
+    };
+
+    // ─── 初始化：文件列表 + skills + 运行态恢复（覆盖刷新页面场景） ─
+    async function init() {
+      await refreshFiles($('filelist'));
+      await loadSkills();
+      await loadRules();
+      try {
+        const st = await (await fetch('/api/state')).json();
+        if (st.running) {
+          setRunning(true);
+          $('log').innerHTML = '';
+          attachStream();   // 重新订阅事件流，继续看进度
+        }
+      } catch (e) { /* 状态接口失败不阻塞页面 */ }
+    }
+    init();
+  </script>
+</body>
+
+</html>

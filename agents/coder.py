@@ -12,21 +12,18 @@
 
 from __future__ import annotations
 
-import asyncio
-import os
-import sys
+import re
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from llm import get_llm
+from agents.errors import SandboxFatalError
 from memory.profile import inject_for_agent
 from orchestrator.state import HwState
 from config.prompts import ACADEMIC_INTEGRITY_PROMPT, CODER_BASE_PROMPT
 from config.runtime import get_settings
 from tools.sandbox_tools import reset_sandbox_failure_counter
-
-MAX_REACT_ITER = int(os.getenv("MAX_REACT_ITER", "6"))
 
 
 def _build_system_prompt(state: HwState) -> str:
@@ -66,6 +63,21 @@ def _build_system_prompt(state: HwState) -> str:
     return inject_for_agent("coder", base)
 
 
+def _parse_step_status(final: str) -> tuple[str, str]:
+    """从 Final Answer 首部解析 step status。
+
+    格式契约（CODER_BASE_PROMPT）：`step <id> <status>: <一句话>`，status ∈ done | needs_retry。
+    Returns: (status, reason)；无匹配时默认 ("done", "") 保持旧格式兼容
+    （旧 prompt 只要求 done 起头，产物缺失仍由 Verifier 兜底）。
+    """
+    m = re.search(r"step\s+\S+\s+(done|needs_retry)\s*[:：]\s*(.*)", final or "")
+    if not m:
+        return "done", ""
+    status = m.group(1)
+    reason = m.group(2).strip().splitlines()[0][:200] if m.group(2).strip() else ""
+    return status, reason
+
+
 def _last_coder_final_answer(messages: list[dict[str, Any]], max_chars: int = 800) -> str:
     """从 state.messages 倒序找最后一条非空 assistant 消息（上一轮 Coder Final Answer）。
 
@@ -94,13 +106,13 @@ def _format_dag_with_focus(
     Plan-and-Execute Lite：Coder 单步执行时的 task_dag 视图。
     标记规则：
       - i == current_idx               → [▶ 当前]
-      - n.id 已出现在 step_outputs[].id → [done]
+      - n.id 有 status=done 的 step_output → [done]
       - 否则                            → [pending]
     """
     nodes = task_dag.get("nodes") or []
     if not nodes:
         return "## task_dag 全局视野\n（Planner 未产出 DAG）"
-    done_ids = {o.get("id") for o in step_outputs}
+    done_ids = {o.get("id") for o in step_outputs if o.get("status") == "done"}
     lines = ["## task_dag 全局视野"]
     for i, n in enumerate(nodes):
         if i == current_idx:
@@ -151,7 +163,13 @@ def _format_completed_step_outputs(step_outputs: list[dict[str, Any]]) -> str:
         first = summ[0] if summ else ""
         first = first[:200]
         err = o.get("error") or ""
-        if err:
+        if o.get("status") == "needs_retry":
+            # 原地重试：让下一轮同 step 的 Coder 看到上次卡点
+            lines.append(
+                f"- **{o.get('id')}** {o.get('name','')}: "
+                f"[retry] {o.get('retry_reason', '') or first}"
+            )
+        elif err:
             lines.append(
                 f"- **{o.get('id')}** {o.get('name','')}: [error] {err[:120]}"
             )
@@ -190,45 +208,46 @@ def _check_dependency_artifacts(
     current_node: dict[str, Any],
     all_nodes: list[dict[str, Any]],
     step_outputs: list[dict[str, Any]],
-) -> list[str]:
-    """检查当前 step 的 depends_on 依赖是否满足（预期产物存在 + 依赖 step 无 error）。
+) -> tuple[list[str], list[str]]:
+    """检查当前 step 的 depends_on 依赖。Returns: (blockers, warnings)。
 
-    返回缺失原因列表（空 = 全部满足）。不满足时 _run_coder_async 会跳过当前 step，
-    不让 Coder 在空中楼阁上浪费 ReAct 迭代。
+    - blockers（真跳过）：依赖 step 未在 DAG 定义 / 依赖 step 执行带 error。
+      调用方跳过当前 step，不让 Coder 在空中楼阁上浪费 ReAct 迭代。
+    - warnings（仅提醒）：依赖 step 已 done 但声明的 expected_artifacts 不在盘上。
+      depends_on 现已统一为单链，LLM 产物命名漂移常见，若仍硬跳过会连坐
+      掉全部后续 step 白烧一轮 Replan；改为注入 Coder 上下文让其先核实实际文件名。
     """
     deps = current_node.get("depends_on") or []
     if not deps:
-        return []
+        return [], []
 
     node_map = {n.get("id"): n for n in all_nodes}
     output_map = {o.get("id"): o for o in step_outputs}
     ws = get_settings().workspace_dir
-    missing: list[str] = []
+    blockers: list[str] = []
+    warnings: list[str] = []
 
     for dep_id in deps:
         dep_node = node_map.get(dep_id)
         if not dep_node:
-            missing.append(f"依赖 step {dep_id} 未在 DAG 中定义")
+            blockers.append(f"依赖 step {dep_id} 未在 DAG 中定义")
             continue
 
         dep_out = output_map.get(dep_id)
         if dep_out and dep_out.get("error"):
-            missing.append(
+            blockers.append(
                 f"{dep_id} 执行失败（{dep_out['error']}），"
                 f"当前 step {current_node.get('id')} 依赖其产出"
             )
             # 有 error 就不用再查文件了（必然不存在）
             continue
 
-        # 检查预期产物文件是否存在
-        artifacts = dep_node.get("expected_artifacts") or []
-        for art in artifacts:
+        # 预期产物文件不在盘上 → 警告注入上下文（不阻断）
+        for art in dep_node.get("expected_artifacts") or []:
             if not (ws / art).exists():
-                missing.append(
-                    f"{dep_id} 的预期产物 {art} 不存在"
-                )
+                warnings.append(f"前置 step {dep_id} 声明的产物 {art} 未在盘上找到")
 
-    return missing
+    return blockers, warnings
 
 
 def _detect_sandbox_fatal(messages: list[Any]) -> str:
@@ -319,13 +338,15 @@ async def build_coder_agent() -> Any:
     from tools.fs_tools import (
         host_bash, list_dir, patch_file, read_file, write_file,
     )
-    from tools.skill_tool import list_skills, load_skill
+    from tools.skill_tool import (
+        list_skills, load_skill, load_skill_reference, use_skill_script,
+    )
     from tools.profile_tool import read_profile
     from tools.search_tool import web_search
 
     local_tools = [
         read_file, write_file, list_dir, patch_file, host_bash,
-        load_skill, list_skills, read_profile,
+        load_skill, list_skills, load_skill_reference, use_skill_script, read_profile,
         # web_search：host 端 ddgs，继承宿主 shell 的代理（HTTPS_PROXY / ALL_PROXY），
         # 比容器内 browser_* 更稳（容器无翻墙能力，撞墙站点会 ERR_CONNECTION_REFUSED）
         web_search,
@@ -351,8 +372,12 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
     每次只跑 task_dag.nodes[current_step_idx] 这一个 step。step_router（在 graph 里）
     检查 current_step_idx vs len(nodes) 决定回 coder_step 还是进 verifier。
 
-    强制推进策略：每跑完一轮就 idx+1，不论 LLM 是否真说"step done"——
-    产物缺失留给 Verifier 阶段 1 硬指标抓 → fail → Replan。
+    推进策略（有界原地重试）：
+    - Final Answer 报 done → idx+1 推进
+    - 报 needs_retry 且该 step 历史尝试数 < MAX_STEP_RETRY → idx 不变，主图回本节点重跑
+    - needs_retry 但重试耗尽 → 标 failed，idx+1 推进（残余缺口交 Verifier → Replan）
+    重试计数不加 state 字段：step_outputs 是 append-only 归约列表，
+    数同 id 条目数即历史尝试数。
     """
     nodes = (state.get("task_dag") or {}).get("nodes") or []
     idx = int(state.get("current_step_idx", 0))
@@ -369,19 +394,20 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
 
     current = nodes[idx]
 
-    # 依赖前置检查：如果当前 step 的 depends_on 尚未满足，跳过 agent 调用，
-    # 不让 Coder 在空中楼阁上浪费 ReAct 迭代。缺失信息会随 step_outputs
-    # 传给 Verifier / Replan，促使下次 Replan 调整 DAG 顺序或合并步骤。
-    missing_deps = _check_dependency_artifacts(
+    # 依赖前置检查：依赖 step 带 error（blockers）时跳过当前 step，
+    # 不让 Coder 在空中楼阁上浪费 ReAct 迭代；缺失信息会随 step_outputs
+    # 传给 Verifier / Replan。产物名漂移只算 warning，注入上下文让 Coder 自查。
+    blockers, dep_warnings = _check_dependency_artifacts(
         current, nodes, state.get("step_outputs") or []
     )
-    if missing_deps:
-        reason = "；".join(missing_deps)
+    if blockers:
+        reason = "；".join(blockers)
         return {
             "current_step_idx": idx + 1,
             "step_outputs": [{
                 "id": current.get("id", f"n{idx+1}"),
                 "name": current.get("name", ""),
+                "status": "failed",
                 "summary": "",
                 "error": f"依赖前置不满足，跳过：{reason}",
             }],
@@ -400,9 +426,16 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
     agent = await build_coder_agent()
     system_prompt = _build_system_prompt(state)
     context_block = _build_context_user_message(state, current_idx=idx)
+    if dep_warnings:
+        context_block += (
+            "\n\n## 依赖产物预警（前置 step 已完成但下列声明产物未在盘上找到；"
+            "多半是文件名漂移，请先 list_dir 核实实际文件名再继续）\n"
+            + "\n".join(f"- {w}" for w in dep_warnings)
+        )
     user_question = (
         f"请完成当前 step（id={current.get('id','?')}, name={current.get('name','')}）。"
-        "记得 Final Answer 以 'step <id> done: <一句话>' 起头。"
+        "记得 Final Answer 以 'step <id> done: <一句话>' 起头；"
+        "未达标时如实以 'step <id> needs_retry: <原因>' 起头，不要假装 done。"
     )
 
     try:
@@ -418,7 +451,7 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
                 ]
             },
             # 单 step 通常 ≤3 ReAct iter；× 8 给 LLM 余裕收尾
-            config={"recursion_limit": MAX_REACT_ITER * 8},
+            config={"recursion_limit": get_settings().max_react_iter * 8},
         )
         msgs = result.get("messages", [])
         final = ""
@@ -440,37 +473,53 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
                         step_lessons.append(line)
 
         # 沙箱致命错误检测：连续 N 次失败后工具返回 [SANDBOX_UNREACHABLE] 标记
-        # → 直接退出进程，等用户修复沙箱后重试
+        # → 抛专用异常给 CLI 层接住（图节点无进程生杀权），等用户修复沙箱后重试
         sandbox_fatal = _detect_sandbox_fatal(msgs)
         if sandbox_fatal:
-            print(
-                "\n" + "=" * 60
-                + "\n[SANDBOX_FATAL] 沙箱连续不可用，任务无法继续。"
-                + "\n[SANDBOX_FATAL] 请检查容器状态：docker ps -a | grep aio-sandbox"
-                + "\n[SANDBOX_FATAL] 重启命令：docker rm -f aio-sandbox && python cli.py"
-                + f"\n[SANDBOX_FATAL] 失败详情：{sandbox_fatal}"
-                + "\n" + "=" * 60
-            )
-            sys.exit(1)
+            raise SandboxFatalError(sandbox_fatal)
 
+        # 有界原地重试：解析 Final Answer status 决定推进还是原地重跑
+        step_id = current.get("id", f"n{idx+1}")
+        status, retry_reason = _parse_step_status(final)
+        prior_attempts = sum(
+            1 for o in (state.get("step_outputs") or []) if o.get("id") == step_id
+        )
+        max_retry = get_settings().max_step_retry
+        if status == "needs_retry" and prior_attempts >= max_retry:
+            # 重试耗尽：标 failed 推进，残余缺口交 Verifier
+            status = "failed"
+
+        step_out: dict[str, Any] = {
+            "id": step_id,
+            "name": current.get("name", ""),
+            "status": status,
+            "summary": (final or "(no final answer)")[:500],
+            "iter_messages": len(msgs),
+            "step_lessons": step_lessons,
+        }
+        if status == "needs_retry":
+            step_out["retry_reason"] = retry_reason or "Coder 报本步未达标"
+        elif status == "failed":
+            step_out["error"] = f"重试 {prior_attempts} 次后仍未达标：{retry_reason or '(无原因)'}"
+
+        next_idx = idx if status == "needs_retry" else idx + 1
         return {
             "messages": [_msg_to_dict(m) for m in msgs],
-            "current_step_idx": idx + 1,
-            "step_outputs": [{
-                "id": current.get("id", f"n{idx+1}"),
-                "name": current.get("name", ""),
-                "summary": (final or "(no final answer)")[:500],
-                "iter_messages": len(msgs),
-                "step_lessons": step_lessons,
-            }],
+            "current_step_idx": next_idx,
+            "step_outputs": [step_out],
             "progress_log": [{
                 "node": "coder_step",
-                "step_id": current.get("id", f"n{idx+1}"),
+                "step_id": step_id,
                 "step_idx": idx,
+                "status": status,
+                "attempt": prior_attempts + 1,
                 "n_messages": len(msgs),
                 "final_excerpt": (final or "")[:200],
             }],
         }
+    except SandboxFatalError:
+        # 致命错误直通到 CLI 层（不走"异常也推进"的兜底，任务必须中止）
+        raise
     except Exception as e:
         # 异常也推进（防死循环）；error 记进 step_outputs，让 Verifier 看到
         return {
@@ -478,6 +527,7 @@ async def _run_coder_async(state: HwState) -> dict[str, Any]:
             "step_outputs": [{
                 "id": current.get("id", f"n{idx+1}"),
                 "name": current.get("name", ""),
+                "status": "failed",
                 "summary": "",
                 "error": f"{type(e).__name__}: {e}",
             }],

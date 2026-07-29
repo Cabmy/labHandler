@@ -29,9 +29,6 @@ _REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO))
 os.chdir(str(_REPO))
 
-# 关闭 LLM cache，确保每次跑的是真实首发 LLM 行为
-os.environ["LLM_CACHE_ENABLED"] = "false"
-
 from dotenv import load_dotenv  # noqa: E402
 
 load_dotenv(_REPO / "config" / ".env")
@@ -55,7 +52,9 @@ async def main() -> int:
     print("\n=== 启动主图 (Plan-and-Execute Lite step loop) ===\n")
     t0 = time.time()
     g = get_graph()
-    final_state = await stream_graph(g, state)
+    # 主图带 checkpointer，需要 thread_id
+    cfg = {"configurable": {"thread_id": f"probe_step_loop_{int(t0)}"}}
+    final_state = await stream_graph(g, state, config=cfg)
     elapsed = time.time() - t0
     print(f"\n=== 主图完成 elapsed: {elapsed:.1f}s ===\n")
 

@@ -1,7 +1,7 @@
 """归档知识卡片检索：Chroma + BM25 双路 + RRF 融合。
 
 职责：
-- index_cards：写入 Chroma 向量 + 更新 BM25 持久化索引
+- index_cards：写入 Chroma 向量 + 刷新 BM25 进程内索引
 - search_cards：双路召回 + RRF 融合 + SQLite 回表 hydrate
 - rebuild_archive_index：全量重建（SQLite 是唯一事实源）
 """
@@ -26,14 +26,37 @@ EMBEDDING_MODEL = (
 )
 CHROMA_COLLECTION = f"archive_cards_{EMBEDDING_MODEL}"
 
-# BM25 持久化单例（进程级，与 InMemoryCache 生命周期一致）
+# BM25 进程级单例（无持久化，首用/刷新时从 SQLite 全量重建）
 _bm25_store: BM25Store | None = None
 
 
-def _get_bm25() -> BM25Store:
+def _to_documents(cards: list[dict[str, Any]]) -> list[Document]:
+    """SQLite 卡片行 → 索引 Document（Chroma / BM25 共用）。"""
+    return [
+        Document(
+            page_content=card["search_text"],
+            metadata={
+                "card_id": card["card_id"],
+                "task_id": card["task_id"],
+                "card_type": card["card_type"],
+                "task_type": card["task_type"],
+            },
+        )
+        for card in cards
+    ]
+
+
+def _get_bm25(refresh: bool = False) -> BM25Store:
+    """BM25 单例；首建或 refresh=True 时从 SQLite 全量重建。
+
+    BM25 无持久化也无增量语义（rank_bm25 每次 add 都全量重算），不在首用时
+    灌数据则新进程双路检索退化为纯向量单路；卡片 <1k 时重建 <100ms。
+    """
     global _bm25_store
-    if _bm25_store is None:
-        _bm25_store = BM25Store()
+    if _bm25_store is None or refresh:
+        store = BM25Store()
+        store.add_documents(_to_documents(get_task_archive().get_cards_for_indexing()))
+        _bm25_store = store
     return _bm25_store
 
 
@@ -49,7 +72,7 @@ def _card_id_str(doc: Document) -> str:
 
 
 def index_cards(card_ids: list[int]) -> dict[str, Any]:
-    """写入 Chroma + 更新 BM25 持久化索引。
+    """写入 Chroma + 从 SQLite 刷新 BM25 进程内索引。
 
     Args:
         card_ids: 要索引的卡片 id 列表（由 memory.archive 写入后返回）
@@ -63,20 +86,8 @@ def index_cards(card_ids: list[int]) -> dict[str, Any]:
     archive = get_task_archive()
     cards = archive.get_cards_by_ids(card_ids)
     vs = _get_vectorstore()
-    bm25 = _get_bm25()
 
-    documents: list[Document] = []
-    for card in cards:
-        doc = Document(
-            page_content=card["search_text"],
-            metadata={
-                "card_id": card["card_id"],
-                "task_id": card["task_id"],
-                "card_type": card["card_type"],
-                "task_type": card["task_type"],
-            },
-        )
-        documents.append(doc)
+    documents = _to_documents(cards)
 
     # Chroma 写入
     indexed = 0
@@ -92,8 +103,8 @@ def index_cards(card_ids: list[int]) -> dict[str, Any]:
         for card in cards:
             archive.mark_card_vector_error(card["card_id"], err_msg)
 
-    # BM25 增量更新（即使 Chroma 失败也更新 BM25，保证至少一路可用）
-    bm25.add_documents(documents)
+    # BM25 从 SQLite 全量刷新（新卡已落库；即使 Chroma 失败也刷，保证至少一路可用）
+    _get_bm25(refresh=True)
 
     return {"indexed": indexed, "failed": failed, "errors": errors}
 
@@ -224,13 +235,9 @@ def rebuild_archive_index() -> dict[str, Any]:
         {total: n, indexed: n, failed: n, errors: [...]}
     """
     archive = get_task_archive()
-    cards = archive.get_cards_for_indexing(limit=500)
+    cards = archive.get_cards_for_indexing()
     if not cards:
         return {"total": 0, "indexed": 0, "failed": 0, "errors": []}
-
-    # 清空 BM25 重建
-    bm25 = _get_bm25()
-    bm25.clear()
 
     # 清空 Chroma collection
     vs = _get_vectorstore()
@@ -239,22 +246,10 @@ def rebuild_archive_index() -> dict[str, Any]:
     except Exception:
         pass  # collection 不存在时忽略
 
-    documents: list[Document] = []
-    card_ids: list[int] = []
+    # 重建前清除旧错误标记
     for card in cards:
-        # 重建前清除旧错误标记
-        archive.clear_card_vector_error(card["id"])
-        doc = Document(
-            page_content=card["search_text"],
-            metadata={
-                "card_id": card["id"],
-                "task_id": card["task_id"],
-                "card_type": card["card_type"],
-                "task_type": card["task_type"],
-            },
-        )
-        documents.append(doc)
-        card_ids.append(card["id"])
+        archive.clear_card_vector_error(card["card_id"])
+    documents = _to_documents(cards)
 
     # Chroma 全量写入
     indexed = 0
@@ -267,11 +262,11 @@ def rebuild_archive_index() -> dict[str, Any]:
         failed = len(documents)
         err_msg = f"{type(e).__name__}: {e}"
         errors.append(err_msg)
-        for cid in card_ids:
-            archive.mark_card_vector_error(cid, err_msg)
+        for card in cards:
+            archive.mark_card_vector_error(card["card_id"], err_msg)
 
     # BM25 全量重建
-    bm25.add_documents(documents)
+    _get_bm25(refresh=True)
 
     return {
         "total": len(documents),

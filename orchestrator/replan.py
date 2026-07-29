@@ -10,12 +10,10 @@ iteration 表示已执行的 planner 轮次，首次进入 planner 后记为 1�
 
 from __future__ import annotations
 
-import os
 from typing import Literal
 
+from config.runtime import get_settings
 from orchestrator.state import HwState
-
-MAX_REPLAN_ITER = int(os.getenv("MAX_REPLAN_ITER", "2"))
 
 
 def replan_router(state: HwState) -> Literal["planner", "compile"]:
@@ -28,7 +26,7 @@ def replan_router(state: HwState) -> Literal["planner", "compile"]:
     verdict = runs[-1].get("verdict", "fail")
     iteration = int(state.get("iteration", 0))
 
-    if verdict == "fail" and iteration < MAX_REPLAN_ITER:
+    if verdict == "fail" and iteration < get_settings().max_replan_iter:
         return "planner"
     return "compile"
 
@@ -40,4 +38,4 @@ def is_partial(state: HwState) -> bool:
         return False
     last_verdict = runs[-1].get("verdict", "fail")
     iteration = int(state.get("iteration", 0))
-    return last_verdict == "fail" and iteration >= MAX_REPLAN_ITER
+    return last_verdict == "fail" and iteration >= get_settings().max_replan_iter

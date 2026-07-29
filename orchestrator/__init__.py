@@ -8,7 +8,7 @@
 from typing import Any
 
 from .compile_node import run_compile
-from .replan import MAX_REPLAN_ITER, is_partial, replan_router
+from .replan import is_partial, replan_router
 from .state import HwState, state_from_jsonable, state_to_jsonable
 
 
@@ -32,6 +32,5 @@ __all__ = [
     "get_graph",
     "replan_router",
     "is_partial",
-    "MAX_REPLAN_ITER",
     "run_compile",
 ]

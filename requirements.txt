@@ -28,5 +28,15 @@ PyYAML
 # CLI
 rich
 
+# Web 前端
+fastapi
+uvicorn
+python-multipart
+sse-starlette
+
+# LangGraph checkpointer
+langgraph-checkpoint-sqlite
+aiosqlite>=0.22,<0.23
+
 # Verifier 在 workspace 跑 pytest
 pytest>=8.0

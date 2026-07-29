@@ -66,13 +66,12 @@ def run_planner(state: HwState) -> dict[str, Any]:
     skill_name = (intake.get("type") or "other").lower()
 
     # 召回历史经验卡片
+    query = intake.get("title") or state.get("question", "")
+    card_types = ["lesson", "strategy"]
+    if skill_name == "coding":
+        card_types.append("pattern")
     try:
         from tools.rag_tool import archive_search
-
-        query = intake.get("title") or state.get("question", "")
-        card_types = ["lesson", "strategy"]
-        if skill_name == "coding":
-            card_types.append("pattern")
 
         retrieved_cards: list[dict] = archive_search.invoke({
             "query": query,
@@ -101,9 +100,8 @@ def run_planner(state: HwState) -> dict[str, Any]:
     if skill_body:
         user_msg_parts.append(f"## skill SOP（{skill_name}）\n{skill_body[:2000]}")
 
-    # Replan: 加上 Verifier 反馈 + 旧 DAG + workspace 产物
+    # Replan: 加上 Verifier 反馈 + 执行轨迹 + 旧 DAG + workspace 产物
     verifier_runs = state.get("verifier_runs") or []
-    replan_query = query  # 默认用首轮 query
     if verifier_runs:
         last = verifier_runs[-1]
         cov = last.get("coverage") or {}
@@ -122,6 +120,13 @@ def run_planner(state: HwState) -> dict[str, Any]:
         if pytest_tail:
             feedback_parts.append("- pytest_output（末段）:\n```\n" + pytest_tail[:500] + "\n```")
         user_msg_parts.append("\n".join(feedback_parts))
+
+        # 执行轨迹摘要（复用 Verifier 的拼装）：让修补节点知道上一轮
+        # 哪个 step 因何失败/跳过，避免重蹈依赖拆分错误
+        from agents.verifier import _build_execution_trace
+        trace_block = _build_execution_trace(state)
+        if trace_block:
+            user_msg_parts.append(trace_block.rstrip())
 
         # Replan 时也用缺漏信息重新检索卡片
         try:
@@ -192,7 +197,6 @@ def run_planner(state: HwState) -> dict[str, Any]:
             "id": str(n.get("id") or f"n{len(cleaned_nodes)+1}"),
             "name": str(n.get("name") or "未命名节点"),
             "agent": str(n.get("agent") or "coder").lower(),
-            "depends_on": list(n.get("depends_on") or []),
             "desc": str(n.get("desc") or ""),
             "acceptance_criteria": list(n.get("acceptance_criteria") or []),
             "expected_artifacts": list(n.get("expected_artifacts") or []),
@@ -201,6 +205,20 @@ def run_planner(state: HwState) -> dict[str, Any]:
             "context_cards": [_compact_card(c) for c in retrieved_cards
                              if c.get("card_type") in ("pattern", "strategy")],
         })
+
+    # Replan 防御：新节点 id 不得与历史 step_outputs 撞名——Coder 的重试计数
+    # （同 id 条目数）和 [done] 标记都按 id 匹配，撞名会被旧轮记录污染。
+    used_ids = {o.get("id") for o in state.get("step_outputs") or []}
+    if used_ids:
+        next_iter = int(state.get("iteration", 0)) + 1
+        for n in cleaned_nodes:
+            if n["id"] in used_ids:
+                n["id"] = f"{n['id']}_r{next_iter}"
+
+    # 执行模型严格串行（列表序即执行序），depends_on 统一覆写为单链：
+    # LLM 无法表达与列表顺序冲突的拓扑（假失败/空中楼阁场景从根上消除）
+    for i, n in enumerate(cleaned_nodes):
+        n["depends_on"] = [cleaned_nodes[i - 1]["id"]] if i else []
 
     # 保留所有卡片（lesson 给 Verifier 参考）
     all_compact = [_compact_card(c) for c in retrieved_cards]
@@ -226,21 +244,22 @@ def run_planner(state: HwState) -> dict[str, Any]:
 
 
 def _fallback_dag(skill: str, title: str, reason: str) -> dict[str, Any]:
+    """LLM 解析失败时的兜底 DAG（depends_on 由 run_planner 清洗层统一覆写为单链）"""
     _empty = {"acceptance_criteria": [], "expected_artifacts": [], "suggested_tools": []}
     if skill == "coding":
         nodes = [
-            {"id": "n1", "name": "实现", "agent": "coder", "depends_on": [],
+            {"id": "n1", "name": "实现", "agent": "coder",
              "desc": f"在沙箱实现 {title}（文件名按主题命名）", **_empty},
-            {"id": "n2", "name": "测试", "agent": "coder", "depends_on": ["n1"],
+            {"id": "n2", "name": "测试", "agent": "coder",
              "desc": "编写并跑通 pytest 测试", **_empty},
         ]
     elif skill in {"essay", "lab_report"}:
         nodes = [
-            {"id": "n1", "name": "起草", "agent": "coder", "depends_on": [],
+            {"id": "n1", "name": "起草", "agent": "coder",
              "desc": f"写 {title}", **_empty},
         ]
     else:
         nodes = [
-            {"id": "n1", "name": "执行", "agent": "coder", "depends_on": [], "desc": title, **_empty},
+            {"id": "n1", "name": "执行", "agent": "coder", "desc": title, **_empty},
         ]
     return {"skill": skill, "nodes": nodes, "_fallback_reason": reason}
