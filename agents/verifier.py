@@ -1,23 +1,24 @@
-"""Verifier agent - 负责作业产物的质量把控，结合硬性指标检查与 LLM 语义审计。
+"""Verifier agent —— 负责作业产物的质量控制，结合规则化指标检查与 LLM 语义审计。
 
-该节点通过两阶段验证确保作业符合所有要求，并根据失败原因提供修复建议。
+本节点通过两阶段验证确保作业满足所有要求，并基于失败原因提供修复建议。
 
 验证流程：
-1. 阶段 1：硬性指标检查 (Rule-based)
-   - Coding 类：核对交付物文件是否存在，并自动执行单元测试 (pytest) 获取运行结果。
-   - 报告类：针对 lab_report 检查是否包含必要的实验章节。
-2. 阶段 2：语义覆盖审计 (LLM-based)
-   - 提取 workspace 中所有相关产物的文本内容。
-   - 将题面约束、用户补充指令及长期规则喂给 LLM，判断产物是否在逻辑和内容上完全覆盖了这些要求。
-   - 处理指令冲突：遵循“后令覆盖前令”的语义规则。
+1. 阶段 1：规则化指标检查
+   - Coding 类型：验证交付物文件存在并自动跑单元测试（pytest）拿结果。
+   - 报告类型：lab_report 检查必备实验章节是否齐备。
+2. 阶段 2：语义覆盖审计（基于 LLM）
+   - 从 workspace 所有相关产物提取文本内容。
+   - 将题面约束、用户补充指示与长期规则喂给 LLM，判断产物在逻辑与内容上
+     是否完整覆盖这些要求。
+   - 处理指示冲突：遵循 '后指示覆盖前指示' 语义规则。
 
 输出 verifier_run 结构：
   {
-    "verdict": "pass" | "fail",     # 最终判定结论
-    "stage1_failures": list[str],    # 硬指标缺失（如文件未找到、测试未通过）
-    "stage2_warnings": list[str],    # 语义缺失（如某项功能逻辑未实现）
-    "coverage": dict,                # 详细的约束覆盖地图
-    "suggested_fix": str,            # 针对性的修复建议，引导 Planner/Coder 修正错误
+    "verdict": "pass" | "fail",     # 最终裁决结论
+    "stage1_failures": list[str],    # 指标失败（如文件未找到、测试未过）
+    "stage2_warnings": list[str],    # 语义缺口（如某功能逻辑未实现）
+    "coverage": dict,                # 详细约束覆盖图
+    "suggested_fix": str,            # 针对性修复建议，引导 Planner/Coder 纠错
   }
 """
 
@@ -27,20 +28,20 @@ import os
 from pathlib import Path
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
 from llm import get_llm
+from llm.invoke import invoke_llm_json, usage_log_fields
 from memory.profile import inject_for_agent, load_profile
 from orchestrator.state import HwState
-from config.prompts import VERIFIER_COVERAGE_SYSTEM, parse_result_json
+from config.prompts import VERIFIER_COVERAGE_SYSTEM
 from config.runtime import get_settings
+from tools.workspace_utils import iter_workspace_files
 
 WORKSPACE_DIR: Path = get_settings().workspace_dir
 
-# lab_report 必备章节关键字
+# lab_report 必备章节关键词
 _LAB_REQUIRED_SECTIONS = ["实验目的", "实验原理", "实验步骤", "实验结果", "结论"]
 
-# 已知文件后缀（用于判 deliverable 是文件名还是描述性条目）
+# 已知文件扩展名（用于判断交付物是文件名还是描述项）
 _FILENAME_EXTS = (
     ".py", ".md", ".markdown", ".txt", ".rst", ".json", ".yaml", ".yml",
     ".pdf", ".docx", ".pptx", ".cpp", ".c", ".h", ".java",
@@ -49,17 +50,18 @@ _FILENAME_EXTS = (
 
 
 def _looks_like_filename(s: str) -> bool:
-    """deliverable 字符串是否「明显是文件名」（按已知后缀判）。
-
-    True  → 由阶段 1 _check_files_exist 严格查存在
-    False → 当成"描述性交付物"，转交阶段 2 LLM 语义覆盖判官
+    """交付物字符串是否 '明显是文件名'（按已知扩展名判断）。
+    
+    True  → 由阶段 1 _check_files_exist 严格检查存在性
+    False → 视为 '描述性交付物'，交给阶段 2 LLM 语义覆盖判官
     """
     if not isinstance(s, str):
         return False
     s = s.strip()
     if not s:
         return False
-    # 含中英文括号 / 空格 / 中文逗号顿号 → 多半是描述（除非是含 `/` 的相对路径且仍带后缀）
+    # 含中文/英文括号 / 空格 / 中文逗号 → 很可能是描述性的
+    # （除非是带 '/' 且仍有扩展名的相对路径）
     has_descriptive_chars = any(ch in s for ch in "（）()，、 ")
     if has_descriptive_chars and not ("/" in s and s.lower().endswith(_FILENAME_EXTS)):
         return False
@@ -67,7 +69,7 @@ def _looks_like_filename(s: str) -> bool:
 
 
 def _split_deliverables(deliverables: list[str]) -> tuple[list[str], list[str]]:
-    """把 deliverables 拆成 (文件名类, 描述类) 两组。"""
+    """将交付物拆为（文件名类、描述类）两组。"""
     files: list[str] = []
     descs: list[str] = []
     for d in deliverables:
@@ -75,23 +77,23 @@ def _split_deliverables(deliverables: list[str]) -> tuple[list[str], list[str]]:
     return files, descs
 
 
-# ─── 阶段 1：硬指标 ───────────────────────────────────────────────
+# ─── 阶段 1：硬指标 ─────────────────────────────────────────────
 
 
 def _check_files_exist(deliverables: list[str]) -> list[str]:
-    """检查"文件名类"交付物是否在 workspace 内存在。
-
-    路径规整：剥掉常见的 "workspace/" 前缀（intake LLM 经常从题面里直抄
-    "workspace/x.py" 这种带前缀的写法），再做存在检查；rglob 兜底用 basename，
-    避免 pattern 含路径分隔符不匹配。
-
-    描述性 deliverable（如「源代码文件（含 ZUC_Init...）」）跳过严格匹配，
-    交给阶段 2 LLM 语义覆盖判官判（避免硬指标误报缺失）。
+    """检查 '文件名类' 交付物是否存在于 workspace 内。
+    
+    路径规范化：剥掉常见 'workspace/' 前缀（intake LLM 常直接从题面拄贝
+    'workspace/x.py' 这种带前缀的），再检查存在性；rglob 回退用 basename，
+    避免带路径分隔符的 pattern 匹配不上。
+    
+    描述性交付物（如 '源代码文件（含 ZUC_Init...）'）跳过严格匹配，
+    交给阶段 2 LLM 语义覆盖判官（避免误报缺失）。
     """
     failures: list[str] = []
     file_names, _ = _split_deliverables(deliverables)
     for d in file_names:
-        # 剥前缀: "workspace/x" / "./workspace/x" / "/workspace/x" → "x"
+        # 剥前缀："workspace/x" / "./workspace/x" / "/workspace/x" → "x"
         d_norm = d
         for prefix in ("workspace/", "./workspace/", "/workspace/"):
             if d_norm.startswith(prefix):
@@ -100,7 +102,7 @@ def _check_files_exist(deliverables: list[str]) -> list[str]:
         path = WORKSPACE_DIR / d_norm
         if path.exists():
             continue
-        # rglob 兜底用 basename（pattern 含 "/" 时 rglob 不匹配）
+        # rglob 回退用 basename（rglob 在 pattern 含 '/' 时匹配不上）
         matches = list(WORKSPACE_DIR.rglob(Path(d_norm).name))
         if not matches:
             failures.append(f"交付物缺失：{d}")
@@ -108,7 +110,7 @@ def _check_files_exist(deliverables: list[str]) -> list[str]:
 
 
 def _check_lab_sections(deliverables: list[str]) -> list[str]:
-    """lab_report 类：扫描可能的 lab_report.md/docx，检查必备章节"""
+    """lab_report 类型：扫描潜在的 lab_report.md/docx，检查必备章节。"""
     failures: list[str] = []
     candidates = [
         WORKSPACE_DIR / d for d in deliverables
@@ -119,7 +121,7 @@ def _check_lab_sections(deliverables: list[str]) -> list[str]:
             WORKSPACE_DIR.rglob("*实验*.md")
         )
     if not candidates:
-        return failures  # 没文件时 _check_files_exist 已经报过
+        return failures  # 无文件 → _check_files_exist 已报过
     text = ""
     for p in candidates:
         try:
@@ -133,15 +135,15 @@ def _check_lab_sections(deliverables: list[str]) -> list[str]:
 
 
 def _classify_pytest_failure(output: str) -> str:
-    """从 pytest 输出中分类失败原因。
+    """从输出分类 pytest 失败原因。
 
-    返回分类标签，用于指导 Replan 方向：
-    - "IMPORT_ERROR": 测试文件导入/编译错误 → 修复测试文件
-    - "SYNTAX_ERROR": 语法错误 → 修复测试文件或源码
-    - "TEST_FAILURE": 断言失败 → 源码有 bug，修复实现
-    - "NO_TESTS":     pytest 未收集到任何测试 → Coder 漏写了测试
-    - "UNKNOWN":      无法分类
-    - "":             未失败
+    返回分类标签以引导 Replan 方向：
+    - "IMPORT_ERROR"：测试文件导入/编译错误 → 修测试文件
+    - "SYNTAX_ERROR"：语法错误 → 修测试文件或源代码
+    - "TEST_FAILURE"：断言失败 → 源代码有 bug，修实现
+    - "NO_TESTS"：     pytest 未收集到测试 → Coder 忘写测试
+    - "UNKNOWN"：      无法分类
+    - ""：             无失败
     """
     if not output:
         return ""
@@ -169,15 +171,15 @@ _FAILURE_TYPE_HINTS = {
 
 def _run_pytest_in_workspace(timeout: int = 60) -> tuple[bool, str, str]:
     """在 workspace 跑 pytest（host_bash 受 fs_tools 边界保护）
-    Returns: (passed, output_tail, failure_type)
+    返回：(passed, output_tail, failure_type)
     """
     try:
         from tools.fs_tools import host_bash
         # 用 host_bash 跑，自动 cwd=WORKSPACE_DIR
-        # host_bash 越界不再 raise，而是返回 "[ERROR/PermissionError] ..." 字符串，
-        # 这里靠下面的 "[exit=0]" not in out 自然兜住（视为失败）
+        # host_bash 越界不再抛异常，而是返回 "[ERROR/PermissionError] ..." 字符串，
+        # 这里靠下面 "[exit=0]" not in out 自然捕获（视为失败）
         out = host_bash.invoke({"cmd": "pytest -q --tb=short", "timeout": timeout})
-        # exit=0 视为通过
+        # exit=0 表示通过
         if "[exit=0]" in out:
             return True, out[-500:], ""
         tail = out[-1000:]
@@ -188,18 +190,18 @@ def _run_pytest_in_workspace(timeout: int = 60) -> tuple[bool, str, str]:
 
 
 def _stage1_hard_checks(state: HwState) -> tuple[list[str], dict[str, Any]]:
-    """硬指标检查。Returns: (failures, evidence_dict)"""
+    """硬指标检查。返回：(failures, evidence_dict)"""
     intake = state.get("intake_result") or {}
     ttype = (intake.get("type") or "other").lower()
     deliv = intake.get("deliverables") or []
     failures: list[str] = []
     evidence: dict[str, Any] = {}
 
-    # 1) 交付物文件存在
+    # 1) 交付物文件存在性
     failures.extend(_check_files_exist(deliv))
     evidence["deliverables_checked"] = deliv
 
-    # 2) 通用：如有 test_*.py 文件就跑 pytest（不论类型，lab_report 也可能含代码）
+    # 2) 通用：存在 test_*.py 文件就跑 pytest（不论类型，lab_report 也可能含代码）
     has_test = any(
         (WORKSPACE_DIR / d).exists() and "test" in d.lower() for d in deliv
     ) or bool(list(WORKSPACE_DIR.rglob("test_*.py"))) or bool(list(WORKSPACE_DIR.rglob("*_test.py")))
@@ -213,21 +215,21 @@ def _stage1_hard_checks(state: HwState) -> tuple[list[str], dict[str, Any]]:
     else:
         evidence["pytest_skipped_reason"] = "未找到 test_*.py / *_test.py"
 
-    # 3) lab_report 类：必备章节
+    # 3) lab_report 类型：必备章节
     if ttype == "lab_report":
         failures.extend(_check_lab_sections(deliv))
 
     return failures, evidence
 
 
-# ─── 阶段 2：LLM 语义覆盖 ────────────────────────────────────────
+# ─── 阶段 2：LLM 语义覆盖 ────────────────────────────────────────────
 
 
-def _build_execution_trace(state: HwState, max_chars: int = 1500) -> str:
-    """拼「执行轨迹摘要」块：让判官能判「约束是否在过程中被真正满足」。
+def build_execution_trace(state: HwState, max_chars: int = 1500) -> str:
+    """构建 '执行轨迹摘要' 块：让判官判定 '约束是否在过程中被真正满足'。
 
-    内容：每个 step 的 id/status/error/retry 原因 + step_lessons 全量 +
-    从 progress_log 提取的 coder_step 关键动向（去重保序）。
+    内容：每个 step 的 id/status/error/retry 原因 + 全量 step_lessons +
+    从 progress_log 提取的关键 coder_step 动向（去重、保序）。
     """
     lines: list[str] = []
 
@@ -237,12 +239,12 @@ def _build_execution_trace(state: HwState, max_chars: int = 1500) -> str:
         if o.get("error"):
             bits.append(f"  error: {str(o['error'])[:200]}")
         if o.get("retry_reason"):
-            bits.append(f"  retry原因: {o['retry_reason']}")
+            bits.append(f"  retry reason: {o['retry_reason']}")
         for lesson in o.get("step_lessons") or []:
             bits.append(f"  lesson: {lesson}")
         lines.extend(bits)
 
-    # coder_step 的 progress_log 摘要（attempt / final_excerpt，去重保序）
+    # coder_step progress_log 摘录（attempt / final_excerpt，去重保序）
     seen_excerpts: set[str] = set()
     for entry in state.get("progress_log") or []:
         if entry.get("node") != "coder_step":
@@ -252,19 +254,19 @@ def _build_execution_trace(state: HwState, max_chars: int = 1500) -> str:
             continue
         seen_excerpts.add(excerpt)
         lines.append(
-            f"- [轨迹] step {entry.get('step_id')} attempt={entry.get('attempt', 1)}: {excerpt}"
+            f"- [trace] step {entry.get('step_id')} attempt={entry.get('attempt', 1)}: {excerpt}"
         )
 
     if not lines:
         return ""
     text = "\n".join(lines)
     if len(text) > max_chars:
-        text = text[:max_chars] + "\n…(轨迹截断)"
-    return "## 执行轨迹摘要（Coder 过程证据；与产物矛盾时以本块为准）\n" + text + "\n\n"
+        text = text[:max_chars] + "\n…(trace truncated)"
+    return "## Execution trace summary (Coder process evidence; when contradicting artifacts, this block prevails)\n" + text + "\n\n"
 
 
 def _priority_artifact_names(state: HwState) -> set[str]:
-    """交付物 + DAG expected_artifacts 的 basename 集合（分层预算的优先名单）。"""
+    """交付物 + DAG expected_artifacts 的 basename 集合（分级预算的优先列表）。"""
     intake = state.get("intake_result") or {}
     names: set[str] = set()
     for d in intake.get("deliverables") or []:
@@ -283,32 +285,25 @@ def _gather_artifacts_text(
     full_per_file: int = 4000,
     head_per_file: int = 1000,
 ) -> str:
-    """把 artifacts + workspace 主要文本文件拼起来给 LLM。
-
-    分层预算（替代旧版"到量硬截断"）：
-    - 优先文件（deliverables / expected_artifacts 命中）：每文件最多 full_per_file 字符
-    - 其余文件：只给开头 head_per_file 字符（判官通常只需确认其存在与大意）
-    - 总量 max_chars 兜底，防大作业 context 爆炸
+    """拼接产物 + 主要 workspace 文本文件供 LLM 使用。
+    
+    分级预算（取代旧的 '按量硬截断'）：
+    - 优先文件（交付物 / expected_artifacts 命中）：每个最多 full_per_file 字符
+    - 其他文件：只要前 head_per_file 字符（判官通常只需确认存在与大意）
+    - 总 max_chars 兜底，防止大作业上下文爆炸
     """
+    _TEXT_EXTS = {".py", ".md", ".txt", ".cpp", ".c", ".h", ".java"}
     seen: set[Path] = set()
 
-    # 优先取 artifacts 列表里登记的文件
+    # 先从 state 取产物
     for art in state.get("artifacts") or []:
         p = WORKSPACE_DIR / str(art.get("path", ""))
-        if p.exists() and p.is_file() and p.suffix.lower() in {
-            ".py", ".md", ".txt", ".cpp", ".c", ".h", ".java"
-        }:
+        if p.exists() and p.is_file() and p.suffix.lower() in _TEXT_EXTS:
             seen.add(p)
 
-    # 兜底：扫 workspace 文本类文件（限文件名以非"."开头）
-    for p in WORKSPACE_DIR.rglob("*"):
-        if p in seen:
-            continue
-        if not p.is_file():
-            continue
-        if any(part.startswith(".") or part == "__pycache__" for part in p.relative_to(WORKSPACE_DIR).parts):
-            continue
-        if p.suffix.lower() in {".py", ".md", ".txt", ".cpp", ".c", ".h", ".java"}:
+    # 回退：扫描 workspace 的文本文件（跳过已见的）
+    for p in iter_workspace_files(WORKSPACE_DIR, extensions=_TEXT_EXTS):
+        if p not in seen:
             seen.add(p)
 
     priority_names = _priority_artifact_names(state)
@@ -326,7 +321,7 @@ def _gather_artifacts_text(
         budget = full_per_file if p.name in priority_names else head_per_file
         budget = min(budget, max_chars - total)
         clipped = text[:budget]
-        suffix = "\n…(截断)" if len(text) > len(clipped) else ""
+        suffix = "\n…(truncated)" if len(text) > len(clipped) else ""
         rel = p.relative_to(WORKSPACE_DIR)
         chunks.append(f"### {rel}\n{clipped}{suffix}")
         total += len(clipped)
@@ -341,48 +336,47 @@ def _render_cons_block(
     deliv_cons: list[str],
     profile_cons: list[str],
 ) -> str:
-    """渲染约束分节展示块（单批 / 分批共用）。
-
-    覆盖优先级声明：user_constraints 按 append 时序编号（最末条 = 最新一轮用户指令）；
-    让 LLM 自行处理"后令覆盖前令"和"用户指令覆盖题面"的语义，避免被作废条目仍判 missing。
+    """渲染约束分节展示块（单批 / 多批共用）。
+    
+    覆盖优先级声明：user_constraints 按追加时间编号（最后 = 最新用户指令）；
+    让 LLM 处理 '后覆盖前' 与 '用户指示覆盖题面' 语义，避免被覆盖的条目
+    仍被判为 missing。
     """
     cons_block_lines: list[str] = [
-        "## 约束条目（已分节；判定前先读下方覆盖规则）",
+        "## Constraint items (sectioned; read the override rules below before judging)",
         "",
-        f"### 当前任务类型：{task_type}（title={task_title or '（空）'}）",
+        f"### Current task type: {task_type} (title={task_title or '(empty)'})",
         "",
-        "### 覆盖规则（必读）",
-        "- 用户补充约束按对话时间顺序编号；**编号靠后者**与靠前者矛盾时，以靠后者为准，靠前者作废。",
-        "- 用户补充约束整体覆盖题面约束中的同主题条目（用户后续的修订指令可推翻题面默认要求）。",
-        "- 被覆盖作废的条目**不计入 missing，也不要为其找证据**；在 covered/missing 数组里直接省略。",
-        "- 描述性交付物（[交付物]）独立判定。",
-        "- 长期规则（[长期规则]）独立判定；但若该规则与当前任务**完全不相关**"
-        "（例如「实验报告截图占位」对一道纯算法题），直接判 covered，evidence 写"
-        "「N/A：与当前任务不相关」，不要列入 missing。",
+        "### Override rules (must read)",
+        "- User supplementary constraints are numbered by dialogue time order; when a **later-numbered** one conflicts with an earlier one, the later wins and the earlier is voided.",
+        "- User supplementary constraints as a whole override same-topic items in the problem constraints (a user's later revision instruction can overturn a problem-statement default requirement).",
+        "- Voided overridden items are **not counted in missing, nor should you seek evidence for them**; simply omit them from the covered/missing arrays.",
+        "- Descriptive deliverables ([Deliverable]) are judged independently.",
+        "- Long-term rules ([Long-term rule]) are judged independently; but if a rule is **completely unrelated** to the current task "
+        "(e.g. 'lab report screenshot placeholder' for a pure algorithm problem), judge it covered directly, with evidence writing "
+        "'N/A: unrelated to the current task'; do not list it in missing.",
         "",
-        "### 题面约束（intake.constraints）",
+        "### Problem constraints (intake.constraints)",
     ]
-    cons_block_lines += [f"- {c}" for c in constraints] or ["- （无）"]
-    cons_block_lines += ["", "### 用户补充约束（user_constraints，按时间顺序）"]
+    cons_block_lines += [f"- {c}" for c in constraints] or ["- (none)"]
+    cons_block_lines += ["", "### User supplementary constraints (user_constraints, in time order)"]
     if user_cons:
         for i, c in enumerate(user_cons, 1):
-            tag = "（最新一轮用户指令）" if i == len(user_cons) else ""
+            tag = " (latest user instruction)" if i == len(user_cons) else ""
             cons_block_lines.append(f"- {i}) {c}{tag}")
     else:
-        cons_block_lines.append("- （无）")
-    cons_block_lines += ["", "### 描述性交付物（[交付物]）"]
-    cons_block_lines += [f"- {c}" for c in deliv_cons] or ["- （无）"]
-    cons_block_lines += ["", "### 长期规则（[长期规则]）"]
-    cons_block_lines += [f"- {c}" for c in profile_cons] or ["- （无）"]
+        cons_block_lines.append("- (none)")
+    cons_block_lines += ["", "### Descriptive deliverables ([Deliverable])"]
+    cons_block_lines += [f"- {c}" for c in deliv_cons] or ["- (none)"]
+    cons_block_lines += ["", "### Long-term rules ([Long-term rule])"]
+    cons_block_lines += [f"- {c}" for c in profile_cons] or ["- (none)"]
     return "\n".join(cons_block_lines)
 
 
-# 单批约束条数上限：超过则按分节切批，防大量约束 + 产物全文挤爆单次调用
-_COVERAGE_BATCH_THRESHOLD = 12
-
-
 def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str, Any]:
-    # 消融开关（benchmark 用，见 benchmark/run_benchmark.py）：跳过语义覆盖判官
+    # 每批约束上限：超过时按分节拆批，避免上下文爆炸
+    _COVERAGE_BATCH_THRESHOLD = 12
+    # 消融开关（供 benchmark，见 benchmark/run_benchmark.py）：跳过语义覆盖判官
     if os.getenv("ABLATION_NO_VERIFIER_S2", "").strip() == "1":
         return {"covered": [], "missing": [], "suggested_fix": "", "_ablated": True}
 
@@ -392,20 +386,20 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
     task_type = str(intake.get("type") or "other")
     task_title = str(intake.get("title") or "")
 
-    # 描述性 deliverables（非文件名）转交阶段 2：加 [交付物] 前缀混入约束列表，
-    # 让 LLM 判官按"workspace 里有没有满足这个产物的描述"判覆盖；
-    # 文件名类 deliverable 已在阶段 1 严格查存在，此处不重复判。
+    # 描述性交付物（非文件名）交给阶段 2：加 [Deliverable] 前缀混入约束列表，
+    # 让 LLM 按 'workspace 是否满足此描述' 判覆盖；文件名类交付物已在阶段 1
+    # 严格检查，不在此重复。
     deliverables = list(intake.get("deliverables") or [])
     _, desc_deliverables = _split_deliverables(deliverables)
-    deliv_cons = [f"[交付物] {d}" for d in desc_deliverables]
+    deliv_cons = [f"[Deliverable] {d}" for d in desc_deliverables]
 
-    # 用户长期偏好规则（profile.preferences.style_rules，由 /remember 累积）
-    # 进硬审计清单：让 verifier 在 covered/missing 列表里逐条对账。
-    # identity（姓名/学号）不进——只通过 inject_for_agent 注入到 system prompt，
-    # 是否需要写进产物完全看题面/用户当轮指令。
+    # 用户长期偏好规则（profile.preferences.style_rules，经 /remember 累加）
+    # 进入硬审计列表：让 verifier 逐条对照 covered/missing 列表。
+    # identity（姓名/学号）不含在内 —— 只经 inject_for_agent 注入 system prompt，
+    # 是否写进产物完全取决于题面/用户当轮指示。
     prof = load_profile() or {}
     profile_rules = ((prof.get("preferences") or {}).get("style_rules") or [])
-    profile_cons = [f"[长期规则] {str(r).strip()}" for r in profile_rules if str(r).strip()]
+    profile_cons = [f"[Long-term rule] {str(r).strip()}" for r in profile_rules if str(r).strip()]
 
     all_cons = constraints + user_cons + deliv_cons + profile_cons
 
@@ -421,19 +415,19 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
         }
 
     stage1_block = (
-        "## 阶段 1 硬指标结果（事实，不要乐观假设其反面）\n"
+        "## Stage 1 hard metric results (facts; do not optimistically assume the opposite)\n"
         + (
             "\n".join(f"- {f}" for f in stage1_failures)
             if stage1_failures
-            else "- 全部通过"
+            else "- all passed"
         )
         + "\n\n"
     )
 
-    # 执行轨迹摘要（P1-1：过程证据，与静态产物互补）
-    trace_block = _build_execution_trace(state)
+    # 执行轨迹摘录（P1-1：过程证据，补充静态产物）
+    trace_block = build_execution_trace(state)
 
-    # 历史相似任务的卡片（reference block，不进硬清单——让 LLM 判断本次是否适用）
+    # 历史相似任务的卡片（参考块，不进硬列表 —— 让 LLM 判本次适用性）
     hist_block = ""
     task_dag = state.get("task_dag") or {}
     retrieved_cards = task_dag.get("retrieved_cards") or []
@@ -441,14 +435,14 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
     if lesson_cards:
         hist_lines = [f"- {l}" for l in lesson_cards]
         hist_block = (
-            "## 历史相似任务的卡片（参考；如本次产物明显违反某条教训，"
-            "请在 missing 中加 [历史教训] 前缀的条目）\n"
+            "## Cards from similar historical tasks (reference; if this round's artifacts clearly violate some lesson, "
+            "add an item prefixed with [historical lesson] in missing)\n"
             + "\n".join(hist_lines)
             + "\n\n"
         )
 
-    # 分批：约束超过阈值时按分节切 ≤2 批（题面+用户 / 交付物+长期规则），
-    # 各批独立调用后合并 covered/missing；多数任务约束 ≤12 条，单批不受影响
+    # 分批：约束超过阈值时按分节拆为 ≤2 批（题面+用户 / 交付物+长期规则），
+    # 每批独立调用后合并 covered/missing；多数任务 ≤12 条约束，不受影响
     if len(all_cons) > _COVERAGE_BATCH_THRESHOLD:
         batch_specs = [
             (constraints, user_cons, [], []),
@@ -458,7 +452,7 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
     else:
         batch_specs = [(constraints, user_cons, deliv_cons, profile_cons)]
 
-    shared_suffix = trace_block + hist_block + "## 产物内容\n\n" + artifacts_text
+    shared_suffix = trace_block + hist_block + "## Artifact content\n\n" + artifacts_text
     llm = get_llm()
     covered: list[Any] = []
     missing: list[Any] = []
@@ -468,11 +462,12 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
         cons_block = _render_cons_block(task_type, task_title, *batch)
         user_msg = stage1_block + cons_block + "\n\n" + shared_suffix
         try:
-            resp = llm.invoke(
-                [SystemMessage(content=inject_for_agent("verifier", VERIFIER_COVERAGE_SYSTEM)), HumanMessage(content=user_msg)]
+            data = invoke_llm_json(
+                llm,
+                inject_for_agent("verifier", VERIFIER_COVERAGE_SYSTEM),
+                user_msg,
+                agent="verifier",
             )
-            content = resp.content if isinstance(resp.content, str) else str(resp.content)
-            data = parse_result_json(content)
         except Exception as e:
             return {
                 "covered": covered,
@@ -498,23 +493,20 @@ def _stage2_llm_coverage(state: HwState, stage1_failures: list[str]) -> dict[str
 def run_verifier(state: HwState) -> dict[str, Any]:
     """LangGraph 节点入口。
 
-    Returns: {verifier_runs: [<新增运行>], progress_log: [...]}
+    返回：{verifier_runs: [<new run>], progress_log: [...]}
     """
-    # Stage 1
+    # 阶段 1
     stage1_failures, evidence = _stage1_hard_checks(state)
 
-    # Stage 2
+    # 阶段 2
     coverage = _stage2_llm_coverage(state, stage1_failures)
     stage2_warnings = [
         f"未覆盖约束：{m.get('constraint')} （{m.get('reason','')}）"
         for m in coverage.get("missing", [])
     ]
 
-    # Verdict（二元化）
-    if stage1_failures or stage2_warnings:
-        verdict = "fail"
-    else:
-        verdict = "pass"
+    # 裁决（二值）
+    verdict = "fail" if (stage1_failures or stage2_warnings) else "pass"
 
     suggested = coverage.get("suggested_fix") or ""
     if stage1_failures and not suggested:
@@ -529,14 +521,16 @@ def run_verifier(state: HwState) -> dict[str, Any]:
         "suggested_fix": suggested,
     }
 
+    log_entry: dict[str, Any] = {
+        "node": "verifier",
+        "verdict": verdict,
+        "n_failures": len(stage1_failures),
+        "n_warnings": len(stage2_warnings),
+    }
+    # token 真值 + 前缀缓存命中（分批覆盖判官的多次调用在此合并成一条）
+    log_entry.update(usage_log_fields("verifier"))
+
     return {
         "verifier_runs": [run],
-        "progress_log": [
-            {
-                "node": "verifier",
-                "verdict": verdict,
-                "n_failures": len(stage1_failures),
-                "n_warnings": len(stage2_warnings),
-            }
-        ],
+        "progress_log": [log_entry],
     }

@@ -1,11 +1,11 @@
-"""Live Panel — 任务执行流式状态输出（GraphEvent 的终端渲染器）。
+"""Live Panel -- 任务执行流式状态输出（GraphEvent 的终端渲染器）。
 
-astream 解析统一在 ui/events.py:iter_graph_events（Web SSE 与终端共用同一事件流）；
-本模块只负责把 GraphEvent 渲染成 rich 终端输出。
-完整消息与工具历史由 compile_node 落盘至
+astream 解析统一在 ui/events.py:iter_graph_events（Web SSE 与终端共用同一套事件流）；
+本模块只负责将 GraphEvent 渲染为 rich 终端输出。
+完整消息与工具历史由 compile_node 落盘到
 workspace/.labhandler/runs/<ts>/transcript.jsonl + tool_history.jsonl。
 
-输出格式（逐行追加，无边框、无重绘，视觉语言对标 Codex CLI 转录范式）：
+输出格式（逐行追加，无边框，不重绘；视觉语言对齐 Codex CLI transcript 范式）：
 
     › 请按 README 完成作业
     • intake
@@ -13,7 +13,7 @@ workspace/.labhandler/runs/<ts>/transcript.jsonl + tool_history.jsonl。
     • planner
       ✓ iteration=1 · skill=coding · n_nodes=3
     • coder
-      <streaming content / dim italic reasoning>
+      <流式内容 / 暗色斜体推理>
       • tool_name(key_args)
         └ result_snippet
       ✓ step_id=n1 · step_idx=0 · n_messages=18
@@ -42,7 +42,7 @@ WORKSPACE_DIR: Path = get_settings().workspace_dir
 
 
 def print_node_event(node: str, log_entries: list[dict[str, Any]]) -> None:
-    """节点完成事件：从属于该节点的 progress_log 条目拼摘要，缩进输出 ✓ 行。"""
+    """节点完成事件：从属于本节点的 progress_log 条目组装摘要，缩进 ✓ 行输出。"""
     summary_bits: list[str] = []
     for entry in log_entries or []:
         for k, v in entry.items():
@@ -53,14 +53,14 @@ def print_node_event(node: str, log_entries: list[dict[str, Any]]) -> None:
     console.print(f"  [dim green]✓[/] [dim]{summary}[/]")
 
 
-# ─── 工具调用 / 结果短摘要 ─────────────────────────────────────
+# ─── 工具调用 / 结果简短摘要 ─────────────────────────────────────
 
 
 def _args_one_line(raw: Any) -> str:
-    """工具参数单行摘要，截断至 80 字符。
+    """工具参数一行摘要，截断到 80 字符。
 
-    优先提取字段：path / file_path / cmd / command / action / code；
-    均不存在则取首个 k=v 对；解析失败 fallback 至原文截断。
+    优先字段提取：path / file_path / cmd / command / action / code；
+    均无则取首个 k=v 对；解析失败回退原文截断。
     """
     if not raw:
         return ""
@@ -87,14 +87,14 @@ def _args_one_line(raw: Any) -> str:
 
 
 def _short(text: str, n: int = 140) -> str:
-    """工具结果单行摘要：折叠换行并截断至 n 字符。"""
+    """工具结果一行摘要：折叠换行并截断到 n 字符。"""
     if not text:
         return ""
     one_line = " ".join(text.split())
     return one_line if len(one_line) <= n else one_line[:n] + "…"
 
 
-# ─── 主入口 ────────────────────────────────────────────────────
+# ─── 主入口 ────────────────────────────────────────────────────────────
 
 
 async def stream_graph(
@@ -103,14 +103,14 @@ async def stream_graph(
     recursion_limit: int = 80,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """执行主图并流式打印事件；返回合并所有 diff 后的最终 state。
+    """执行主图并流式打印事件；返回合并所有 diff 后的终态。
 
     解析逻辑在 ui/events.py:iter_graph_events；本函数只做终端渲染。
-    必须为 async：主图含 async 节点（run_coder），graph.astream 由顶层
-    asyncio loop 包装（cli.py:_run_task），确保 stream_mode='messages' 的
-    contextvar 可透传至所有 LLM（含 Coder 内部的 create_react_agent）。
-    config 透传给主图（checkpointer 的 thread_id 等）。
-    state=None 为断点续跑（从 checkpoint 继续），返回值只含续跑期间 diff。
+    须为 async：主图含异步节点（run_coder），graph.astream 由顶层
+    asyncio 循环包裹（cli.py:_run_task），确保 stream_mode='messages' 的 contextvar 传到所有 LLM
+    （含 Coder 内部的 create_react_agent）。
+    config 透传给主图（checkpointer thread_id 等）。
+    state=None 为断点续跑（从 checkpoint 继续），返回值仅含续跑期间的 diff。
     """
     from ui.events import iter_graph_events
 
@@ -123,7 +123,7 @@ async def stream_graph(
 
     final_state: dict[str, Any] = dict(state) if state else {}
     elapsed: float = 0.0
-    # 当前是否处于流式 content 行（决定节点切换前是否补换行）
+    # 当前是否处于流式内容行（决定节点切换前是否补换行）
     content_open: bool = False
 
     def _close_content_line() -> None:
@@ -141,8 +141,8 @@ async def stream_graph(
                 console.print(f"\n[bold]• {ev.node}[/]")
 
             elif ev.kind == "content":
-                # 流式输出 LLM content / reasoning，给用户"模型在动"的可见性；
-                # reasoning 用 dim italic 弱化（Codex thinking 同款层级），不刷屏
+                # 流式呈现 LLM 内容 / 推理，提供“模型正在干活”可见性；
+                # 推理用暗色斜体（与 Codex thinking 同级），不刷屏
                 text = ev.payload.get("text", "")
                 if not text:
                     continue
@@ -184,7 +184,7 @@ async def stream_graph(
 
 
 def print_completion_panel(state: dict[str, Any]) -> None:
-    """任务完成面板：做了什么 / 在哪里"""
+    """任务完成面板：干了什么 / 产物在哪。"""
     runs = state.get("verifier_runs") or []
     last_verdict = (runs[-1].get("verdict") if runs else "unknown")
     iter_n = state.get("iteration", 0)
@@ -227,7 +227,7 @@ def print_completion_panel(state: dict[str, Any]) -> None:
         border_style="dim", padding=(1, 2),
     ))
 
-    # SUMMARY 全文直接渲染到终端（跑完即交付，不让用户再去 cat 文件）
+    # SUMMARY 全文直接渲染到终端（完成即交付，无需用户 cat 文件）
     if summary_path.exists():
         console.print(Panel(
             Markdown(summary_path.read_text(encoding="utf-8")),

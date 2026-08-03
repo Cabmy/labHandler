@@ -1,7 +1,7 @@
 """任务归档存储（SQLite 事实层）。
 
-只负责 SQLite 读写（task + cards），不涉及任何检索。
-Chroma / BM25 / RRF 全部在 rag/archive_retriever.py 中处理。
+只负责 SQLite 读写（task + cards）；不涉及检索。
+Chroma / BM25 / RRF 均在 rag/archive_retriever.py 处理。
 """
 
 from __future__ import annotations
@@ -9,9 +9,9 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
-from typing import Any, Optional
+from typing import Any
 
-MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH", "./.labhandler_data/memory.db")
+from config.runtime import get_settings
 
 # card_type 白名单
 VALID_CARD_TYPES = frozenset({"lesson", "strategy", "pattern"})
@@ -20,13 +20,13 @@ VALID_CARD_TYPES = frozenset({"lesson", "strategy", "pattern"})
 class TaskArchive:
     """任务归档服务。"""
 
-    def __init__(self, db_path: Optional[str] = None) -> None:
-        self.db_path: str = db_path or MEMORY_DB_PATH
+    def __init__(self, db_path: str | None = None) -> None:
+        self.db_path: str = db_path or str(get_settings().memory_db_path)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self._init_db()
 
     def _init_db(self) -> None:
-        """创建数据表。"""
+        """创建数据库表。"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 """
@@ -61,7 +61,7 @@ class TaskArchive:
     # --- 写接口 -------------------------------------------------------
 
     def create_task(self, task_title: str, task_type: str, user_summary: str) -> int:
-        """创建任务归档，返回 task_id。"""
+        """创建任务归档条目，返回 task_id。"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
                 "INSERT INTO task_archive (task_title, task_type, user_summary) VALUES (?, ?, ?)",
@@ -73,10 +73,10 @@ class TaskArchive:
     def create_cards(
         self, task_id: int, knowledge_cards: list[dict], task_title: str, task_type: str
     ) -> list[int]:
-        """批量写入知识卡片，返回写入成功的 card_id 列表。
+        """批量写入知识卡片，返回成功写入的 card_id 列表。
 
         校验逻辑：
-        - card_type 不在白名单中 -> 丢弃
+        - card_type 不在白名单 -> 丢弃
         - content 为空 -> 丢弃
         - 同 task 内 card_type + content_hash 重复 -> 跳过
         """
@@ -122,7 +122,7 @@ class TaskArchive:
             conn.commit()
 
     def clear_card_vector_error(self, card_id: int) -> None:
-        """清除卡片的向量错误标记（重建用）。"""
+        """清除卡片的 vector error 标志（供重建用）。"""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute(
                 "UPDATE archive_cards SET vector_error = NULL WHERE id = ?",
@@ -131,7 +131,7 @@ class TaskArchive:
             conn.commit()
 
     def retire_cards(self, card_ids: list[int]) -> int:
-        """软删卡片（/dream 治理淘汰/被合并的卡）。返回实际标记条数。"""
+        """软删除卡片（/dream 治理淘汰/合并卡片）。返回实际标记数。"""
         if not card_ids:
             return 0
         placeholders = ",".join("?" * len(card_ids))
@@ -149,7 +149,7 @@ class TaskArchive:
     # --- 读接口 -------------------------------------------------------
 
     def get_cards_for_indexing(self) -> list[dict[str, Any]]:
-        """获取所有需要被索引的卡片（含所属任务信息；排除软删）。"""
+        """获取所有需索引的卡片（含父任务信息；排除软删除）。"""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
@@ -165,7 +165,7 @@ class TaskArchive:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_cards_by_ids(self, card_ids: list[int]) -> list[dict[str, Any]]:
-        """按 card_id 回表 hydrate 卡片和所属任务（排除软删）。"""
+        """按 card_id 水合卡片及父任务（排除软删除）。"""
         if not card_ids:
             return []
         placeholders = ",".join("?" * len(card_ids))
@@ -185,7 +185,7 @@ class TaskArchive:
             return [rows_by_id[rid] for rid in card_ids if rid in rows_by_id]
 
     def get_all_active_cards(self) -> list[dict[str, Any]]:
-        """/dream 治理输入：全部未软删卡片（含 card_id / 分组键 / 内容）。"""
+        """/dream 治理的输入：所有非软删除卡片（带 card_id / 分组键 / content）。"""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
@@ -203,11 +203,11 @@ class TaskArchive:
 
 # 模块级单例
 
-_default_archive: Optional[TaskArchive] = None
+_default_archive: TaskArchive | None = None
 
 
 def get_task_archive() -> TaskArchive:
-    """获取全局 TaskArchive 实例"""
+    """获取全局 TaskArchive 实例。"""
     global _default_archive
     if _default_archive is None:
         _default_archive = TaskArchive()

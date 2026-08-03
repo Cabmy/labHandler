@@ -1,36 +1,36 @@
 ---
 name: lab_report
 description: |
-  实验报告类作业：含实验目的 / 原理 / 步骤 / 结果 / 分析 / 结论 6+ 章节结构。
-  特征：含实验过程（做实验），可能含代码片段 / 数据 / 截图证据；助教按章节齐全 + 复现性评分。
-  典型产物：实验报告文档（.md/.docx/.pdf）+ 可能的代码 / 数据文件。
+  Lab report assignments: contain experiment objective / principle / steps / results / analysis / conclusion, a 6+ section structure.
+  Characteristics: includes an experiment process (doing the experiment), may contain code snippets / data / screenshot evidence; the TA grades by section completeness + reproducibility.
+  Typical artifacts: lab report document (.md/.docx/.pdf) + possible code / data files.
 when_to_use: |
-  以下任一成立时选用：
-  - 作业要求"写实验报告 / Lab N / 实验 N"，或明确要求提交含实验过程的报告
-  - 作业涉及网络安全实验、操作系统实验、计算机网络实验、SEED Lab、抓包分析等实验课程
-  - workspace 含"实验指导.pdf / lab_*.md / lab_*.docx"类文档
-  - deliverables 含实验报告 + 可能的代码 / 数据文件
-  排除：
-  - 纯算法实现 + 单元测试（无实验报告要求）→ coding
-  - 纯论述 / 读后感 / 议论文（无实验过程）→ essay
+  Pick this when ANY of the following holds:
+  - The assignment asks to "写实验报告 / Lab N / 实验 N" (write a lab report), or explicitly requires submitting a report containing the experiment process
+  - The assignment involves network security labs, OS labs, computer network labs, SEED Lab, packet capture analysis, or other lab courses
+  - workspace contains documents like "实验指导.pdf / lab_*.md / lab_*.docx"
+  - deliverables include a lab report + possible code / data files
+  Exclude:
+  - Pure algorithm implementation + unit tests (no lab report requirement) -> coding
+  - Pure argumentation / reading reflection / argumentative essay (no experiment process) -> essay
 ---
 
 # Lab Report Skill SOP
 
-指导 Coder agent 完成实验报告类作业的实验复现 / 数据组织 / 报告撰写。
-ground truth 全部从 task context（intake_result + 实验指导原文 + 用户提供的实验环境）拿；
-**绝不允许编造未跑过的实验数据 / 未截过的截图 / 未发生的实验现象**。
-详细材料在 references/（用 load_skill_reference 按需读取）：
-- `writing_guide.md` — 实验过程章节的写作风格长示例 + 环境前置样例 + 结果表模板
+Guides the Coder agent to complete lab report assignments: experiment reproduction / data organization / report writing.
+All ground truth comes from the task context (intake_result + original lab guidance + experiment environment provided by the user);
+**fabricating experiment data never run / screenshots never captured / phenomena never observed is absolutely forbidden**.
+Detailed materials live in references/ (read on demand via load_skill_reference):
+- `writing_guide.md` — long examples of the experiment-process section writing style + environment-prerequisite samples + result table templates
 
-## 1. 读懂实验指导
+## 1. Read the lab guidance thoroughly
 
-调 sandbox_convert_to_markdown 把 PDF/DOCX 实验指导转 markdown 后读，抽：
-实验目的（一句话）、实验环境（OS/容器/拓扑/工具版本）、必做任务清单（Task 1.1, 1.2, ...）、
-加分任务、提交要求、评分细则。
-期望产物：**章节齐 + 每个 Task 都有"实验过程 + 现象 + 结论"完整链条**，缺一不可。
+Call sandbox_convert_to_markdown to convert PDF/DOCX lab guidance to markdown before reading; extract:
+experiment objective (one sentence), experiment environment (OS/container/topology/tool versions), required task list (Task 1.1, 1.2, ...),
+bonus tasks, submission requirements, grading rubric.
+Expected artifact: **complete sections + every Task has a full "process + phenomenon + conclusion" chain** — none may be missing.
 
-## 2. 必备章节（Verifier 阶段 1 硬指标）
+## 2. Required sections (Verifier Stage 1 hard metrics)
 
 ```
 1. 实验目的            5. 实验结果（数据表 + 原始记录）
@@ -39,35 +39,35 @@ ground truth 全部从 task context（intake_result + 实验指导原文 + 用�
 4. 实验步骤（按 Task 分小节）  8. 思考题（如实验指导附了）
 ```
 
-Verifier 会扫这 5 个关键字至少齐：实验目的 / 实验原理 / 实验步骤 / 实验结果 / 结论。
+The Verifier scans that at least these 5 keywords are all present: 实验目的 / 实验原理 / 实验步骤 / 实验结果 / 结论.
 
-## 3. 写作要点（细节与长示例见 references/writing_guide.md）
+## 3. Writing points (details and long examples in references/writing_guide.md)
 
-- **展现思考过程**：每一步前 1-2 句解释「为什么这么做、考虑过什么 alternative」，
-  不是堆命令 + 截图——这是 lab_report 与 coding/essay 最大的差异
-- 截图位置用 `（此处建议附 XX 截图）` 占位（agent 不能产截图，由用户补）
-- 代码/攻击脚本整段贴在对应步骤文中（不附录式塞最后），代码块前一句说明做什么 + 参数理由
-- 需改 docker / 系统配置才能跑通的，单独写「环境前置」段说明为什么改
-- 少用加粗；结果能上 markdown table 就上；意外现象单独讨论（这是得分点）
+- **Show the thinking process**: before each step, 1-2 sentences explaining "why do it this way, what alternatives were considered" —
+  not just piling commands + screenshots — this is the biggest difference between lab_report and coding/essay
+- Use `（此处建议附 XX 截图）` placeholders for screenshot positions (the agent cannot produce screenshots; the user fills them in)
+- Paste code/attack scripts inline within the corresponding step text (not dumped in an appendix at the end); one sentence before each code block stating what it does + parameter rationale
+- When docker / system config must be changed to make it run, write a separate "environment prerequisites" section explaining why
+- Use bold sparingly; put results into markdown tables where possible; discuss unexpected phenomena separately (this is a scoring point)
 
-## 4. 引用与学术诚信
+## 4. Citation and academic integrity
 
-- 实验指导原文可直接引用作分析对象；其他来源（教材/RFC/论文）引号 + 来源，单条 ≤ 30 字
-- 同组讨论思路可以，代码/报告不能互抄；不展示他人学号/姓名/真实 IP/凭据
-- 末尾「使用工具说明」段标注 AI 辅助（哪几节 AI 协助生成、截图待用户补充）
+- The original lab guidance may be quoted directly as the analysis object; other sources (textbook/RFC/paper) use quotation marks + source, single item ≤ 30 characters
+- Discussing ideas within the same group is fine; code/reports must not be copied from each other; do not expose others' student IDs/names/real IPs/credentials
+- A "tool usage note" section at the end noting AI assistance (which sections AI helped generate, screenshots pending user supplement)
 
-## 5. 自检 checklist
+## 5. Self-check checklist
 
-- [ ] 5 个关键章节齐；实验环境有 OS/容器/工具版本
-- [ ] 每个 Task 都有"过程 + 现象 + 结论"链条，每步前有思考解释
-- [ ] 截图占位打全；代码贴文中；数据真实
-- [ ] 结果分析含与预期对比 + 意外现象解释
-- [ ] 末尾有「使用工具说明」段
+- [ ] The 5 key sections complete; experiment environment has OS/container/tool versions
+- [ ] Every Task has a "process + phenomenon + conclusion" chain, with thinking explanations before each step
+- [ ] Screenshot placeholders all placed; code pasted inline; data authentic
+- [ ] Result analysis includes comparison with expectations + explanation of unexpected phenomena
+- [ ] A "tool usage note" section at the end
 
-## 6. 异常处理
+## 6. Exception handling
 
-- 实验未实际跑通：**不要伪造结果**——对应 Task 节写「实测未跑通：错误现象 + 已尝试方法 + 卡点」，
-  Final Answer 报 `step <id> needs_retry: <卡点>`；重试耗尽自然交 Verifier
-- 实验数据有意外（如比预期慢 100×）：在「分析」章节单独讨论 + 假设原因，比平铺数据更得分
-- 英文 SEED Lab：报告主体用中文；引用原文时英文 + 中文意译
-- 边界：仅"实现+测试"→ coding；"做实验+写报告"→ 本 skill（报告是主交付物）
+- Experiment did not actually run through: **do not fabricate results** — in the corresponding Task section write "实测未跑通：错误现象 + 已尝试方法 + 卡点" (not run through: error phenomenon + methods tried + stuck point),
+  Final Answer reports `step <id> needs_retry: <stuck point>`; after retries are exhausted it naturally hands to Verifier
+- Experiment data has surprises (e.g. 100× slower than expected): discuss separately in the "analysis" section + hypothesize causes — scores better than flat data
+- English SEED Lab: the report body uses Chinese; when quoting the original use English + a Chinese paraphrase
+- Boundary: only "implement + test" -> coding; "do the experiment + write a report" -> this skill (the report is the main deliverable)

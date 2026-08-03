@@ -1,11 +1,13 @@
 """/edit_skill 编辑判官（仿 memory/dream.py 的单模块 LLM 判官模式）。
 
-流程：读取 skill 全部文件 →（指令提及 workspace 文件则读入作为文风样本）→
-一次 LLM 调用产出多文件 operations → 预校验 + unified diff → 调用方展示确认 →
-apply_edit 落盘（skills/repository.py:apply_skill_operations，整批校验整批应用）。
+流程：读取全部 skill 文件 ->（若指令提及 workspace 文件，读作文风
+样本）-> 一次 LLM 调用产出多文件操作 -> 预校验 + 统一 diff ->
+调用方展示确认 -> apply_edit 落盘
+（skills/repository.py:apply_skill_operations，整批校验整批落盘）。
 
-约束：只编辑现有 skill（coding/essay/lab_report），禁止借编辑入口新建 skill；
-触发入口：CLI /edit_skill 或 Web POST /api/edit_skill。纯离线操作，不碰主图 state。
+约束：仅能编辑现有 skill（coding/essay/lab_report）；禁止经编辑
+入口新增 skill。触发入口：CLI /edit_skill 或 Web POST /api/edit_skill。
+纯离线操作，不触碰主图状态。
 """
 
 from __future__ import annotations
@@ -13,39 +15,37 @@ from __future__ import annotations
 import difflib
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-
-from config.prompts import EDIT_SKILL_SYSTEM, parse_result_json
+from config.prompts import EDIT_SKILL_SYSTEM
 from config.runtime import get_settings
 from llm import get_llm
+from llm.invoke import invoke_llm_json
 from skills.repository import (
-    _validate_operation,
     apply_skill_operations,
     list_skill_documents,
     read_skill_files,
+    validate_operation,
 )
 
-# 单个文风样本的截断上限（字符）
+# 单个文风样本的截断上限（字符数）
 _MAX_SAMPLE_CHARS = 8000
 
-# host 端可直接读的文本后缀；PDF/DOCX/PPTX 走 sandbox_convert_to_markdown
+# host 侧可直接读的文本后缀；PDF/DOCX/PPTX 走 sandbox_convert_to_markdown
 _TEXT_EXTS = {".md", ".txt", ".rst", ".markdown"}
 _PARSEABLE_EXTS = {".pdf", ".docx", ".pptx"}
 
 
 def existing_skill_names() -> list[str]:
-    """现有 skill 名清单（编辑目标白名单，当前 coding/essay/lab_report）。"""
+    """现有 skill 名列表（编辑目标白名单，当前为 coding/essay/lab_report）。"""
     return sorted(s["name"] for s in list_skill_documents())
 
 
 def _collect_style_samples(instruction: str) -> tuple[dict[str, str], list[str]]:
-    """从指令文本中匹配 workspace 一级文件名，读入作为文风样本。
+    """从指令文本中匹配 workspace 顶层文件名，读作文风样本。
 
-    自然语言指令里直接提文件名即可（如"学习 我的实验报告.docx 的文风"），
-    不设 flag；Web 端样本先经现有上传接口进 workspace。
-    长文件名优先匹配并从指令中掩盖已命中片段，防 "a.md" 因是 "data.md"
-    子串而被误拉入。
-    Returns: ({文件名: 样本文本}, [解析失败说明])
+    自然语言指令可直接提及文件名（如“学一下我的实验报告.docx 的文风”），
+    无需标志位；Web 侧样本经现有上传接口进入 workspace。长文件名优先匹配，
+    匹配到的片段从指令中掩蔽，防止“a.md”作为“data.md”子串被误拉入。
+    返回：({文件名: 样本文本}, [解析失败描述])
     """
     ws = get_settings().workspace_dir
     if not ws.is_dir():
@@ -64,8 +64,8 @@ def _collect_style_samples(instruction: str) -> tuple[dict[str, str], list[str]]
         if suffix in _TEXT_EXTS:
             text = p.read_text(encoding="utf-8", errors="replace")
         elif suffix in _PARSEABLE_EXTS:
-            # PDF/DOCX 复用沙箱解析（同 agents/intake.py:_parse_with_sandbox 模式）；
-            # 编辑命令在主线程/工作线程同步跑，无 running loop，asyncio.run 安全
+            # PDF/DOCX 复用沙箱解析（与 agents/intake.py:_parse_with_sandbox 同模式）；
+            # edit 命令在主/工作线程同步跑，无 running loop，asyncio.run 安全
             import asyncio
 
             try:
@@ -74,12 +74,12 @@ def _collect_style_samples(instruction: str) -> tuple[dict[str, str], list[str]]
                 if not isinstance(text, str):
                     text = str(text)
             except Exception as e:
-                # 失败样本不进 samples：占位符喂给 LLM 无意义，且会让用户
-                # 误以为文风已学习；失败原因单独透出
+                # 失败样本不入 samples：占位符喂给 LLM 无意义，
+                # 且会误导用户以为已学到文风；失败原因单独曝出
                 failures.append(f"{p.name}：沙箱解析失败（{type(e).__name__}: {e}）")
                 continue
         else:
-            continue  # 其他后缀（代码/图片等）不当文风样本
+            continue  # 其他后缀（代码/图片等）不作为文风样本
         samples[p.name] = text[:_MAX_SAMPLE_CHARS]
     return samples, failures
 
@@ -112,7 +112,7 @@ def _build_user_msg(
 def _make_diffs(
     files: dict[str, str], operations: list[dict[str, Any]]
 ) -> list[dict[str, str]]:
-    """按操作集生成 per-file unified diff（新建文件旧文本为空；delete 新文本为空）。"""
+    """按操作集逐文件生成 unified diff（新建文件旧文本为空；删除新文本为空）。"""
     diffs: list[dict[str, str]] = []
     for op in operations:
         file = str(op["file"])
@@ -129,8 +129,8 @@ def _make_diffs(
 def propose_edit(skill_name: str, instruction: str) -> dict[str, Any]:
     """生成编辑提案（不落盘）。
 
-    Returns: {skill_name, summary, operations, diffs, style_samples}
-    Raises: FileNotFoundError（skill 不在现有清单）/ LLM 输出解析、校验异常
+    返回：{skill_name, summary, operations, diffs, style_samples}
+    异常：FileNotFoundError（skill 不在现有列表）/ LLM 输出解析 / 校验错误
     """
     available = existing_skill_names()
     if skill_name not in available:
@@ -141,12 +141,10 @@ def propose_edit(skill_name: str, instruction: str) -> dict[str, Any]:
     samples, sample_failures = _collect_style_samples(instruction)
 
     llm = get_llm()
-    resp = llm.invoke([
-        SystemMessage(content=EDIT_SKILL_SYSTEM),
-        HumanMessage(content=_build_user_msg(skill_name, files, instruction, samples)),
-    ])
-    text = resp.content if isinstance(resp.content, str) else str(resp.content)
-    data = parse_result_json(text)
+    data = invoke_llm_json(
+        llm, EDIT_SKILL_SYSTEM,
+        _build_user_msg(skill_name, files, instruction, samples),
+    )
 
     operations_raw = data.get("operations") or []
     if not isinstance(operations_raw, list):
@@ -160,8 +158,8 @@ def propose_edit(skill_name: str, instruction: str) -> dict[str, Any]:
             "file": str(op.get("file", "")),
             "content": op.get("content", "") or "",
         }
-        # 与 apply 同源的预校验：任何一条非法立即报错，不给用户看半合法提案
-        _validate_operation(skill_name, norm)
+        # 提前对照落盘时校验：任一条目非法则整个提案被拒
+        validate_operation(skill_name, norm)
         operations.append(norm)
 
     return {
@@ -175,5 +173,5 @@ def propose_edit(skill_name: str, instruction: str) -> dict[str, Any]:
 
 
 def apply_edit(skill_name: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
-    """确认后落盘（整批校验整批应用）。Returns: {applied: [...]}"""
+    """确认后落盘（整批校验整批落盘）。返回：{applied: [...]}"""
     return {"applied": apply_skill_operations(skill_name, operations)}

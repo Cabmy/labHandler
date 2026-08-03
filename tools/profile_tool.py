@@ -1,6 +1,6 @@
-"""profile_tool - 读 / 改 profile/me.yaml
+"""profile_tool - 读 / 更新 profile/me.yaml。
 
-面向运行时 profile 读取与更新的工具集合。
+运行时 profile 读写工具集。
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ from langchain_core.tools import tool
 
 @tool
 def read_profile() -> dict:
-    """读取 profile/me.yaml 全部内容（dict）。"""
+    """Read the full content of profile/me.yaml (dict)."""
     from memory import load_profile
 
     return load_profile()
@@ -20,11 +20,11 @@ def read_profile() -> dict:
 
 @tool
 def update_profile(path: str, value: Any) -> dict:
-    """更新 profile 字段（点号路径，路径必须已存在）。
+    """Update a profile field (dotted path; path must already exist).
 
-    例：update_profile("preferences.writing_style.formality", "high")
+    Example: update_profile("preferences.writing_style.formality", "high")
 
-    Returns: 更新后的 profile dict。
+    Returns: the updated profile dict.
     """
     from memory import update_field
 
@@ -33,7 +33,7 @@ def update_profile(path: str, value: Any) -> dict:
 
 @tool
 def add_profile_field(path: str, value: Any) -> dict:
-    """新增 profile 字段（点号路径，缺失父节点会自动建）。"""
+    """Add a profile field (dotted path; missing parent nodes are created automatically)."""
     from memory import add_field
 
     return add_field(path, value)

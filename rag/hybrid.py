@@ -1,10 +1,11 @@
-"""RRF 融合（Reciprocal Rank Fusion）
+"""RRF 融合（Reciprocal Rank Fusion，倒数排名融合）。
 
 公式：score(d) = Σ_i 1 / (k_const + rank_i(d))
-k_const=60 是 Cormack et al. 2009 论文经验值。
+k_const=60 是 Cormack 等人 2009 论文的经验值。
 
-不做加权求和：BM25 分数和余弦相似度尺度不齐，直接加权需要先归一化；
-RRF 只用排名信息规避这个问题，也不需要调节权重超参。
+不用加权和：BM25 分数与余弦相似度量纲不同，
+直接加权需先做归一化。RRF 只用排名信息规避该问题，
+也无需调权重超参。
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ def rrf_fuse(
     rankings: list[list[str]],
     k_const: int = RRF_K,
 ) -> list[tuple[str, float]]:
-    """Reciprocal Rank Fusion
+    """倒数排名融合。
 
     Args:
         rankings: 多路召回的排序结果，每路是 [doc_id_rank1, doc_id_rank2, ...]

@@ -1,33 +1,33 @@
-"""search_tool - DDG 检索包装（参考 deep_search/search.py 拷造）
+"""search_tool - DDG 搜索封装（改编自 deep_search/search.py）。
 
 设计要点：
-1. 用 ddgs 库（P0 验过）；PROXY 走 .env，可空
-2. 带最简重试（2 次，3s 间隔）；async 实现：阻塞的 DDGS 调用丢线程池、
-   重试间隔用 asyncio.sleep，不占事件循环（Web 端 SSE 并发下不卡流）
-3. @tool 装饰输出 OpenAI schema 给 bind_tools
+1. 用 ddgs 库（P0 已验证）；PROXY 来自 .env，可为空。
+2. 最小重试（2 次，间隔 3s）；异步实现：阻塞的 DDGS 调用
+   卸到线程池，重试间隔用 asyncio.sleep 避免阻塞
+   事件循环（Web 并发下不卡 SSE 流）。
+3. @tool 装饰器输出 OpenAI schema 供 bind_tools。
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 import warnings
 
 from langchain_core.tools import tool
 
-warnings.filterwarnings("ignore")
+from config.runtime import get_settings
 
-PROXY = os.getenv("PROXY") or None
-MAX_RETRIES = int(os.getenv("SEARCH_MAX_RETRIES", "2"))
-RETRY_DELAY = int(os.getenv("SEARCH_RETRY_DELAY", "3"))
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="duckduckgo_search")
+warnings.filterwarnings("ignore", category=DeprecationWarning, module="ddgs")
 
 
 def _search_once(query: str, max_results: int) -> list[dict]:
-    """单次同步检索（在线程池里跑）。"""
-    from ddgs import DDGS  # 懒 import 避免 import 阶段拖累
+    """单次同步搜索（跑在线程池内）。"""
+    from ddgs import DDGS  # 延迟导入避免模块加载开销
 
+    settings = get_settings()
     results = []
-    with DDGS(proxy=PROXY) as ddgs:
+    with DDGS(proxy=settings.proxy) as ddgs:
         for r in ddgs.text(query, max_results=max_results):
             results.append(
                 {
@@ -41,20 +41,22 @@ def _search_once(query: str, max_results: int) -> list[dict]:
 
 @tool
 async def web_search(query: str, max_results: int = 5) -> list[dict]:
-    """DuckDuckGo 网络检索。返回 [{title, url, snippet}] 列表（最多 max_results 条）。
+    """DuckDuckGo web search. Returns a [{title, url, snippet}] list (up to max_results items).
 
-    用例：Researcher 节点查 API 文档 / 论文。Coder 节点偶尔查报错信息。
+    Usage: the Researcher node looks up API docs / papers; the Coder node
+    occasionally looks up error messages.
     """
+    settings = get_settings()
     last_err: Exception | None = None
-    for attempt in range(MAX_RETRIES + 1):
+    for attempt in range(settings.search_max_retries + 1):
         try:
             results = await asyncio.to_thread(_search_once, query, max_results)
             if results:
                 return results
         except Exception as e:
             last_err = e
-            if attempt < MAX_RETRIES:
-                await asyncio.sleep(RETRY_DELAY)
+            if attempt < settings.search_max_retries:
+                await asyncio.sleep(settings.search_retry_delay)
     if last_err:
-        return [{"title": "", "url": "", "snippet": f"[搜索失败: {type(last_err).__name__}]"}]
+        return [{"title": "", "url": "", "snippet": f"[search failed: {type(last_err).__name__}]"}]
     return []

@@ -1,9 +1,9 @@
 """归档知识卡片检索：Chroma + BM25 双路 + RRF 融合。
 
 职责：
-- index_cards：写入 Chroma 向量 + 刷新 BM25 进程内索引
-- search_cards：双路召回 + RRF 融合 + SQLite 回表 hydrate
-- rebuild_archive_index：全量重建（SQLite 是唯一事实源）
+- index_cards：写 Chroma 向量 + 刷新 BM25 进程内索引
+- search_cards：双路召回 + RRF 融合 + SQLite 回填水合
+- rebuild_archive_index：全量重建（SQLite 为唯一事实源）
 """
 
 from __future__ import annotations
@@ -26,12 +26,12 @@ EMBEDDING_MODEL = (
 )
 CHROMA_COLLECTION = f"archive_cards_{EMBEDDING_MODEL}"
 
-# BM25 进程级单例（无持久化，首用/刷新时从 SQLite 全量重建）
+# BM25 进程级单例（不持久化；首次使用/刷新时从 SQLite 全量重建）
 _bm25_store: BM25Store | None = None
 
 
 def _to_documents(cards: list[dict[str, Any]]) -> list[Document]:
-    """SQLite 卡片行 → 索引 Document（Chroma / BM25 共用）。"""
+    """SQLite 卡片行 -> 索引 Document（Chroma / BM25 共用）。"""
     return [
         Document(
             page_content=card["search_text"],
@@ -47,10 +47,11 @@ def _to_documents(cards: list[dict[str, Any]]) -> list[Document]:
 
 
 def _get_bm25(refresh: bool = False) -> BM25Store:
-    """BM25 单例；首建或 refresh=True 时从 SQLite 全量重建。
+    """BM25 单例；首次创建或 refresh=True 时从 SQLite 全量重建。
 
-    BM25 无持久化也无增量语义（rank_bm25 每次 add 都全量重算），不在首用时
-    灌数据则新进程双路检索退化为纯向量单路；卡片 <1k 时重建 <100ms。
+    BM25 无持久化也无增量语义（rank_bm25 每次 add 全量重算）；
+    首次使用不填数据的话，新进程里双路检索会退化为
+    纯向量单路；卡片 <1k 时重建 <100ms。
     """
     global _bm25_store
     if _bm25_store is None or refresh:
@@ -68,11 +69,11 @@ def _card_id_str(doc: Document) -> str:
     return str(doc.metadata.get("card_id", ""))
 
 
-# ─── 写入索引 -----------------------------------------------------------
+# ─── 写索引 -----------------------------------------------------------
 
 
 def index_cards(card_ids: list[int]) -> dict[str, Any]:
-    """写入 Chroma + 从 SQLite 刷新 BM25 进程内索引。
+    """写 Chroma + 从 SQLite 刷新 BM25 进程内索引。
 
     Args:
         card_ids: 要索引的卡片 id 列表（由 memory.archive 写入后返回）
@@ -103,7 +104,7 @@ def index_cards(card_ids: list[int]) -> dict[str, Any]:
         for card in cards:
             archive.mark_card_vector_error(card["card_id"], err_msg)
 
-    # BM25 从 SQLite 全量刷新（新卡已落库；即使 Chroma 失败也刷，保证至少一路可用）
+    # BM25 从 SQLite 全量刷新（新卡已持久化；即使 Chroma 失败也刷新，确保至少一路可用）
     _get_bm25(refresh=True)
 
     return {"indexed": indexed, "failed": failed, "errors": errors}
@@ -134,7 +135,7 @@ def search_cards(
     vs = _get_vectorstore()
     over = max(limit * 2, 10)
 
-    # 1) Chroma 语义召回 -> card_id ranking
+    # 1) Chroma 语义召回 -> card_id 排序
     chroma_ranking: list[str] = []
     vector_error: str | None = None
     chroma_filter: dict[str, Any] | None = None
@@ -154,8 +155,8 @@ def search_cards(
     except Exception as e:
         vector_error = f"{type(e).__name__}: {e}"
 
-    # 2) BM25 持久化索引召回 -> card_id ranking
-    # BM25 不支持原数据过滤，先全量召回再做后置过滤
+    # 2) BM25 持久索引召回 -> card_id 排序
+    # BM25 不支持 metadata 过滤；全量召回后后置过滤
     bm25_ranking: list[str] = []
     try:
         bm25_hits = _get_bm25().search(query, k=over)
@@ -229,7 +230,7 @@ def search_cards(
 
 
 def rebuild_archive_index() -> dict[str, Any]:
-    """全量重建 Chroma + BM25 索引（以 SQLite 为事实源）。
+    """全量重建 Chroma + BM25 索引（SQLite 为事实源）。
 
     Returns:
         {total: n, indexed: n, failed: n, errors: [...]}
@@ -246,7 +247,7 @@ def rebuild_archive_index() -> dict[str, Any]:
     except Exception:
         pass  # collection 不存在时忽略
 
-    # 重建前清除旧错误标记
+    # 重建前清除旧的 error 标志
     for card in cards:
         archive.clear_card_vector_error(card["card_id"])
     documents = _to_documents(cards)

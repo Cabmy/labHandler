@@ -10,7 +10,7 @@ import uvicorn
 def main() -> None:
     host = os.getenv("LAB_WEB_HOST", "127.0.0.1")
     port = int(os.getenv("LAB_WEB_PORT", "8000"))
-    # 启动时自检沙箱（与 cli 一致；LAB_AUTOSTART_SANDBOX=false 可禁用）
+    # 启动时自检沙箱（与 CLI 一致；LAB_AUTOSTART_SANDBOX=false 可禁）
     try:
         from infra.sandbox_boot import ensure_sandbox
         ensure_sandbox(log=print)

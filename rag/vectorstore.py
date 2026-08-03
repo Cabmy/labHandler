@@ -1,25 +1,24 @@
-"""ChromaDB 向量存储管理"""
+"""ChromaDB 向量库管理。"""
 
-import os
-from typing import Optional, Any
+from typing import Any
 import chromadb
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./.labhandler_data/chroma")
+from config.runtime import get_settings
 
 
 class VectorStore:
-    """ChromaDB 向量存储封装（collection 名由调用方指定，唯一消费者在 rag/archive_retriever.py）"""
+    """ChromaDB 向量库封装（collection 名由调用方指定，唯一消费者是 rag/archive_retriever.py）。"""
 
-    def __init__(self, collection_name: str, persist_dir: Optional[str] = None) -> None:
+    def __init__(self, collection_name: str, persist_dir: str | None = None) -> None:
         self.collection_name: str = collection_name
-        self.persist_dir: str = persist_dir or CHROMA_PERSIST_DIR
-        self._vectorstore: Optional[Chroma] = None
+        self.persist_dir: str = persist_dir or str(get_settings().chroma_persist_dir)
+        self._vectorstore: Chroma | None = None
 
     @property
     def vectorstore(self) -> Chroma:
-        """懒加载 vectorstore（embeddings 延迟 import，避免模块初始化时序问题）"""
+        """懒加载向量库（embeddings 延迟导入，避免模块初始化时机问题）。"""
         if self._vectorstore is None:
             from llm import get_embeddings
             self._vectorstore = Chroma(
@@ -30,24 +29,20 @@ class VectorStore:
         return self._vectorstore
     
     def add_documents(self, documents: list[Document]) -> list[str]:
-        """添加文档到向量库"""
+        """向向量库添加文档。"""
         if not documents:
             return []
         return self.vectorstore.add_documents(documents)
     
     def similarity_search(self, query: str, k: int = 4) -> list[Document]:
-        """相似度检索"""
+        """相似度检索。"""
         return self.vectorstore.similarity_search(query, k=k)
     
-    def similarity_search_with_score(self, query: str, k: int = 4) -> list[tuple[Document, float]]:
-        """带分数的相似度检索"""
-        return self.vectorstore.similarity_search_with_score(query, k=k)
-    
     def clear(self) -> None:
-        """清空当前 collection"""
+        """清空当前 collection。"""
         client = chromadb.PersistentClient(path=self.persist_dir)
         try:
             client.delete_collection(self.collection_name)
         except Exception:
-            pass  # Collection 不存在
+            pass  # collection 不存在时忽略
         self._vectorstore = None

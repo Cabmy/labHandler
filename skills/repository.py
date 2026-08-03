@@ -1,12 +1,12 @@
-"""skills 读写仓储：统一 frontmatter 解析、列表/正文读取与编辑落盘。
+"""Skills 读写仓储：统一 frontmatter 解析、列表/body 读取与编辑落盘。
 
 布局（progressive disclosure 三层）：
-skills/<name>/SKILL.md      — frontmatter + 精简 SOP（拼入 agent system prompt）
-skills/<name>/references/   — 详细材料，由 Coder 通过 load_skill_reference 按需读取
-skills/<name>/scripts/      — 可执行脚本，由 Coder 通过 use_skill_script 复制进 workspace 后在沙箱执行
+skills/<name>/SKILL.md      -- frontmatter + 精简 SOP（拼入 agent system prompt）
+skills/<name>/references/   -- 详细材料，由 Coder 经 load_skill_reference 按需读取
+skills/<name>/scripts/      -- 可执行脚本，由 Coder 经 use_skill_script 复制进 workspace 后在沙箱执行
 
-写入只有一个入口 apply_skill_operations（/edit_skill 编辑判官的落盘层），
-apply 前整批校验，一条非法整批拒绝。
+唯一写入入口：apply_skill_operations（/edit_skill 编辑判官的落盘层）；
+落盘前整批校验，一条非法整批拒绝。
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from config.runtime import get_settings
 
 
 def _parse_skill_md(text: str) -> tuple[dict[str, Any], str]:
-    """切 frontmatter / body。返回 (meta, body)。"""
+    """拆分 frontmatter / body。返回 (meta, body)。"""
     if not text.startswith("---\n"):
         return {}, text
     end = text.find("\n---\n", 4)
@@ -48,7 +48,7 @@ def _scripts_dir(skill_name: str) -> Path:
 def load_skill_document(skill_name: str) -> dict[str, str]:
     path = _skill_file(skill_name)
     if not path.exists():
-        raise FileNotFoundError(f"skill 不存在：{skill_name}（路径 {path}）")
+        raise FileNotFoundError(f"skill not found: {skill_name} (path {path})")
     text = path.read_text(encoding="utf-8")
     meta, body = _parse_skill_md(text)
     return {
@@ -87,7 +87,7 @@ def list_skill_references(skill_name: str) -> list[str]:
 
 
 def list_skill_scripts(skill_name: str) -> list[str]:
-    """列出 skill 的 scripts/ 可执行脚本文件名（不限后缀；无则空列表）。"""
+    """列出 skill 的 scripts/ 可执行脚本文件名（任意后缀；无则空列表）。"""
     sc_dir = _scripts_dir(skill_name)
     if not sc_dir.is_dir():
         return []
@@ -97,28 +97,28 @@ def list_skill_scripts(skill_name: str) -> list[str]:
 def load_skill_reference(skill_name: str, ref_name: str) -> str:
     """读取 skills/<name>/references/<ref_name> 全文（progressive disclosure 第二层）。
 
-    ref_name 做 basename 化 + resolve 边界校验，防 ../ 越界读 skills 外文件。
+    ref_name 取 basename + resolve 边界检查，防止 ../ 越界读 skills 外文件。
     """
     ref_dir = _references_dir(skill_name)
     candidate = (ref_dir / Path(ref_name).name).resolve()
     try:
         candidate.relative_to(ref_dir.resolve())
     except ValueError as e:
-        raise PermissionError(f"非法 reference 路径：{ref_name!r}") from e
+        raise PermissionError(f"Illegal reference path: {ref_name!r}") from e
     if not candidate.is_file():
         available = list_skill_references(skill_name)
         raise FileNotFoundError(
-            f"reference 不存在：{skill_name}/references/{ref_name}"
-            f"（可用：{available or '无'}）"
+            f"reference not found: {skill_name}/references/{ref_name}"
+            f" (available: {available or 'none'})"
         )
     return candidate.read_text(encoding="utf-8")
 
 
-# ─── /edit_skill 编辑读写层 ────────────────────────────────────────
+# ─── /edit_skill 编辑读写层 ───────────────────────────────────────
 
 
 def read_skill_files(skill_name: str) -> dict[str, str]:
-    """读取 skill 全部文件，返回 {相对路径: 全文}（编辑判官拼上下文与算 diff 用）。
+    """读取 skill 全部文件，返回 {相对路径: 全文}（供编辑判官组装上下文与计算 diff）。
 
     覆盖 SKILL.md + references/*.md + scripts/*；skill 不存在抛 FileNotFoundError。
     """
@@ -135,11 +135,11 @@ def read_skill_files(skill_name: str) -> dict[str, str]:
     return files
 
 
-def _validate_operation(skill_name: str, op: dict[str, Any]) -> Path:
-    """校验单条编辑操作，返回解析后的目标绝对路径；非法抛 PermissionError/ValueError。
+def validate_operation(skill_name: str, op: dict[str, Any]) -> Path:
+    """校验单个编辑操作，返回解析后的目标绝对路径；非法抛 PermissionError/ValueError。
 
-    file 只允许三种形态：SKILL.md / references/<basename>.md / scripts/<basename>。
-    白名单锁死在本 skill 目录内，结构上不可能创建新 skill 或越界写。
+    file 仅允许三种形式：SKILL.md / references/<basename>.md / scripts/<basename>。
+    白名单锁死在本 skill 目录内；结构上不可能新建 skill 或越界写。
     """
     action = str(op.get("action", ""))
     file = str(op.get("file", ""))
@@ -160,7 +160,7 @@ def _validate_operation(skill_name: str, op: dict[str, Any]) -> Path:
             f"非法 file 路径：{file!r}"
             "（只允许 SKILL.md / references/<name>.md / scripts/<name>）"
         )
-    # resolve 边界兜底（basename 化后理论上不可能越界，防御性保留）
+    # resolve 边界兜底（basename 化后理论上不可能越界，防御性）
     try:
         target.resolve().relative_to(skill_dir)
     except ValueError as e:
@@ -182,12 +182,12 @@ def _validate_operation(skill_name: str, op: dict[str, Any]) -> Path:
 
 
 def apply_skill_operations(skill_name: str, operations: list[dict[str, Any]]) -> list[str]:
-    """校验并落盘编辑操作。apply 前整批校验，一条非法整批拒绝（不做半应用）。
+    """校验并落盘编辑操作。落盘前整批校验，一条非法整批拒绝（不半落盘）。
 
-    Returns: 已应用的 file 相对路径清单。
+    返回：已落盘文件相对路径列表。
     """
     validated: list[tuple[dict[str, Any], Path]] = [
-        (op, _validate_operation(skill_name, op)) for op in operations
+        (op, validate_operation(skill_name, op)) for op in operations
     ]
     applied: list[str] = []
     for op, target in validated:

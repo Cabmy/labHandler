@@ -1,14 +1,17 @@
-"""sandbox_boot - 启动时自动拉起 AIO Sandbox 容器（PLAN §6.1 / 一键启动）
+"""sandbox_boot - 启动时自动拉起 AIO Sandbox 容器。
 
 设计要点：
-1. 端口探活通 → 直接 return（容器已在跑）
-2. 探活不通 → `docker inspect`：容器存在但停了就 `docker start`；不存在就 `docker run`
-3. 轮询端口最多 60s
-4. 没装 docker / docker 失败 → 打印友好错误，不 raise（让 mcp_client 后续给一致报错）
-5. opt-out：LAB_AUTOSTART_SANDBOX=false 跳过整个流程（保留手动控制权）
-6. 容器参数从 .env 读：AIO_SANDBOX_IMAGE / AIO_SANDBOX_PORT / AIO_SANDBOX_MCP_URL
-7. **workspace bind-mount**：宿主 WORKSPACE_DIR → 容器 /workspace（让 sandbox_convert_to_markdown 等
-   能直接读 PDF/DOCX）；老容器若没有此挂载会打印一次性迁移提示
+1. 端口探活成功 -> 直接返回（容器已在跑）。
+2. 探活失败 -> `docker inspect`：容器存在但已停 -> `docker start`；
+   不存在 -> `docker run`。
+3. 轮询端口最多 60s。
+4. 未装 docker / docker 失败 -> 打印友好错误，不抛异常
+   （后续由 mcp_client 给出一致报错）。
+5. 可关闭：LAB_AUTOSTART_SANDBOX=false 跳过整个流程（保留手动控制）。
+6. 容器参数从 .env 读取：AIO_SANDBOX_IMAGE / AIO_SANDBOX_PORT / AIO_SANDBOX_MCP_URL。
+7. **workspace 绑定挂载**：host WORKSPACE_DIR -> 容器 /workspace（使
+   sandbox_convert_to_markdown 等能直接读 PDF/DOCX）；无此挂载的旧容器
+   会收到一次性迁移提示。
 """
 
 from __future__ import annotations
@@ -20,14 +23,11 @@ import subprocess
 import time
 from pathlib import Path
 
+from config.runtime import get_settings
 from infra.net_probe import probe_port
 
 CONTAINER_NAME = "aio-sandbox"
-SANDBOX_WORKSPACE_MOUNT = "/workspace"  # 容器内的统一工作目录
-
-
-def _host_workspace_dir() -> Path:
-    return Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
+SANDBOX_WORKSPACE_MOUNT = "/workspace"  # 容器侧统一工作区目录
 
 
 def _docker_available() -> bool:
@@ -35,7 +35,7 @@ def _docker_available() -> bool:
 
 
 def _container_state() -> str | None:
-    """返回容器 state（running / exited / ...）；不存在返回 None"""
+    """返回容器状态（running / exited / ...）；不存在返回 None。"""
     try:
         r = subprocess.run(
             ["docker", "inspect", "-f", "{{.State.Status}}", CONTAINER_NAME],
@@ -49,7 +49,7 @@ def _container_state() -> str | None:
 
 
 def _image_exists_locally(image: str) -> bool:
-    """本地是否已有该镜像；用于区分"首次拉镜像"与"仅创建容器"的日志措辞。"""
+    """检查镜像是否已在本地；用于区分“首次拉镜像”与“仅创建容器”的日志文案。"""
     try:
         r = subprocess.run(
             ["docker", "image", "inspect", image],
@@ -61,10 +61,10 @@ def _image_exists_locally(image: str) -> bool:
 
 
 def _container_has_workspace_mount(host_workspace: Path) -> bool:
-    """检查现有容器是否把宿主 WORKSPACE_DIR 挂载到了 SANDBOX_WORKSPACE_MOUNT。
+    """检查现有容器是否已将 host WORKSPACE_DIR 挂载到 SANDBOX_WORKSPACE_MOUNT。
 
-    存在但缺挂载 → 返回 False（调用方据此决定打印迁移提示）
-    容器不存在 / docker 报错 → 返回 True（不影响后续逻辑）
+    存在但缺挂载 -> 返回 False（由调用方决定是否打迁移提示）。
+    容器不存在 / docker 出错 -> 返回 True（不影响后续逻辑）。
     """
     try:
         r = subprocess.run(
@@ -78,7 +78,7 @@ def _container_has_workspace_mount(host_workspace: Path) -> bool:
         for m in mounts:
             src = str(m.get("Source", ""))
             dst = str(m.get("Destination", ""))
-            # Source 与 host_workspace 需匹配（容忍尾斜杠 / symlink 解析差异）
+            # Source 与 host_workspace 须匹配（容忍尾部斜杠 / 软链解析差异）
             if dst == SANDBOX_WORKSPACE_MOUNT and (
                 src == host_resolved or Path(src).resolve() == host_workspace
             ):
@@ -95,18 +95,19 @@ def _docker_start(log=print) -> bool:
             capture_output=True, text=True, timeout=30,
         )
         if r.returncode != 0:
-            log(f"[sandbox] docker start stderr: {(r.stderr or '').strip()}")
+            log(f"[sandbox] docker start 失败，stderr：{(r.stderr or '').strip()}")
         return r.returncode == 0
     except Exception as e:
-        log(f"[sandbox] docker start exception: {type(e).__name__}: {e}")
+        log(f"[sandbox] docker start 异常：{type(e).__name__}: {e}")
         return False
 
 
 def _docker_run(image: str, port: int, host_workspace: Path, log=print) -> bool:
-    """首次创建容器；镜像不在本地会自动拉（可能几分钟）
+    """首次创建容器；本地无镜像时自动拉取（可能耗时几分钟）。
 
-    挂载宿主 workspace 到 /workspace（让 sandbox 工具能读 PDF/DOCX）
-    失败时打印 docker stderr，便于排查（常见：WSL2 docker-credential-desktop.exe / 网络拉镜像失败 / 端口占用）
+    将 host workspace 挂载到 /workspace（使 sandbox 工具能读 PDF/DOCX）。
+    失败时打印 docker stderr 供排查（常见：WSL2 docker-credential-desktop.exe /
+    网络拉镜像失败 / 端口冲突）。
     """
     try:
         r = subprocess.run(
@@ -118,12 +119,12 @@ def _docker_run(image: str, port: int, host_workspace: Path, log=print) -> bool:
                 "-e", "DISABLE_JUPYTER=true", "-e", "DISABLE_CODE_SERVER=true",
                 image,
             ],
-            capture_output=True, text=True, timeout=600,  # 给拉镜像留 10 分钟
+            capture_output=True, text=True, timeout=600,  # 预留 10 分钟拉镜像
         )
         if r.returncode != 0:
             stderr = (r.stderr or "").strip()
-            log(f"[sandbox] docker run failed (exit={r.returncode}):\n  {stderr}")
-            # 友好提示：识别 WSL2 凭据助手坑
+            log(f"[sandbox] docker run 失败（exit={r.returncode}）：\n  {stderr}")
+            # 友好提示：检测 WSL2 凭据助手问题
             if "docker-credential-desktop.exe" in stderr or "exec format error" in stderr:
                 log(
                     "[sandbox] 检测到 WSL2 + Docker Desktop 凭据助手错误。\n"
@@ -135,14 +136,14 @@ def _docker_run(image: str, port: int, host_workspace: Path, log=print) -> bool:
                 )
         return r.returncode == 0
     except Exception as e:
-        log(f"[sandbox] docker run exception: {type(e).__name__}: {e}")
+        log(f"[sandbox] docker run 异常：{type(e).__name__}: {e}")
         return False
 
 
 def ensure_sandbox(log=print) -> bool:
-    """检测并按需拉起 sandbox 容器；返回端口最终是否通。"""
+    """按需检测并启动沙箱容器；返回端口最终是否可达。"""
     if os.getenv("LAB_AUTOSTART_SANDBOX", "true").lower() in {"false", "0", "no"}:
-        return True  # 用户禁用了自动启动；交给 mcp_client 探活报错
+        return True  # 用户禁用自启；交由 mcp_client 探活时报错
 
     url = os.getenv("AIO_SANDBOX_MCP_URL", "http://127.0.0.1:8080/mcp")
     image = os.getenv(
@@ -150,10 +151,10 @@ def ensure_sandbox(log=print) -> bool:
         "enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest",
     )
     port = int(os.getenv("AIO_SANDBOX_PORT", "8080"))
-    host_workspace = _host_workspace_dir()
+    host_workspace = get_settings().workspace_dir
     host_workspace.mkdir(parents=True, exist_ok=True)
 
-    # 一次性迁移提示：旧容器若没有 workspace 挂载，agent 在沙箱内永远读不到 PDF
+    # 一次性迁移提示：无 workspace 挂载的旧容器意味着 agent 永远无法在沙箱读 PDF
     if _docker_available() and not _container_has_workspace_mount(host_workspace):
         log(
             "[sandbox] ⚠️ 检测到旧容器没有 workspace bind-mount。"
@@ -161,7 +162,7 @@ def ensure_sandbox(log=print) -> bool:
             "  请运行：  docker rm -f aio-sandbox\n"
             "  然后重启 cli.py（会自动用新挂载重建容器）。"
         )
-        # 继续执行：旧容器仍可运行，只是文件读不到；让用户主动决定是否重建。
+        # 继续：旧容器仍可跑，只是读不了文件；由用户决定是否重建。
 
     if probe_port(url):
         return True
@@ -172,7 +173,7 @@ def ensure_sandbox(log=print) -> bool:
 
     state = _container_state()
     if state == "running":
-        # 容器在跑但端口未通；等等看（健康检查可能还没过）
+        # 容器 running 但端口未通；等待（健康检查可能尚未通过）
         log("[sandbox] 容器 running 但端口未通，等待健康检查...")
     elif state in {"exited", "created", "paused", "dead"}:
         log(f"[sandbox] 容器存在（{state}），尝试 docker start...")
@@ -200,7 +201,7 @@ def ensure_sandbox(log=print) -> bool:
 
 
 def _docker_rm(log=print) -> bool:
-    """docker rm -f aio-sandbox；容器不存在也算成功。"""
+    """docker rm -f aio-sandbox；容器不存在也视为成功。"""
     try:
         r = subprocess.run(
             ["docker", "rm", "-f", CONTAINER_NAME],
@@ -208,21 +209,21 @@ def _docker_rm(log=print) -> bool:
         )
         if r.returncode == 0:
             return True
-        # 容器本来就不在 → 视为成功
+        # 容器已不存在 -> 视为成功
         if "No such container" in (r.stderr or ""):
             return True
-        log(f"[sandbox] docker rm stderr: {(r.stderr or '').strip()}")
+        log(f"[sandbox] docker rm 失败，stderr：{(r.stderr or '').strip()}")
         return False
     except Exception as e:
-        log(f"[sandbox] docker rm exception: {type(e).__name__}: {e}")
+        log(f"[sandbox] docker rm 异常：{type(e).__name__}: {e}")
         return False
 
 
 def recreate_sandbox(log=print) -> bool:
-    """删除现有容器 + 复位 MCP/sandbox_tools 缓存 + 重新拉起。
+    """删除现有容器 + 重置 MCP/sandbox_tools 缓存 + 重启。
 
-    用途：`/done --clear` 不仅清宿主 workspace，也清容器内的 pip 全局包 / /tmp /
-    长跑进程残留，让下次任务从干净容器开始。
+    目的：`/done --clear` 不仅清 host workspace，还清容器内的
+    pip 全局包 / /tmp / 长驻进程残留，使下一个任务从干净容器起步。
     """
     if os.getenv("LAB_AUTOSTART_SANDBOX", "true").lower() in {"false", "0", "no"}:
         log("[sandbox] LAB_AUTOSTART_SANDBOX=false，跳过重建（请手动 docker rm 后重启 cli）")
@@ -237,7 +238,14 @@ def recreate_sandbox(log=print) -> bool:
         else:
             log(f"[sandbox] docker rm {CONTAINER_NAME} 失败；继续尝试重建")
 
-    # 复位上层单例（容器换了，旧 MCP session / tool wrapper 已死）
+    # 重置 coder agent 缓存（沙箱已变，旧 agent 的 MCP 工具已失效）
+    try:
+        from agents.coder import reset_coder_agent
+        reset_coder_agent()
+    except Exception as e:
+        log(f"[sandbox] reset_coder_agent 失败（继续）：{type(e).__name__}: {e}")
+
+    # 重置上层单例（容器已变，旧 MCP 会话 / 工具封装已死）
     try:
         from mcp_client import reset_mcp_client
         reset_mcp_client()
@@ -249,5 +257,5 @@ def recreate_sandbox(log=print) -> bool:
     except Exception as e:
         log(f"[sandbox] 清 sandbox_tools._tools_cache 失败（继续）：{type(e).__name__}: {e}")
 
-    # 重新拉起（最多等 60s 端口就绪）
+    # 重启（等待端口就绪最多 60s）
     return ensure_sandbox(log=log)

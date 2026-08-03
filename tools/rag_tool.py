@@ -1,7 +1,7 @@
 """rag_tool - 跨任务经验知识卡片检索。
 
-只暴露 archive_search（检索历史任务归档中沉淀的知识卡片），
-不暴露通用文档检索（rag_search 已移除）。
+只暴露 archive_search（检索从历史任务归档蒸馏出的知识卡片）；
+通用文档检索（rag_search）已移除。
 """
 
 from __future__ import annotations
@@ -18,19 +18,20 @@ def archive_search(
     card_types: list[str] | None = None,
     task_type: str | None = None,
 ) -> list[dict]:
-    """检索历史任务归档中沉淀的跨任务经验卡片。
+    """Retrieve cross-task experience cards distilled from historical task archives.
 
-    返回的卡片包含 lesson（教训）、strategy（策略）、pattern（模式）三种类型。
-    Planner 接到新作业时用：召回相似历史作业的经验辅助规划。
+    Returned cards fall into three types: lesson, strategy, pattern.
+    Intended for the Planner to call upon receiving a new assignment: recall
+    similar historical assignment experience to aid planning.
 
     Args:
-        query: 检索查询（任务标题、约束、需求描述等）
-        limit: 返回卡片上限（默认 5）
-        card_types: 过滤卡片类型，如 ["lesson", "strategy"]
-        task_type: 过滤任务类型，如 "coding"
+        query: search query (task title, constraints, requirement description, etc.)
+        limit: maximum number of cards to return (default 5)
+        card_types: filter by card type, e.g. ["lesson", "strategy"]
+        task_type: filter by task type, e.g. "coding"
 
     Returns:
-        知识卡片列表，每张卡片含 card_id / card_type / content / task_title / rrf_score
+        A list of knowledge cards, each containing card_id / card_type / content / task_title / rrf_score
     """
     result = search_cards(
         query=query,

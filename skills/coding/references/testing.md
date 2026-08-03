@@ -1,40 +1,40 @@
-# 测试用例设计指南（coding skill 参考材料）
+# Test Case Design Guide (coding skill reference material)
 
-## 三类用例（每类至少覆盖）
+## Three case categories (cover at least each)
 
-1. **正常场景**：target 在中间 / 头 / 尾；典型输入规模
-2. **边界场景**：空输入、单元素、重复元素、极值（INT_MAX 级别）、目标不存在
-3. **异常场景**：输入未排序 / 类型错误——按题面约束决定行为（返回 -1 还是 raise），
-   题面没说就选返回哨兵值并在 docstring 注明
+1. **Normal scenarios**: target in the middle / head / tail; typical input scale
+2. **Boundary scenarios**: empty input, single element, duplicate elements, extreme values (INT_MAX level), target absent
+3. **Exception scenarios**: unsorted input / wrong type — decide behavior per the problem-statement constraints (return -1 or raise);
+   if the statement is silent, choose to return a sentinel value and note it in the docstring
 
-## 用例组织
+## Case organization
 
-- 一个行为一个测试函数，命名 `test_<行为>`（如 `test_empty_list` / `test_target_at_head`）
-- 断言带信息：`assert res == 2, f"expect 2, got {res}"`
-- 参数化批量边界用 `@pytest.mark.parametrize`，比复制粘贴 5 个函数干净
+- One behavior per test function, named `test_<behavior>` (e.g. `test_empty_list` / `test_target_at_head`)
+- Assertions carry a message: `assert res == 2, f"expect 2, got {res}"`
+- Use `@pytest.mark.parametrize` for batched boundary cases — cleaner than copy-pasting 5 functions
 
-## 示例骨架（以 binary_search 为例）
+## Example skeleton (binary_search as example)
 
 ```python
 import pytest
 from binary_search import binary_search
 
 @pytest.mark.parametrize("arr,target,expect", [
-    ([1, 2, 3, 4, 5], 3, 2),    # 中间
-    ([1, 2, 3], 1, 0),          # 头
-    ([1, 2, 3], 3, 2),          # 尾
-    ([], 1, -1),                # 空
-    ([1, 2, 3], 9, -1),         # 不存在
+    ([1, 2, 3, 4, 5], 3, 2),    # middle
+    ([1, 2, 3], 1, 0),          # head
+    ([1, 2, 3], 3, 2),          # tail
+    ([], 1, -1),                # empty
+    ([1, 2, 3], 9, -1),         # absent
 ])
 def test_search(arr, target, expect):
     assert binary_search(arr, target) == expect
 ```
 
-## 验证命令
+## Verification command
 
 ```
 sandbox_execute_bash: pytest test_<name>.py -v
 ```
 
-- 用 sandbox_execute_bash（同步等真实输出），不要用 sandbox_execute_code（异步 ack-only）
-- 全过才发 done；部分过报 needs_retry 并写清哪个用例挂了
+- Use sandbox_execute_bash (synchronous, waits for real output); do not use sandbox_execute_code (asynchronous ack-only)
+- Only send done when all pass; partial pass reports needs_retry and clearly states which case failed

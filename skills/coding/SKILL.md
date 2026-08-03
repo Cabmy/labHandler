@@ -1,73 +1,73 @@
 ---
 name: coding
 description: |
-  编程类作业：实现算法、数据结构、工程脚本，产出可执行代码 + pytest 单元测试。
-  典型产物：.py / .cpp / .java 源文件 + test_*.py 测试文件。
+  Programming assignments: implement algorithms, data structures, engineering scripts; produce runnable code + pytest unit tests.
+  Typical artifacts: .py / .cpp / .java source files + test_*.py test files.
 when_to_use: |
-  以下任一成立时选用：
-  - 作业要求"实现 / 编写程序 / 写代码 / 编程"且需要可执行产物
-  - 作业含编程题（如 LeetCode 风格）、排序算法、数据结构等
-  - deliverables 包含源代码文件（.py/.cpp/.java/.js/.ts）或测试文件（test_*.py）
-  排除：
-  - 含实验过程 + 实验报告要求 → lab_report
-  - 纯论述 / 读后感 / 议论文 → essay
-  - 纯算法分析论述题（无需实现代码）→ essay 或 other
+  Pick this when ANY of the following holds:
+  - The assignment asks to "实现 / 编写程序 / 写代码 / 编程" (implement / write a program / write code) and needs a runnable artifact
+  - The assignment contains programming problems (e.g. LeetCode style), sorting algorithms, data structures, etc.
+  - deliverables include source code files (.py/.cpp/.java/.js/.ts) or test files (test_*.py)
+  Exclude:
+  - Contains an experiment process + lab report requirement -> lab_report
+  - Pure argumentation / reading reflection / argumentative essay -> essay
+  - Pure algorithm-analysis discussion (no code implementation required) -> essay or other
 ---
 
 # Coding Skill SOP
 
-指导 Coder agent 在 AIO Sandbox 容器内完成 coding 类作业。
-ground truth 全部从 task context（intake_result + user_constraints + profile）拿，不凭空臆造题面。
-详细材料在 references/（用 load_skill_reference 按需读取）：
-- `testing.md` — 测试用例设计指南（正常/边界/异常三类 + 示例）
-- `pitfalls.md` — 异常处理速查表（沙箱不可达 / pytest 反复失败等）
+Guides the Coder agent to complete coding assignments inside the AIO Sandbox container.
+All ground truth comes from the task context (intake_result + user_constraints + profile); never fabricate the problem statement.
+Detailed materials live in references/ (read on demand via load_skill_reference):
+- `testing.md` — test case design guide (normal / boundary / exception categories + examples)
+- `pitfalls.md` — exception handling cheat sheet (sandbox unreachable / pytest repeatedly failing, etc.)
 
-## 1. 读懂题面
+## 1. Read the problem statement thoroughly
 
-调 sandbox_convert_to_markdown 把 PDF/DOCX 实验指导转 markdown（如有），结合 README.md 抽：
-- 函数签名、输入输出契约（参数类型 / 返回类型 / 异常）
-- 性能要求（时间/空间复杂度、实测耗时上限）
-- 禁用清单（不允许用某些标准库 / 第三方包）
-- 边界要求（空输入 / 单元素 / 极值 / 非法输入是返回 -1 还是 raise）
+Call sandbox_convert_to_markdown to convert PDF/DOCX lab guidance to markdown (if any), then extract from README.md:
+- Function signatures, input/output contracts (parameter types / return types / exceptions)
+- Performance requirements (time/space complexity, measured runtime upper bound)
+- Forbidden list (certain stdlib / third-party packages not allowed)
+- Boundary requirements (empty input / single element / extreme values / illegal input -> return -1 or raise)
 
-每条约束记进心理 checklist；后面的产物逐行对照。不确定的地方问 user 或调 archive_search 召回历史 lessons，不要猜。
+Record every constraint into a mental checklist; later cross-check artifacts line by line. When unsure, ask the user or call archive_search to recall historical lessons — do not guess.
 
-## 2. 先想清楚再写
+## 2. Think it through before writing
 
-先在脑里走一遍：主循环结构、哪些 corner case 要单独处理、复杂度怎么保证
-（如二分中点用 `lo+(hi-lo)//2` 防溢出）。关键取舍写进 Final Answer 的
-`决策：` 行——Summarizer 会把它蒸馏进 SUMMARY「我做了什么」，这是产物质量的核心区分点。
+First walk through it mentally: main loop structure, which corner cases need separate handling, how to guarantee complexity
+(e.g. binary search midpoint uses `lo+(hi-lo)//2` to prevent overflow). Write key trade-offs into the Final Answer's
+`决策：` line — the Summarizer distills it into the SUMMARY "what I did" section; this is the core quality differentiator of the artifact.
 
-## 3. 在 sandbox 内实现
+## 3. Implement inside the sandbox
 
-- 用 sandbox_str_replace_editor 创建源文件（主创作走容器；host fs_tools 用于读与补丁）
-- **文件命名按题面；题面没指定时按算法/主题/题号命名**（如 `zuc.py` / `binary_search.py` /
-  `hw4_q1.py`），禁止 `solution.py` / `main.py` 这类通用名（与全局命名规则一致）
-- 写完先跑一行 import 确认语法 + 模块结构，再继续堆代码
+- Use sandbox_str_replace_editor to create source files (main authoring goes through the container; host fs_tools are for reading and patching)
+- **Name files per the problem statement; when unspecified, name by algorithm/topic/problem number** (e.g. `zuc.py` / `binary_search.py` /
+  `hw4_q1.py`); generic names like `solution.py` / `main.py` are forbidden (consistent with the global naming rule)
+- After writing, first run a one-line import to confirm syntax + module structure, then keep adding code
 
-## 4. 写测试（pytest）
+## 4. Write tests (pytest)
 
-测试文件与源文件同主题（`test_zuc.py` 配 `zuc.py`），至少 5 个用例覆盖
-正常 / 边界 / 异常三类（设计细节见 references/testing.md）。
-跑 `sandbox_execute_bash "pytest test_<name>.py -v"`；exit_code != 0 时回去修代码/测试，
-直到全过；修不动时如实报 `step <id> needs_retry: <卡点>`，不要假装 done。
+The test file shares the source file's topic (`test_zuc.py` pairs with `zuc.py`); at least 5 cases covering the
+normal / boundary / exception categories (design details in references/testing.md).
+Run `sandbox_execute_bash "pytest test_<name>.py -v"`; when exit_code != 0 go back to fix code/tests
+until all pass; when truly stuck, honestly report `step <id> needs_retry: <stuck point>` — do not pretend done.
 
-## 5. 风格收尾（按 profile.coding_style）
+## 5. Style wrap-up (per profile.coding_style)
 
-- type_hints=true 时函数参数 + 返回值都加 type hints；docstring 按 profile 选 none/short/numpy
-- 编译型语言（.cpp/.c/.java）测试全过后清理中间件：`rm -f *.o *.obj *.class` 及编译出的可执行文件
+- When type_hints=true, add type hints to function parameters + return values; docstring follows profile choice none/short/numpy
+- For compiled languages (.cpp/.c/.java), after all tests pass clean up intermediates: `rm -f *.o *.obj *.class` plus compiled executables
 
-## 6. 学术诚信（独立约束）
+## 6. Academic integrity (independent constraint)
 
-- 不复制网络答案；网络仅用于查 API 文档
-- 引用外部代码片段（Stack Overflow / GitHub）须在 Final Answer `待办：` 行标注来源 URL，
-  让 Summarizer 写进 SUMMARY 待办
-- 不在产物里出现别人的姓名 / 学号 / GitHub 用户名
+- Do not copy answers from the internet; the internet is only for looking up API docs
+- Referenced external code snippets (Stack Overflow / GitHub) must have their source URL noted in the Final Answer `待办：` line,
+  so the Summarizer writes it into the SUMMARY todo
+- No other people's names / student IDs / GitHub usernames may appear in the artifact
 
-## 何时停止
+## When to stop
 
-- verifier verdict = pass → 主图自动 Compile + Summarize，本 skill 退出
-- 本步修不动 → Final Answer 报 needs_retry（主图有界重试，上限 MAX_STEP_RETRY）
-- verdict = fail 且 iteration ≥ MAX_REPLAN_ITER → 主图输出「部分完成」面板让用户接手
+- verifier verdict = pass -> the main graph automatically Compiles + Summarizes, this skill exits
+- This step cannot be fixed -> Final Answer reports needs_retry (the main graph retries with a bound, upper limit MAX_STEP_RETRY)
+- verdict = fail and iteration ≥ MAX_REPLAN_ITER -> the main graph outputs a "partially complete" panel for the user to take over
 
-不要硬循环修；重试与 Replan 上限是有意限制的（防失控）。
+Do not hard-loop on fixes; the retry and Replan limits are intentional (to prevent runaway).

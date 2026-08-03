@@ -1,28 +1,28 @@
-# 引用规范细则（essay skill 参考材料）
+# Citation Norm Details (essay skill reference material)
 
-## 直接引用（原文照录）
+## Direct citation (verbatim quoting)
 
-- 格式：`"原文" — 作者(年份)《标题》` 或编号制 `[1] 作者. 标题. 期刊, 年份.`
-- 单条 ≤ 30 字；超过改间接引用（自己语言转述 + 标来源）
-- 正文编号 [1][2] 必须与参考文献条目一一对应
+- Format: `"original text" — author(year)《title》` or numbered style `[1] 作者. 标题. 期刊, 年份.`
+- Single item ≤ 30 characters; beyond that switch to indirect citation (paraphrase in your own words + mark the source)
+- In-text numbers [1][2] must correspond one-to-one with reference entries
 
-## 间接引用（转述观点）
+## Indirect citation (paraphrasing a viewpoint)
 
-- 句末标 `(作者, 年份)`，不能闷声塞进自己的话里
-- 转述必须换自己的句式与用词，不是同义词替换
+- Mark `(author, year)` at the sentence end; do not silently weave it into your own words
+- Paraphrasing must use your own sentence structure and wording, not mere synonym substitution
 
-## 常见格式
+## Common formats
 
-- GB/T 7714（国内课程默认）：`[1] 作者. 标题[J]. 期刊名, 年份, 卷(期): 页码.`
-- APA：`Author, A. (Year). Title. Journal, Vol(Issue), pages.`
-- 网页来源：标题 + URL + 访问日期
+- GB/T 7714 (default for domestic courses): `[1] 作者. 标题[J]. 期刊名, 年份, 卷(期): 页码.`
+- APA: `Author, A. (Year). Title. Journal, Vol(Issue), pages.`
+- Web source: title + URL + access date
 
-## PDF 阅读材料引用
+## Citing PDF reading materials
 
-- 调 sandbox_convert_to_markdown 转 markdown 后再读
-- 引用时带原文页码（如 `p.42`），便于助教核对
+- Call sandbox_convert_to_markdown to convert to markdown before reading
+- When citing, include the original page number (e.g. `p.42`) so the TA can verify
 
-## 禁止
+## Forbidden
 
-- 编造不存在的文献 / DOI
-- 引用维基百科作为学术论据（可作背景线索，正式论据换一手来源）
+- Fabricating non-existent references / DOIs
+- Citing Wikipedia as an academic argument (it may serve as a background lead; use primary sources for formal arguments)

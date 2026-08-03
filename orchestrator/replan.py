@@ -5,7 +5,7 @@
 - verdict == "fail" 且 iteration < MAX_REPLAN_ITER：回到 planner
 - verdict == "fail" 且 iteration >= MAX_REPLAN_ITER：进入 compile（后续按部分完成处理）
 
-iteration 表示已执行的 planner 轮次，首次进入 planner 后记为 1。
+iteration 表示已执行的 planner 轮数，首次进入 planner 后记为 1。
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from orchestrator.state import HwState
 
 
 def replan_router(state: HwState) -> Literal["planner", "compile"]:
-    """用于 LangGraph conditional_edges 的路由函数。"""
+    """LangGraph conditional_edges 的路由函数。"""
     runs = state.get("verifier_runs") or []
     if not runs:
         # 异常状态：缺少 verifier 结果时直接收敛到 compile。
@@ -32,7 +32,7 @@ def replan_router(state: HwState) -> Literal["planner", "compile"]:
 
 
 def is_partial(state: HwState) -> bool:
-    """判定当前是否为"部分完成"状态（Compile / Summarizer 用）"""
+    """判断当前状态是否为 '部分完成' 状态（供 Compile / Summarizer 使用）。"""
     runs = state.get("verifier_runs") or []
     if not runs:
         return False

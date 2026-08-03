@@ -1,11 +1,13 @@
-"""BM25 关键词检索索引
+"""BM25 关键词检索索引。
 
-进程内存索引（无持久化；由 rag.archive_retriever._get_bm25 惰性从 SQLite 全量重建），
-使用 jieba 中文分词。注意：必须分词，否则 BM25 会退化成字符级匹配，中文语义完全失效。
+进程内内存索引（不持久化；由 rag.archive_retriever._get_bm25 从 SQLite 懒加载全量重建），
+使用 jieba 中文分词。
+注意：必须分词，否则 BM25 退化为字符级匹配，中文语义完全失效。
 
-Trade-off（刻意为之）：rank_bm25 不支持增量更新，每次 add_documents 后全量重建。
-知识卡片规模 <1k 张时全量重建 <100ms，用重建的简单性换掉增量索引的复杂度
-（无脏数据/无索引漂移/无并发一致性问题）；卡片量级若上万再考虑换支持增量的引擎。
+权衡（有意为之）：rank_bm25 不支持增量更新，每次 add_documents 后全量重建。
+知识卡片数 <1k 时全量重建 <100ms；以重建的简单性换取增量索引的复杂性
+（无脏数据 / 无索引漂移 / 无并发一致性问题）；
+卡片数达到数万级时再考虑切换增量引擎。
 """
 
 import jieba
@@ -15,7 +17,7 @@ from rank_bm25 import BM25Okapi
 
 
 class BM25Store:
-    """BM25Okapi 封装，支持 langchain Document 直接入库"""
+    """BM25Okapi 封装，支持 langchain Document 直接入索引。"""
 
     def __init__(self) -> None:
         self.docs: list[Document] = []
@@ -23,20 +25,21 @@ class BM25Store:
         self._bm25: BM25Okapi | None = None
 
     def add_documents(self, docs: list[Document]) -> None:
-        """入库并全量重建索引。
+        """入索引并全量重建。
 
-        rank_bm25 无增量 API；卡片 <1k 时重建 <100ms，简单性优先（见模块 docstring）。
+        rank_bm25 无增量 API；卡片 <1k 时重建 <100ms，
+        简单优先（见模块 docstring）。
         """
         if not docs:
             return
         for d in docs:
             self.docs.append(d)
             self._tokenized.append(list(jieba.cut(d.page_content)))
-        # rank_bm25 不支持增量，每次 add 后全量重建索引
+        # rank_bm25 不支持增量；每次 add 后全量重建
         self._bm25 = BM25Okapi(self._tokenized)
 
     def search(self, query: str, k: int = 6) -> list[tuple[Document, float]]:
-        """返回 [(Document, bm25_score)] top-k，score > 0 的才返回"""
+        """返回 [(Document, bm25_score)] top-k，仅含 score > 0 的条目。"""
         if self._bm25 is None or not self.docs:
             return []
         q_tokens = list(jieba.cut(query))

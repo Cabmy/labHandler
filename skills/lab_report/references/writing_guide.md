@@ -1,8 +1,8 @@
-# 实验报告写作指南（lab_report skill 参考材料）
+# Lab Report Writing Guide (lab_report skill reference material)
 
-## 实验过程章节的写作风格（长示例）
+## Writing style for the experiment-process section (long example)
 
-每一步先用 1-2 句话解释**思考与抉择**，再给命令/现象/截图占位：
+Before each step, first use 1-2 sentences to explain the **thinking and decisions**, then give the command / phenomenon / screenshot placeholder:
 
 ```
 首先启动容器，进入受害者容器 10.9.0.5 关闭 SYN Cookie 防护并清除 TCP 缓存。
@@ -28,9 +28,9 @@
 （此处建议附 telnet 超时截图）
 ```
 
-## 环境前置段样例
+## Environment-prerequisite section sample
 
-需要改 docker / 系统配置才能跑通时，单独写一段让助教知道"为什么我改了 yml"：
+When docker / system config must be changed to make it run, write a separate paragraph so the TA knows "why I changed the yml":
 
 > 在一切开始之前，因为 docker 容器配置问题，需要修改 docker-compose.yml 让容器能联网下载部件：
 > ```yaml
@@ -43,12 +43,12 @@
 > 网络改成主机网络，宿主机开 VPN 即可正常访问外网。
 > 另外还需要开启容器的 privileged 权限。
 
-要点：容器/VM 拓扑（多容器画出 IP / 网络示意）、docker-compose.yml 关键改动、
-特殊权限（privileged / cap_add / seccomp）。
+Key points: container/VM topology (for multi-container draw out IPs / network diagram), key docker-compose.yml changes,
+special permissions (privileged / cap_add / seccomp).
 
-## 代码贴文中的写法
+## How to paste code inline
 
-代码块前一句说明「这段代码做什么 + 关键参数选择理由」：
+One sentence before the code block stating "what this code does + rationale for key parameter choices":
 
 ```python
 # tcp_rst.py
@@ -62,9 +62,9 @@ send(pkt, verbose=0)
 print("RST packet sent!")
 ```
 
-伪造一个从 10.9.0.5 发往 10.9.0.6 的 RST 包，seq 设置为 10.9.0.6 期望的值（即 ACK 值）。
+Forge an RST packet sent from 10.9.0.5 to 10.9.0.6, with seq set to the value 10.9.0.6 expects (i.e. the ACK value).
 
-## 实验结果表模板
+## Experiment result table template
 
 | Task | 是否成功 | 耗时 | 关键现象 |
 |---|---|---|---|
@@ -72,5 +72,5 @@ print("RST packet sent!")
 | 1.2 (c SYN flood) | ✓ | ~5s | 比 py 快 6×，无 py 解释器开销 |
 | 1.3 (开 SYN Cookie) | ✗（攻击失败合预期） | - | Cookie 不存半开状态，队列不会填满 |
 
-分析段要点：与预期对比（理论 X 实测 Y，差异原因）、意外现象解释、
-防御机制有效性证明（攻击失败本身就是防御有效的证据）。
+Key points for the analysis section: comparison with expectations (theory X vs measured Y, reason for the difference), explanation of unexpected phenomena,
+proof of defense mechanism effectiveness (the attack failing is itself evidence the defense works).

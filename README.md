@@ -16,7 +16,7 @@
 
 - Python 3.11
 - Docker（用于沙箱容器）
-- Paratera API Key（DeepSeek-V4-Pro + GLM-Embedding-3）
+- Paratera API Key（DeepSeek-V4-Flash-0731 + GLM-Embedding-3）
 
 ## 安装
 
