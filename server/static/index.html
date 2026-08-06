@@ -375,6 +375,7 @@
       <div class="row">
         <input type="text" id="question" placeholder="例：请按 README 完成作业" value="请按 README 完成作业">
         <button id="run">开始</button>
+        <button id="dreambtn" class="ghost" title="离线治理归档卡片（LLM 合并/去重/淘汰），随时可用">知识治理（/dream）</button>
         <span id="status"></span>
       </div>
     </section>
@@ -391,7 +392,6 @@
       <div id="summary"></div>
       <div class="row" style="margin-top:12px">
         <button id="donebtn" class="ghost">归档结束（清场 workspace）</button>
-        <button id="dreambtn" class="ghost">知识治理（/dream）</button>
       </div>
     </section>
 
@@ -439,6 +439,7 @@
     function setRunning(v) {
       running = v;
       $('run').disabled = v;
+      $('dreambtn').disabled = v;
       $('status').textContent = v ? '运行中…' : '';
       $('drop').classList.toggle('disabled', v);
       $('fileinput').disabled = v;

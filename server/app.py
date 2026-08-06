@@ -44,6 +44,17 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="labHandler", docs_url=None, redoc_url=None)
 
+
+@app.middleware("http")
+async def _no_cache_static(request, call_next):
+    """静态页禁用缓存：前端迭代频繁，浏览器缓存会让人看不到最新改动。"""
+    resp = await call_next(request)
+    if request.url.path in ("/", "/index.html") or request.url.path.endswith(
+        (".html", ".js", ".css")
+    ):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    return resp
+
 # ─── 会话与任务运行时（模块级单例：单进程单任务） ───
 
 _session = TaskSession()
