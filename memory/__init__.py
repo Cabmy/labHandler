@@ -1,4 +1,4 @@
-"""labHandler memory 模块入口。"""
+"""跨 lab 记忆：任务归档、知识卡片检索、用户画像。"""
 
 from .archive import TaskArchive, get_task_archive
 from .profile import (

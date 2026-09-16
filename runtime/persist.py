@@ -1,13 +1,22 @@
-"""turn 边界落盘 Task 树；启动扫描未完成 lab。"""
+"""会话目录的持久化原语：原子写、Task 树快照、副作用账本、续跑扫描。
 
-from __future__ import annotations
+所有写入走 atomic_write_text（tmp + fsync + rename），崩在半路不会留下
+截断的文件。副作用账本让恢复具备幂等性：已经产出且内容未变的节点不重跑。
+"""
 
+import hashlib
 import json
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from runtime.task import TaskTree, TaskStatus
+
+STATE_FILE = "STATE.json"
+LEDGER_FILE = "EFFECTS.json"
+SPEC_FILE = "SPEC.md"
+MATERIALS_FILE = "MATERIALS.md"
 
 
 def session_root(workspace: Path) -> Path:
@@ -18,36 +27,25 @@ def session_dir(workspace: Path, thread_id: str) -> Path:
     return session_root(workspace) / thread_id
 
 
-def _fsync_file(path: Path) -> None:
-    fd = os.open(str(path), os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+# ── 原子写 ──────────────────────────────────────────────
 
-
-def save_tree(sdir: Path, tree: TaskTree) -> None:
-    sdir.mkdir(parents=True, exist_ok=True)
-    path = sdir / "STATE.json"
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(tree.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        f.write(content)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
-    _fsync_file(path)
-
-
-def load_tree(sdir: Path) -> TaskTree | None:
-    path = sdir / "STATE.json"
-    if not path.is_file():
-        return None
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return TaskTree.from_dict(data)
+    dir_fd = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def write_text(sdir: Path, name: str, content: str) -> None:
-    sdir.mkdir(parents=True, exist_ok=True)
-    path = sdir / name
-    path.write_text(content, encoding="utf-8")
-    _fsync_file(path)
+    atomic_write_text(sdir / name, content)
 
 
 def read_text(sdir: Path, name: str) -> str:
@@ -57,19 +55,118 @@ def read_text(sdir: Path, name: str) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def append_notes(sdir: Path, text: str) -> None:
-    if not text.strip():
-        return
-    existing = read_text(sdir, "NOTES.md")
-    body = existing.rstrip() + "\n\n" + text.strip() + "\n"
-    write_text(sdir, "NOTES.md", body)
+def write_json(sdir: Path, name: str, payload: Any) -> None:
+    atomic_write_text(sdir / name, json.dumps(payload, ensure_ascii=False, indent=2))
 
+
+def read_json(sdir: Path, name: str) -> Any | None:
+    path = sdir / name
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+# ── Task 树快照 ─────────────────────────────────────────
+
+def save_tree(sdir: Path, tree: TaskTree) -> None:
+    write_json(sdir, STATE_FILE, tree.to_dict())
+
+
+def load_tree(sdir: Path) -> TaskTree | None:
+    """损坏或缺 root_id 的 STATE.json 返回 None。调用方据此判定不可续跑。"""
+    data = read_json(sdir, STATE_FILE)
+    if not isinstance(data, dict) or "root_id" not in data:
+        return None
+    try:
+        return TaskTree.from_dict(data)
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+# ── 副作用账本（恢复幂等）────────────────────────────────
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@dataclass
+class EffectLedger:
+    """node_id -> {相对路径: 内容 sha256}。
+
+    worker 完成后记录它实际产出的文件指纹；续跑时若文件仍在且指纹一致，
+    说明这个节点的副作用已经落地，不必重跑。
+    """
+
+    sdir: Path
+    workspace: Path
+    entries: dict[str, dict[str, str]]
+
+    @classmethod
+    def load(cls, sdir: Path, workspace: Path) -> "EffectLedger":
+        raw = read_json(sdir, LEDGER_FILE)
+        entries = raw if isinstance(raw, dict) else {}
+        return cls(sdir=sdir, workspace=workspace, entries=entries)
+
+    def _resolve(self, rel: str) -> Path | None:
+        candidate = (self.workspace / rel).resolve()
+        try:
+            candidate.relative_to(self.workspace)
+        except ValueError:
+            return None
+        return candidate if candidate.is_file() else None
+
+    def record(self, node_id: str, changed_files: list[str]) -> None:
+        fingerprints: dict[str, str] = {}
+        for rel in changed_files:
+            path = self._resolve(rel)
+            if path is None:
+                continue
+            try:
+                fingerprints[rel] = sha256_file(path)
+            except OSError:
+                continue
+        self.entries[node_id] = fingerprints
+        write_json(self.sdir, LEDGER_FILE, self.entries)
+
+    def satisfied(self, node_id: str) -> bool:
+        """节点产出是否仍然完好。无记录或指纹对不上都返回 False。"""
+        fingerprints = self.entries.get(node_id)
+        if not fingerprints:
+            return False
+        for rel, digest in fingerprints.items():
+            path = self._resolve(rel)
+            if path is None:
+                return False
+            try:
+                if sha256_file(path) != digest:
+                    return False
+            except OSError:
+                return False
+        return True
+
+    def drop(self, node_id: str) -> None:
+        if self.entries.pop(node_id, None) is not None:
+            write_json(self.sdir, LEDGER_FILE, self.entries)
+
+
+# ── 续跑扫描 ────────────────────────────────────────────
 
 def latest_incomplete(workspace: Path) -> tuple[str, TaskTree] | None:
     root = session_root(workspace)
     if not root.is_dir():
         return None
-    dirs = sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.stat().st_mtime, reverse=True)
+    dirs = sorted(
+        (p for p in root.iterdir() if p.is_dir()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
     for d in dirs:
         tree = load_tree(d)
         if tree is None:
@@ -77,43 +174,62 @@ def latest_incomplete(workspace: Path) -> tuple[str, TaskTree] | None:
         root_task = tree.get(tree.root_id)
         if root_task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
             return d.name, tree
-        # any running child also counts
         if any(n.status is TaskStatus.RUNNING for n in tree.nodes.values()):
             return d.name, tree
     return None
 
 
-def changed_files_from_audit(workspace: Path) -> list[str]:
+# ── 审计回溯 ────────────────────────────────────────────
+
+_WRITE_TOOLS = {
+    "write_file",
+    "patch_file",
+    "sandbox_file_operations",
+    "sandbox_str_replace_editor",
+    "write_acceptance",
+    "use_skill_script",
+}
+
+
+def audit_offset(workspace: Path) -> int:
+    """当前审计日志的行数。worker 启动时取一次，用于界定它自己的写入。"""
+    path = workspace / ".labhandler" / "audit.jsonl"
+    if not path.is_file():
+        return 0
+    try:
+        return sum(1 for _ in path.open(encoding="utf-8"))
+    except OSError:
+        return 0
+
+
+def changed_files_from_audit(workspace: Path, *, since: int = 0) -> list[str]:
+    """回捞 since 行之后写过的文件。brief 没给 changed_files 时兜底。
+
+    不带 since 会把整个会话的写入都算到某一个 worker 头上，账本按 id 记的
+    指纹就会混进别人的产物，续跑判断随之失真。
+    """
     path = workspace / ".labhandler" / "audit.jsonl"
     if not path.is_file():
         return []
-    write_tools = {
-        "write_file",
-        "patch_file",
-        "sandbox_file_operations",
-        "sandbox_str_replace_editor",
-        "write_acceptance",
-        "use_skill_script",
-    }
-    files: list[str] = []
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            rec = json.loads(line)
-            if rec.get("tool") not in write_tools:
-                continue
-            if not str(rec.get("outcome", "")).startswith("ok"):
-                continue
-            args = rec.get("args") or {}
-            for key in ("path", "file_path", "filename"):
-                if args.get(key):
-                    files.append(str(args[key]))
-    except Exception:
-        return files
-    # unique preserve order
     seen: set[str] = set()
     out: list[str] = []
-    for f in files:
-        if f not in seen:
-            seen.add(f)
-            out.append(f)
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[since:]
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("tool") not in _WRITE_TOOLS:
+            continue
+        if not str(rec.get("outcome", "")).startswith("ok"):
+            continue
+        args = rec.get("args") or {}
+        for key in ("path", "file_path", "filename"):
+            value = args.get(key)
+            if value and str(value) not in seen:
+                seen.add(str(value))
+                out.append(str(value))
     return out

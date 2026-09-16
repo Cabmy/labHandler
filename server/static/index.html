@@ -200,7 +200,7 @@
       color: var(--dim);
     }
 
-    /* ─── 转录区（与 CLI 视觉语言呼应） ──────────────── */
+    /* ─── 转录区：节点 / 工具行 / dim 结果 ───────────── */
 
     #log {
       font-family: "SF Mono", Consolas, monospace;
@@ -347,6 +347,7 @@
       color: var(--dim);
       margin-top: 8px;
     }
+
   </style>
 </head>
 
@@ -356,7 +357,7 @@
     <h1>labHandler <small>把作业材料拖进来，剩下的交给 agent</small></h1>
     <nav>
       <button id="tabTask" class="active">任务</button>
-      <button id="tabSkill">Skill 编辑</button>
+      <button id="tabSkill">Skill</button>
     </nav>
   </header>
 
@@ -398,13 +399,13 @@
 
   </div>
 
-  <!-- ═══ Skill 编辑视图 ═══ -->
+  <!-- ═══ Skill / 偏好 ═══ -->
   <div id="viewSkill" class="hidden">
 
-    <div id="skillNotice" class="hidden">任务运行中，暂不能编辑 skill；等本次任务结束后再来。</div>
+    <div id="skillNotice" class="hidden">任务运行中，暂不能编辑；等本次任务结束后再来。</div>
 
     <section id="secSkill">
-      <h2>编辑现有 skill（自然语言描述改法；文风样本先在「任务」页上传进 workspace 并在指令中提及文件名）</h2>
+      <h2>编辑现有 skill（自然语言描述改法；文风样本先在「任务」页上传并在指令里写文件名）</h2>
       <div class="row">
         <select id="skillSel"></select>
         <button id="skillPropose">生成修改提案</button>
@@ -420,10 +421,13 @@
     </section>
 
     <section id="secProfile">
-      <h2>长期偏好规则（注入各 agent 提示词，Verifier 会逐条对账；等效 CLI /remember）</h2>
+      <h2>长期偏好（/remember）</h2>
+      <p style="font-size:12px;color:var(--dim);margin-bottom:10px">
+        写入 profile。SPEC 后由 Remember-Judge 裁定是否适用于本 lab；步骤 Judge 对照适用条目，未满足不能结束。
+      </p>
       <ul id="ruleList" class="files"></ul>
       <div class="row">
-        <input id="ruleInput" type="text" placeholder="例：所有实验报告结论章节必须含误差分析" style="flex:1">
+        <input id="ruleInput" type="text" placeholder="例：实验报告结论必须含「误差分析」" style="flex:1">
         <button id="ruleAdd">追加规则</button>
       </div>
     </section>
@@ -497,7 +501,7 @@
       uploadFiles([...e.dataTransfer.files]);
     };
 
-    // ─── 转录渲染（Codex 风格：节点 bullet / 工具行 / dim 结果） ─
+    // ─── 转录渲染：节点 bullet / 工具行 / dim 结果 ─────────────
     function logLine(cls, text) {
       streamBuf = null;
       const s = document.createElement('span');
@@ -579,7 +583,15 @@
         if (d.trace_id) logLine('toolret', 'trace ' + d.trace_id);
       });
       es.addEventListener('error', (e) => {
-        if (e.data) { const d = JSON.parse(e.data); logLine('err', '✗ ' + d.detail); }
+        // 只处理服务端推的 kind=error。浏览器自带的 EventSource error 没有 data，
+        // 断线重连时也会触发；当成任务失败会把进度停死在最后一个 node。
+        if (!e.data) return;
+        try {
+          const d = JSON.parse(e.data);
+          logLine('err', '✗ ' + (d.detail || e.data));
+        } catch {
+          logLine('err', '✗ ' + e.data);
+        }
         finish(null);
       });
       es.addEventListener('final', async (e) => {
@@ -749,7 +761,7 @@
       await loadRules();
     };
 
-    // ─── 初始化：文件列表 + skills + 运行态恢复（覆盖刷新页面场景） ─
+    // ─── 初始化：文件列表 + skills + 规则；running 则重接 SSE，resumable 则询问续跑
     async function init() {
       await refreshFiles($('filelist'));
       await loadSkills();

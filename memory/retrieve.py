@@ -1,6 +1,8 @@
-"""跨 lab 记忆检索：向量 + 文件系统。卡片 markdown 是事实源。"""
+"""跨 lab 记忆检索。卡片 markdown 是事实源，向量表是派生索引。
 
-from __future__ import annotations
+读路径只允许 cards_dir 与 workspace_dir。语义检索 k 夹在 1..8；grep 命中上限默认 40；
+单文件正文最多返回 80000 字。
+"""
 
 from pathlib import Path
 import re
@@ -12,16 +14,19 @@ from memory.vectors import VectorIndex, content_sha256
 
 
 def _cards_dir(settings: RuntimeSettings | None = None) -> Path:
+    """返回 settings.cards_dir，目录保证存在。"""
     s = settings or get_settings()
     s.cards_dir.mkdir(parents=True, exist_ok=True)
     return s.cards_dir
 
 
 def card_path(card_id: int, settings: RuntimeSettings | None = None) -> Path:
+    """卡片文件路径：{cards_dir}/{card_id}.md。"""
     return _cards_dir(settings) / f"{card_id}.md"
 
 
 def write_card_file(card: dict[str, Any], settings: RuntimeSettings | None = None) -> Path:
+    """写出 {card_id}.md：YAML frontmatter（含 content_sha256）+ 正文 content。覆盖同 id 已有文件。"""
     cid = int(card["card_id"])
     body = str(card.get("content") or "")
     meta = [
@@ -44,10 +49,12 @@ def write_card_file(card: dict[str, Any], settings: RuntimeSettings | None = Non
 
 
 def read_card_file(path: Path) -> str:
+    """读卡片文件全文（含 frontmatter）。"""
     return path.read_text(encoding="utf-8")
 
 
 def parse_card_body(text: str) -> str:
+    """去掉首段 --- frontmatter，返回正文。无合法分隔则整份原文。"""
     if not text.startswith("---"):
         return text
     end = text.find("\n---\n", 3)
@@ -57,6 +64,7 @@ def parse_card_body(text: str) -> str:
 
 
 async def embed_card_file(path: Path, llm, settings: RuntimeSettings | None = None) -> None:
+    """用正文（无 frontmatter）嵌入并 upsert 到向量表。正文为空时退回全文前 2000 字。"""
     s = settings or get_settings()
     text = read_card_file(path)
     body = parse_card_body(text)
@@ -65,6 +73,7 @@ async def embed_card_file(path: Path, llm, settings: RuntimeSettings | None = No
 
 
 async def index_card_ids(card_ids: list[int], llm, settings: RuntimeSettings | None = None) -> dict[str, Any]:
+    """按 archive 行写文件并建索引。单卡失败记入 errors，其余继续。"""
     s = settings or get_settings()
     archive = get_task_archive()
     cards = archive.get_cards_by_ids(card_ids)
@@ -81,6 +90,7 @@ async def index_card_ids(card_ids: list[int], llm, settings: RuntimeSettings | N
 
 
 def delete_card_file(card_id: int, settings: RuntimeSettings | None = None) -> None:
+    """同时删除该卡的向量行与 markdown。文件不存在不报错。"""
     s = settings or get_settings()
     path = card_path(card_id, s)
     VectorIndex(settings=s).delete(str(path))
@@ -88,7 +98,11 @@ def delete_card_file(card_id: int, settings: RuntimeSettings | None = None) -> N
 
 
 async def reconcile_index(llm, settings: RuntimeSettings | None = None) -> dict[str, int]:
-    """启动对账：文件为事实源，不一致则重建对应索引行。"""
+    """以 cards_dir 下 *.md 为事实源对齐向量表。
+
+    缺行、content_sha256 不一致、或 embedding_model 与当前设置不同 → 重建该行。
+    没有对应文件的索引行删除。
+    """
     s = settings or get_settings()
     idx = VectorIndex(settings=s)
     files = {str(p): p for p in _cards_dir(s).glob("*.md")}
@@ -114,6 +128,10 @@ async def reconcile_index(llm, settings: RuntimeSettings | None = None) -> dict[
 
 
 async def memory_search(query: str, k: int, llm, settings: RuntimeSettings | None = None) -> str:
+    """语义检索：嵌入 query，返回至多 min(k, 8) 条（至少 1）卡片正文前 400 字。
+
+    无命中 "(no matches)"。文件已删的命中 snippet 为空。
+    """
     s = settings or get_settings()
     vecs = await llm.embed([query])
     hits = VectorIndex(settings=s).search(vecs[0], k=max(1, min(k, 8)))
@@ -127,16 +145,30 @@ async def memory_search(query: str, k: int, llm, settings: RuntimeSettings | Non
     return "\n---\n".join(lines)
 
 
-def memory_grep(pattern: str, settings: RuntimeSettings | None = None, limit: int = 40) -> str:
+def memory_grep(
+    pattern: str,
+    settings: RuntimeSettings | None = None,
+    limit: int = 40,
+    *,
+    extra_roots: list[Path] | None = None,
+) -> str:
+    """在 cards_dir 以及 extra_roots（缺省为 workspace/.labhandler）下按正则扫文件。
+
+    非法正则：[ERROR/Validation]。命中达 limit 后截断并标注。
+    无命中 "(no matches)"。读失败的文件跳过。
+    """
     s = settings or get_settings()
     try:
         rx = re.compile(pattern)
     except re.error as e:
         return f"[ERROR/Validation] invalid regex: {e}"
     roots = [_cards_dir(s)]
-    ws = s.workspace_dir / ".labhandler"
-    if ws.is_dir():
-        roots.append(ws)
+    if extra_roots is not None:
+        roots.extend(extra_roots)
+    else:
+        ws = s.workspace_dir / ".labhandler"
+        if ws.is_dir():
+            roots.append(ws)
     hits: list[str] = []
     for root in roots:
         if not root.exists():
@@ -157,6 +189,11 @@ def memory_grep(pattern: str, settings: RuntimeSettings | None = None, limit: in
 
 
 def memory_read(path: str, settings: RuntimeSettings | None = None) -> str:
+    """读允许范围内的文件，正文最多 80000 字。
+
+    相对路径依次试 cards_dir、workspace_dir；绝对路径必须落在这两者之下。
+    越权 [ERROR/PermissionError]，缺失 [ERROR/FileNotFoundError]。
+    """
     s = settings or get_settings()
     candidate = Path(path)
     if not candidate.is_absolute():
@@ -179,6 +216,7 @@ def memory_read(path: str, settings: RuntimeSettings | None = None) -> str:
 
 
 def _is_under(path: Path, root: Path) -> bool:
+    """path 是否位于 root 之下（含 root 自身）。"""
     try:
         path.relative_to(root)
         return True

@@ -1,8 +1,10 @@
-"""MCP 客户端：官方 SDK streamable HTTP，不用 langchain。"""
+"""AIO Sandbox 的 MCP 客户端（官方 SDK streamable HTTP）。
 
-from __future__ import annotations
+模块级单例 session + tools 列表缓存。连上前 probe_port；探活失败抛 RuntimeError。
+call_mcp_tool 失败则 reset 后重连再调一次。reset_mcp_client 清空 session/缓存，
+并在已有 event loop 里异步关闭旧连接；无 running loop 时只丢引用。
+"""
 
-import warnings
 from typing import Any
 
 from config.runtime import get_settings

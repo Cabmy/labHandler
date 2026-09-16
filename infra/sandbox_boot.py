@@ -14,8 +14,6 @@
    会收到一次性迁移提示。
 """
 
-from __future__ import annotations
-
 import json
 import os
 import shutil

@@ -1,7 +1,5 @@
 """决策器：读 Task 快照 + 信号，输出唯一 Decision。无状态。"""
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 from config.runtime import RuntimeSettings
@@ -54,7 +52,7 @@ def decide(
         if snap.transient_count >= settings.transient_retry_max:
             return Decision(
                 kind="nudge",
-                text="Transient retries exhausted. Switch tools or change approach. Do not mark plan_invalid.",
+                text="Transient retries exhausted. Switch tools or change approach. Do not mark spec_invalid.",
             )
         return Decision(kind="retry_tool", delay=delay_for(snap.transient_count))
 

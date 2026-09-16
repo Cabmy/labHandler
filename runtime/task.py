@@ -1,22 +1,30 @@
 """RuntimeTask 控制面：树、状态、预算计数、投影事件。"""
 
-from __future__ import annotations
-
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Self
 
 from runtime.errors import ErrorClass
 from runtime.stagnation import StagnationSignal
 
 
 class TaskKind(str, Enum):
+    """节点种类，同时是阶段的唯一身份。
+
+    除 SESSION 外每一项都在 runtime.phase.PHASES 里有一条定义，那里说明本阶段
+    由谁执行、看得见哪些工具、从哪个 submit_* 交卷。
+    """
+
     SESSION = "session"
-    PLAN = "plan"
-    WORKER = "worker"
+    SPEC = "spec"          # Pro 起草/修订 SPEC.md
+    DISPATCH = "dispatch"  # Pro 决定下一步派谁做什么
+    WORKER = "worker"      # Flash 执行一份任务书
+    TAKEOVER = "takeover"  # Flash 做不动时 Pro 接手本步实现
     JUDGE = "judge"
+    REMEMBER_JUDGE = "remember_judge"  # 裁定 /remember 是否适用于本 lab，不写 SPEC/MEMORY
+    SUMMARY = "summary"
 
 
 class TaskStatus(str, Enum):
@@ -186,7 +194,7 @@ class RuntimeTask:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> RuntimeTask:
+    def from_dict(cls, data: dict[str, Any]) -> Self:
         return cls(
             task_id=data["task_id"],
             parent_id=data.get("parent_id"),
@@ -253,7 +261,7 @@ class TaskTree:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> TaskTree:
+    def from_dict(cls, data: dict[str, Any]) -> Self:
         nodes = {
             tid: RuntimeTask.from_dict(payload)
             for tid, payload in (data.get("nodes") or {}).items()

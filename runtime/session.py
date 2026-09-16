@@ -1,6 +1,8 @@
-"""lab 生命周期：start / stop / done / 启动续跑询问。"""
+"""lab 生命周期：一次会话对应一个 thread_id、一棵 Task 树、一个会话目录。
 
-from __future__ import annotations
+新任务永远新开会话。续跑只通过 attach_resume 显式挂上未完成的树。
+done() 归档知识卡、把 workspace 挪进 .trash、重建沙箱，并换一棵空 runner。
+"""
 
 import shutil
 import time
@@ -11,10 +13,11 @@ from typing import Any
 
 from config.runtime import RuntimeSettings, get_settings
 from runtime.llm import LLMGateway
+from runtime.observe.sinks import build_sinks
 from runtime.observe.tracer import Tracer
 from runtime.orchestrator import LabRunner
 from runtime.persist import latest_incomplete, session_dir as make_session_dir
-from runtime.task import TaskStatus, TaskTree, new_session_task
+from runtime.task import TaskTree, new_session_task
 from runtime.tools import build_registry
 
 
@@ -31,8 +34,14 @@ class LabSession:
     ) -> None:
         self.settings = settings or get_settings()
         tracer = Tracer(
-            jsonl_path=self.settings.workspace_dir / ".labhandler" / "traces.jsonl",
-            otlp_endpoint=self.settings.otel_exporter_otlp_endpoint,
+            build_sinks(
+                jsonl_path=self.settings.traces_path if self.settings.trace_jsonl_enabled else None,
+                langfuse_public_key=self.settings.langfuse_public_key,
+                langfuse_secret_key=self.settings.langfuse_secret_key,
+                langfuse_host=self.settings.langfuse_host,
+                environment=self.settings.langfuse_environment,
+                log=print,
+            )
         )
         self.llm = llm or LLMGateway(self.settings, tracer=tracer)
         self.tracer = tracer
@@ -47,7 +56,7 @@ class LabSession:
         self.thread_id = _new_thread_id()
         self.tree: TaskTree | None = None
         self.last_result: dict[str, Any] = {}
-        self._task: Any = None
+        self._resuming = False
 
     @property
     def session_path(self) -> Path:
@@ -62,8 +71,10 @@ class LabSession:
         return {"thread_id": tid, "status": root.status.value}
 
     def attach_resume(self, thread_id: str, tree: TaskTree) -> None:
+        """挂上一个未完成的会话。续跑是显式动作，只在这里发生。"""
         self.thread_id = thread_id
         self.tree = tree
+        self._resuming = True
 
     def decline_resume(self) -> dict[str, Any]:
         found = latest_incomplete(self.settings.workspace_dir)
@@ -75,16 +86,21 @@ class LabSession:
         self.runner.request_stop()
 
     async def run(self, question: str, on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None) -> dict[str, Any]:
-        resume = False
-        if self.tree is None:
-            root = new_session_task(
-                step_budget=self.settings.pro_step_budget + self.settings.flash_step_budget,
-                wall_time_s=self.settings.task_wall_time_s * 4,
-                now=self.clock(),
+        resume = self._resuming
+        if not resume:
+            # 每个新任务都是一条独立会话：新的 thread_id、新的 Task 树、新的目录。
+            # 复用上一轮的树会让新任务读到上一轮的 SPEC.md 和材料。
+            self.thread_id = _new_thread_id()
+            self.tree = TaskTree(
+                new_session_task(
+                    step_budget=self.settings.pro_step_budget + self.settings.flash_step_budget,
+                    wall_time_s=self.settings.task_wall_time_s * 4,
+                    now=self.clock(),
+                )
             )
-            self.tree = TaskTree(root)
-        else:
-            resume = any(n.status is TaskStatus.RUNNING for n in self.tree.nodes.values())
+        assert self.tree is not None
+        self._resuming = False
+        self.tracer.new_trace()
         self.session_path.mkdir(parents=True, exist_ok=True)
         result = await self.runner.run(
             question,

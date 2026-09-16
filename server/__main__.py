@@ -1,7 +1,5 @@
 """python -m server 启动入口（uvicorn，默认仅本机 127.0.0.1:8000）。"""
 
-from __future__ import annotations
-
 import os
 
 import uvicorn

@@ -4,8 +4,6 @@
 端口是否可达。不依赖 docker/subprocess 等重依赖，可安全跨模块复用。
 """
 
-from __future__ import annotations
-
 import socket
 from urllib.parse import urlparse
 

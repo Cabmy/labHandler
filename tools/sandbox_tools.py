@@ -1,12 +1,18 @@
-"""sandbox_tools - AIO Sandbox MCP 封装（官方 SDK，无 langchain）。"""
+"""AIO Sandbox MCP 工具封装。
 
-from __future__ import annotations
+宿主机路径经 sandbox_workspace_path 映射到容器 /workspace；越界抛 ValueError。
+call_sandbox 把 MCP 返回值收成文本：同一工具连续失败满 3 次记
+[SANDBOX_UNREACHABLE]，其余记 [tool_error]。sandbox_execute_code 若只收到
+ack（stdout/stderr/exit_code 皆 null）会附加改走 sandbox_execute_bash 的提示。
+list_sandbox_tool_names 在 MCP 不可达时返回空列表。
+"""
 
+import asyncio
 import json
-import os
 from pathlib import Path
 from typing import Any
 
+from config.runtime import get_settings
 from mcp_client import call_mcp_tool, list_mcp_tools
 
 _SANDBOX_WORKSPACE = "/workspace"
@@ -15,22 +21,22 @@ _sandbox_failures: dict[str, int] = {}
 _PATH_KW = {"path", "file_path"}
 
 
+def sandbox_workspace_path(path: Path | str) -> str:
+    """宿主机路径 → 容器内 /workspace 路径。越界抛 ValueError。"""
+    host_ws = get_settings().workspace_dir
+    target = Path(path).resolve()
+    rel = target.relative_to(host_ws)
+    return f"{_SANDBOX_WORKSPACE}/{rel}".replace("\\", "/") if str(rel) != "." else _SANDBOX_WORKSPACE
+
+
 def _translate_path(p: str) -> str:
     if not p or not isinstance(p, str):
         return p
-    if p.startswith(_SANDBOX_WORKSPACE):
-        return p
-    if not p.startswith("/"):
+    if p.startswith(_SANDBOX_WORKSPACE) or not p.startswith("/"):
         return p
     try:
-        host_ws = Path(os.getenv("WORKSPACE_DIR", "./workspace")).resolve()
-        target = Path(p).resolve()
-        try:
-            rel = target.relative_to(host_ws)
-        except ValueError:
-            return p
-        return f"{_SANDBOX_WORKSPACE}/{rel}".replace("\\", "/")
-    except Exception:
+        return sandbox_workspace_path(p)
+    except (ValueError, OSError):
         return p
 
 
@@ -117,3 +123,38 @@ async def list_sandbox_tool_names() -> list[str]:
     except Exception:
         return []
     return [getattr(t, "name", "") for t in tools if getattr(t, "name", "")]
+
+
+async def sandbox_run(command: str, *, timeout: float) -> tuple[int, str]:
+    """在沙箱里跑一条 bash 命令，返回 (exit_code, 合并日志)。
+
+    超时、[SANDBOX_UNREACHABLE]、[tool_error]、缺 exit_code：exit_code=-1，
+    日志带标记。非 JSON / 非 dict 载荷按 exit_code=0 原样返回。
+    调用方据此区分环境失败与被测命令失败。
+    """
+    try:
+        raw = await asyncio.wait_for(
+            call_sandbox("sandbox_execute_bash", command=command), timeout=timeout
+        )
+    except asyncio.TimeoutError:
+        return -1, f"[TIMEOUT after {timeout}s] {command}"
+
+    if "[SANDBOX_UNREACHABLE]" in raw:
+        return -1, raw
+    if raw.startswith("[tool_error]"):
+        return -1, raw
+
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return 0, raw
+    if not isinstance(payload, dict):
+        return 0, raw
+
+    exit_code = payload.get("exit_code")
+    log = "\n".join(
+        str(payload.get(k) or "") for k in ("stdout", "stderr") if payload.get(k)
+    )
+    if exit_code is None:
+        return -1, (log or raw) + "\n[labhandler] 沙箱未返回 exit_code"
+    return int(exit_code), log or raw

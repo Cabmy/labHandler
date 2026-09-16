@@ -1,49 +1,17 @@
-"""退避执行器。只负责重试瞬时失败，不持策略计数。"""
+"""退避延迟：delay_for(attempt) 的秒数，指数增长、封顶 MAX_WAIT。
 
-from __future__ import annotations
+重试决策只由 control.decide 产出（它能看见 Task 的步数、墙钟和瞬时失败计数）。
+LLMGateway / SDK 的 max_retries=0，避免多层退避把 wall-clock 预算耗在等待上。
+"""
 
 import asyncio
-from collections.abc import Awaitable, Callable
-from typing import TypeVar
 
-from tenacity import (
-    AsyncRetrying,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential,
-)
-
-from runtime.errors import ErrorClass, classify
-
-T = TypeVar("T")
+MIN_WAIT = 0.5
+MAX_WAIT = 8.0
 
 
-def _is_transient(exc: BaseException) -> bool:
-    return classify(exc) == ErrorClass.TRANSIENT
-
-
-async def with_backoff(
-    fn: Callable[[], Awaitable[T]],
-    *,
-    attempts: int = 3,
-    min_wait: float = 0.5,
-    max_wait: float = 8.0,
-) -> T:
-    """指数退避执行协程。attempts 含首次。"""
-    if attempts <= 1:
-        return await fn()
-    async for attempt in AsyncRetrying(
-        stop=stop_after_attempt(attempts),
-        wait=wait_exponential(multiplier=min_wait, min=min_wait, max=max_wait),
-        retry=retry_if_exception(_is_transient),
-        reraise=True,
-    ):
-        with attempt:
-            return await fn()
-    raise RuntimeError("with_backoff: unreachable")
-
-
-def delay_for(attempt: int, *, min_wait: float = 0.5, max_wait: float = 8.0) -> float:
+def delay_for(attempt: int, *, min_wait: float = MIN_WAIT, max_wait: float = MAX_WAIT) -> float:
+    """第 attempt 次瞬时失败后应等待的秒数（指数退避，封顶 max_wait）。"""
     return min(max_wait, min_wait * (2 ** max(0, attempt - 1)))
 
 

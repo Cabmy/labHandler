@@ -1,6 +1,10 @@
-"""离线知识治理。卡片文件为事实源；向量表为派生索引。"""
+"""离线知识治理（/dream）。
 
-from __future__ import annotations
+按 (card_type, task_type) 分组；组内至少 2 张才送 Pro 判定。
+合并成功：新卡写入 archive + markdown + 向量索引；源卡 retired_at 置位并删文件。
+合并写入失败：对应 source_ids 不淘汰。单组 LLM/解析失败记入 errors，其余组继续。
+卡片文件为事实源；向量表为派生索引。
+"""
 
 from typing import Any
 
@@ -11,10 +15,11 @@ from memory.retrieve import delete_card_file, index_card_ids, write_card_file
 from runtime.llm import LLMGateway
 from runtime.schema_call import DREAM_SCHEMA, SUBMIT_DREAM, oneshot_schema
 
-_MIN_GROUP_SIZE = 2
+_MIN_GROUP_SIZE = 2  # 少于此张数的分组不进入治理
 
 
 def _group_cards(cards: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """按 (card_type, task_type) 归组。组内顺序与输入一致。"""
     groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for c in cards:
         key = (str(c.get("card_type", "")), str(c.get("task_type", "")))
@@ -23,6 +28,7 @@ def _group_cards(cards: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict
 
 
 def _build_group_msg(card_type: str, task_type: str, cards: list[dict[str, Any]]) -> str:
+    """编一份给 Pro 的分组正文。约定：card_id 越大越新。"""
     lines = [
         f"## 治理分组：card_type={card_type} / task_type={task_type}（共 {len(cards)} 张）",
         "card_id 越大越新。",
@@ -41,6 +47,12 @@ async def _judge_group(
     task_type: str,
     cards: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[int], str | None]:
+    """对本组调用 submit_dream。返回 (merged, retire_ids, error)。
+
+    retire_ids / source_ids 只保留本组已有 card_id。
+    merged 要求 content 非空且至少两个 source；类型强制为本组 card_type（非法则 lesson）。
+    LLM 失败时 merged/retire 为空，error 为异常摘要。
+    """
     group_ids = {c["card_id"] for c in cards}
     try:
         data = await oneshot_schema(
@@ -86,6 +98,10 @@ async def _judge_group(
 
 
 async def run_dream(llm: LLMGateway | None = None) -> dict[str, Any]:
+    """跑完一轮治理，返回统计 dict（judged / merged_created / retired / errors / ...）。
+
+    新卡挂在源卡中 card_id 最大者的 task 下。pattern 且源卡 ≥3 时只记 promotion_suggestions，不写 skill 文件。
+    """
     settings = get_settings()
     llm = llm or LLMGateway(settings)
     archive = get_task_archive()

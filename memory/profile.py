@@ -1,14 +1,10 @@
-"""Profile 模块 - 读写 profile/me.yaml + 注入 agent system prompt。
+"""用户画像：profile/me.yaml 为唯一事实源。
 
-设计要点：
-1. 单一 me.yaml 文件为唯一事实源；不用 DB（个人 profile 不需历史）
-2. update_field / add_field 用原子写：先 .tmp 再 rename（崩溃安全）
-3. inject_for_agent：将关键 profile 字段拼入 agent system prompt
-4. 点号路径："identity.name" / "preferences.writing_style.formality"
-5. 不用 pydantic - YAML -> dict 即可（保持轻量）
+点号路径读写（identity.name、preferences.writing_style.formality）。
+写回先落同目录 .tmp，再 POSIX rename：崩溃后磁盘上始终是一份完整 YAML。
+load：文件缺失或 YAML 非法时得到空 dict，不抛。
+inject_for_agent 把 identity / preferences / style_rules 拼进名单内 agent 的 system 末尾。
 """
-
-from __future__ import annotations
 
 import os
 import shutil
@@ -24,18 +20,18 @@ from config.runtime import get_settings
 
 
 def _profile_path() -> Path:
-    """从 settings 解析 profile YAML 路径。"""
+    """返回 settings.profile_path。"""
     return get_settings().profile_path
 
 
 def _atomic_write(data: dict[str, Any]) -> None:
-    """原子将 dict 写入 YAML：先 .tmp 再 POSIX rename。"""
+    """把 dict 写成 YAML。先写 .tmp 再 os.replace；失败则 shutil.move。崩溃后磁盘上始终是完整文件。"""
     path = _profile_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-    # POSIX 原子 rename；Windows 回退用 shutil.move
+    # os.replace 在 POSIX 上原子替换；失败则 shutil.move
     try:
         os.replace(tmp, path)
     except Exception:
@@ -46,7 +42,7 @@ def _atomic_write(data: dict[str, Any]) -> None:
 
 
 def load_profile() -> dict[str, Any]:
-    """读 profile YAML；文件缺失或解析出错时返回空 dict。"""
+    """读 profile YAML 为 dict。文件缺失、非 dict、或解析失败 → 空 dict，不抛。"""
     path = _profile_path()
     if not path.exists():
         return {}
@@ -61,13 +57,14 @@ def load_profile() -> dict[str, Any]:
 
 
 def get_profile() -> dict[str, Any]:
-    """返回当前 profile dict（load_profile 的便捷别名）。"""
+    """当前 profile dict，语义同 load_profile。"""
     return load_profile()
 
 
 def update_field(dotted_path: str, value: Any) -> dict[str, Any]:
-    """更新点号路径处的字段（path 必须已存在）。
+    """覆盖点号路径上已有字段，原子写回，返回写后的整份 dict。
 
+    路径不存在或中间节点非 dict 时抛 KeyError。不创建缺失父节点。
     示例：update_field("preferences.writing_style.formality", "high")
     """
     data = load_profile()
@@ -85,7 +82,7 @@ def update_field(dotted_path: str, value: Any) -> dict[str, Any]:
 
 
 def add_field(dotted_path: str, value: Any) -> dict[str, Any]:
-    """在点号路径处新增字段（缺失的父节点自动创建为 dict）。"""
+    """在点号路径写入字段，缺失的父节点建成空 dict，原子写回，返回写后的整份 dict。"""
     data = load_profile()
     parts = dotted_path.split(".")
     cur = data
@@ -98,16 +95,19 @@ def add_field(dotted_path: str, value: Any) -> dict[str, Any]:
     return data
 
 
-def inject_for_agent(agent_name: str, system_prompt: str) -> str:
-    """将关键 profile 字段拼到 system prompt 末尾，供所有产出类 agent 使用。
+def inject_for_agent(
+    agent_name: str,
+    system_prompt: str,
+    *,
+    rules: list[str] | None = None,
+    include_rules: bool = True,
+) -> str:
+    """把 identity / preferences 以及本 lab 适用的 style_rules 拼到 system 末尾。
 
-    注入对象：coder / planner / verifier / summarizer。
-    Intake 跳过（只解析题面，不产出）。
-
-    style_rules 段附带优先级声明：长期规则 > skill SOP（全 skill 类型通用），
-    补上 config/prompts.py:412（profile < 题面）与本文件 rules < 当轮用户指令
-    之外缺失的那条轴。verifier 的 stage-2 判官同样经本函数注入
-    （agents/verifier.py:467），故写侧与判侧口径一致。
+    仅 coder / planner / verifier / summarizer / pro / flash 会注入。
+    include_rules=False 时不写规则段（起草 SPEC、remember_judge 裁定前）。
+    rules 非 None 时只用这份名单，不再读 profile 全量 style_rules。
+    优先级：当轮用户指令 > 本 lab 适用规则 > skill SOP。
     """
     agent = agent_name.lower()
     if agent not in {"coder", "planner", "verifier", "summarizer", "pro", "flash"}:
@@ -143,19 +143,19 @@ def inject_for_agent(agent_name: str, system_prompt: str) -> str:
             ds = cs.get("docstring", "short")
             lines.append(f"- Coding style: {th}; docstring={ds}")
 
-    # 自由文本规则（经 /remember 累积）
-    rules = prefs.get("style_rules") or []
-    rules = [str(r).strip() for r in rules if str(r).strip()]
-    if rules:
+    if include_rules and rules is None:
+        rules = prefs.get("style_rules") or []
+    chosen = [str(r).strip() for r in (rules or []) if str(r).strip()] if include_rules else []
+    if include_rules:
         lines.append("")
-        lines.append("## User long-term rules (accumulated via /remember)")
+        lines.append("## User long-term rules applicable to this lab")
         lines.append("")
         lines.append(
             "### Precedence (holds for every skill type: coding / essay / lab_report / other)"
         )
         lines.append(
             "- These long-term rules **outrank the current skill SOP**. When a rule conflicts with any "
-            "convention stated in the `## Current skill SOP` section (placeholder format, file naming, "
+            "convention in a loaded skill SOP (placeholder format, file naming, "
             "section wording, writing style, ...), the rule is authoritative and the SOP's conflicting "
             "wording is void — this holds even when the SOP demonstrates its own version through concrete "
             "examples in a loaded reference file."
@@ -166,16 +166,19 @@ def inject_for_agent(agent_name: str, system_prompt: str) -> str:
             "separate sources and are not overridden here."
         )
         lines.append("")
-        for r in rules:
-            lines.append(f"- {r}")
+        if chosen:
+            for r in chosen:
+                lines.append(f"- {r}")
+        else:
+            lines.append("- （本 lab 没有适用的 /remember 规则）")
 
     return system_prompt + "\n".join(lines)
 
 
 def append_rule(rule: str) -> dict[str, Any]:
-    """向 preferences.style_rules（list）追加一条自由文本规则。
+    """在 preferences.style_rules 末尾追加一条规则，原子写回，返回写后的整份 dict。
 
-    /remember 命令的后端；复用 _atomic_write 避免覆盖式的 add_field。
+    空字符串抛 ValueError。style_rules 缺失或非 list 时先建成空 list 再追加。
     """
     text = (rule or "").strip()
     if not text:

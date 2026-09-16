@@ -1,10 +1,10 @@
-# Exception Handling Cheat Sheet (coding skill reference material)
+# Exception Handling (coding)
 
-| Failure mode | Response |
+| Failure | Response |
 |---|---|
-| task_title / deliverables missing | Call read_file to read the full workspace/README.md directly, then re-extract the constraints yourself |
-| Sandbox 8080 unreachable | Fall back to host `host_bash` (guarded by _safe_path, cwd=workspace auto-locked); note "sandbox unreachable, fell back" in the Final Answer |
-| pytest repeatedly fails (same error ≥3 times) | Stop hard-tuning; Final Answer reports `step <id> needs_retry: <stuck point + methods already tried>`; after retries are exhausted the main graph automatically hands to Verifier for Replan |
-| Problem-statement constraints conflict | Do not force-satisfy all of them; Final Answer `待办：` line notes "constraint X conflicts with Y, user must decide priority" |
-| host_bash out-of-bounds PermissionError | By design, not a bug; switch to relative paths + execute inside the sandbox |
-| recursion_limit reached | Task granularity too large; report needs_retry and let the main graph handle it; this skill expects a single step ≤6 ReAct iter |
+| Constraints not in the assignment | `read_file` the workspace README / guidance; do not guess |
+| Sandbox unreachable | Gate maps this to `test_invalid`. Do not pretend the tests passed on the host |
+| pytest same error ≥3 times | Stop retuning. Next dispatch should shrink the assignment or rewrite tests (`test_invalid` if the gate itself is wrong) |
+| Conflicting constraints | Do not force both. Note the conflict in SPEC / SUMMARY and pick the problem statement over the skill |
+| `host_bash` PermissionError | Stay inside workspace relative paths, or run in `sandbox_execute_bash` |
+| Assignment too large | Split. One Flash, one unit of work |

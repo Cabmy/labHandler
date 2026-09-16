@@ -1,16 +1,13 @@
-"""/edit_skill 编辑判官（仿 memory/dream.py 的单模块 LLM 判官模式）。
+"""/edit_skill 编辑判官：一次 LLM 调用产出多文件操作提案，确认后才落盘。
 
-流程：读取全部 skill 文件 ->（若指令提及 workspace 文件，读作文风
-样本）-> 一次 LLM 调用产出多文件操作 -> 预校验 + 统一 diff ->
-调用方展示确认 -> apply_edit 落盘
-（skills/repository.py:apply_skill_operations，整批校验整批落盘）。
+数据流：读 skill 全部文件 → 指令里若点到 workspace 文件则读作文风样本
+→ oneshot_schema 产出 operations → 预校验 + unified diff → 调用方展示
+→ apply_edit 经 apply_skill_operations 整批落盘（一条非法整批拒绝）。
 
-约束：仅能编辑现有 skill（coding/essay/lab_report）；禁止经编辑
-入口新增 skill。触发入口：CLI /edit_skill 或 Web POST /api/edit_skill。
-纯离线操作，不触碰主图状态。
+不变量：只能改现有 skill（coding/essay/lab_report），编辑入口不能新建 skill。
+入口：CLI /edit_skill 或 Web POST /api/edit_skill。不碰主图 / LabSession 状态。
+文风样本上限 _MAX_SAMPLE_CHARS；解析失败进 sample_failures，不进 samples。
 """
-
-from __future__ import annotations
 
 import difflib
 from typing import Any
@@ -42,10 +39,9 @@ def existing_skill_names() -> list[str]:
 async def _collect_style_samples(instruction: str) -> tuple[dict[str, str], list[str]]:
     """从指令文本中匹配 workspace 顶层文件名，读作文风样本。
 
-    自然语言指令可直接提及文件名（如“学一下我的实验报告.docx 的文风”），
-    无需标志位；Web 侧样本经现有上传接口进入 workspace。长文件名优先匹配，
-    匹配到的片段从指令中掩蔽，防止“a.md”作为“data.md”子串被误拉入。
-    返回：({文件名: 样本文本}, [解析失败描述])
+    指令里出现的顶层文件名即作文风样本（Web 侧经上传接口进 workspace）。
+    长文件名优先匹配，命中片段从指令中掩蔽，避免「a.md」作为「data.md」
+    子串被误拉入。返回：({文件名: 样本文本}, [解析失败描述])。
     """
     ws = get_settings().workspace_dir
     if not ws.is_dir():
@@ -70,8 +66,8 @@ async def _collect_style_samples(instruction: str) -> tuple[dict[str, str], list
                 if not isinstance(text, str):
                     text = str(text)
             except Exception as e:
-                # 失败样本不入 samples：占位符喂给 LLM 无意义，
-                # 且会误导用户以为已学到文风；失败原因单独曝出
+                # 解析失败的样本不进 samples，原因进 sample_failures；
+                # 占位符既喂不了风格，也会让调用方以为已经学到文风。
                 failures.append(f"{p.name}：沙箱解析失败（{type(e).__name__}: {e}）")
                 continue
         else:

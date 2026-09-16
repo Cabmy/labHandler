@@ -1,6 +1,5 @@
 # LLM & Agent
 openai>=1.40.0
-tenacity
 jsonschema
 
 # MCP
@@ -23,8 +22,7 @@ python-multipart
 sse-starlette
 
 # Observability
-opentelemetry-sdk
-opentelemetry-exporter-otlp
+langfuse>=3.0
 
-# Verifier 在 workspace 跑 pytest
+# 验收测试在沙箱内跑 pytest；本地开发也需要
 pytest>=8.0

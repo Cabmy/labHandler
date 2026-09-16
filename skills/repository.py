@@ -1,15 +1,13 @@
 """Skills 读写仓储：统一 frontmatter 解析、列表/body 读取与编辑落盘。
 
 布局（progressive disclosure 三层）：
-skills/<name>/SKILL.md      -- frontmatter + 精简 SOP（拼入 agent system prompt）
-skills/<name>/references/   -- 详细材料，由 Coder 经 load_skill_reference 按需读取
-skills/<name>/scripts/      -- 可执行脚本，由 Coder 经 use_skill_script 复制进 workspace 后在沙箱执行
+skills/<name>/SKILL.md      -- frontmatter 进目录；body 由 Pro 经 load_skill 拉取
+skills/<name>/references/   -- 详细材料，绑定后经 load_skill_reference 按需读取
+skills/<name>/scripts/      -- 可执行脚本，绑定后经 use_skill_script 复制进 workspace
 
 唯一写入入口：apply_skill_operations（/edit_skill 编辑判官的落盘层）；
 落盘前整批校验，一条非法整批拒绝。
 """
-
-from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
@@ -95,7 +93,7 @@ def list_skill_scripts(skill_name: str) -> list[str]:
 
 
 def load_skill_reference(skill_name: str, ref_name: str) -> str:
-    """读取 skills/<name>/references/<ref_name> 全文（progressive disclosure 第二层）。
+    """读取 skills/<name>/references/<ref_name> 全文。
 
     ref_name 取 basename + resolve 边界检查，防止 ../ 越界读 skills 外文件。
     """
@@ -160,7 +158,7 @@ def validate_operation(skill_name: str, op: dict[str, Any]) -> Path:
             f"非法 file 路径：{file!r}"
             "（只允许 SKILL.md / references/<name>.md / scripts/<name>）"
         )
-    # resolve 边界兜底（basename 化后理论上不可能越界，防御性）
+    # resolve 后必须仍落在本 skill 目录；越界抛 PermissionError
     try:
         target.resolve().relative_to(skill_dir)
     except ValueError as e:

@@ -1,6 +1,9 @@
-"""search_tool - DDG 搜索（无 langchain）。"""
+"""DuckDuckGo 网页搜索。
 
-from __future__ import annotations
+web_search 在线程里调 DDGS；max_results 夹到 [1, 8]。空结果会按
+search_max_retries 重试；耗尽后若有异常返回一条 [search failed: ...] snippet，
+无异常则空列表。代理取 settings.proxy。
+"""
 
 import asyncio
 import warnings

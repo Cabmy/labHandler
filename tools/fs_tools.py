@@ -1,6 +1,12 @@
-"""host workspace 文件操作（无 langchain）。安全检查委托 SecurityPolicy。"""
+"""host workspace 文件操作。路径与命令一律经 SecurityPolicy，调用记入 ToolAuditor。
 
-from __future__ import annotations
+不变量：读写只落在 WORKSPACE_DIR 内。越界 / 非白名单命令以
+[ERROR/PermissionError] 字符串返回（含 PERM_HINT），到不了 OS。
+read 默认从第 1 行起，可传 1-based offset / limit（行数）；单次最多 80_000 字符，
+截断时标明下一行 offset。list_dir / glob 上限 80 条；grep 上限 40 条。
+patch_file 要求 old 在文件中恰好出现一次。host_bash cwd=WORKSPACE_DIR，
+默认超时 30s。FileNotFound / IsADirectory / 非法 regex 走错误通道并审计。
+"""
 
 import subprocess
 from pathlib import Path
@@ -14,6 +20,7 @@ WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
 
 _GREP_LIMIT = 40
 _GLOB_LIMIT = 80
+_READ_CHAR_CAP = 80_000
 
 
 def _perm_msg(e: PermissionError) -> str:
@@ -25,7 +32,7 @@ def _denied(tool_name: str, args: dict, e: PermissionError) -> str:
     return _perm_msg(e)
 
 
-def read_file(path: str) -> str:
+def read_file(path: str, offset: int = 1, limit: int | None = None) -> str:
     try:
         p = get_policy().safe_path(path)
     except PermissionError as e:
@@ -36,11 +43,40 @@ def read_file(path: str) -> str:
     if not p.is_file():
         get_auditor().record("read_file", {"path": path}, "error:IsADirectoryError")
         raise IsADirectoryError(f"Not a file: {path}")
-    get_auditor().record("read_file", {"path": path}, "ok")
+    if offset < 1:
+        return "[ERROR/Validation] offset must be a 1-based line number"
+    if limit is not None and limit < 1:
+        return "[ERROR/Validation] limit must be a positive line count"
+
     text = p.read_text(encoding="utf-8", errors="replace")
-    if len(text) > 80_000:
-        return text[:80_000] + f"\n[truncated {len(text) - 80_000} chars]"
-    return text
+    lines = text.splitlines(keepends=True)
+    n = len(lines)
+    start = offset - 1
+    if start >= n:
+        get_auditor().record("read_file", {"path": path, "offset": offset}, "ok")
+        return f"[ERROR/Validation] offset {offset} past end ({n} lines)"
+    end = n if limit is None else min(n, start + limit)
+    chunk = "".join(lines[start:end])
+    next_line = end + 1
+    leftover_lines = n - end
+    if len(chunk) > _READ_CHAR_CAP:
+        cut = chunk[:_READ_CHAR_CAP]
+        nl = cut.rfind("\n")
+        if nl >= 0:
+            cut = cut[: nl + 1]
+        next_line = offset + cut.count("\n")
+        leftover_lines = n - (next_line - 1)
+        chunk = cut.rstrip("\n") + (
+            f"\n[truncated at char cap {_READ_CHAR_CAP}; next offset={next_line}, {leftover_lines} lines remain]"
+        )
+    elif leftover_lines > 0:
+        chunk += f"\n[truncated {leftover_lines} lines; next offset={next_line}]"
+    get_auditor().record(
+        "read_file",
+        {"path": path, "offset": offset, "limit": limit, "n_chars": len(chunk)},
+        "ok",
+    )
+    return chunk
 
 
 def write_file(path: str, content: str, role: str = "write") -> str:
@@ -94,9 +130,10 @@ def patch_file(path: str, old: str, new: str, role: str = "write") -> str:
 
 def glob_files(pattern: str, limit: int = _GLOB_LIMIT) -> list[str]:
     root = WORKSPACE_DIR
+    get_policy().check_glob(pattern)
     matches: list[str] = []
     for p in root.glob(pattern):
-        if not p.is_file():
+        if not p.is_file() or not get_policy().contains(p):
             continue
         rel = p.relative_to(root)
         if is_excluded_path(rel):
@@ -113,6 +150,7 @@ def grep_files(pattern: str, glob: str = "**/*", limit: int = _GREP_LIMIT) -> st
     import re
 
     root = WORKSPACE_DIR
+    get_policy().check_glob(glob)
     try:
         rx = re.compile(pattern)
     except re.error as e:
@@ -120,7 +158,7 @@ def grep_files(pattern: str, glob: str = "**/*", limit: int = _GREP_LIMIT) -> st
     hits: list[str] = []
     truncated = False
     for p in root.glob(glob):
-        if not p.is_file():
+        if not p.is_file() or not get_policy().contains(p):
             continue
         rel = p.relative_to(root)
         if is_excluded_path(rel) and ".labhandler" not in rel.parts:

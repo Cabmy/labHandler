@@ -1,6 +1,9 @@
-"""任务归档存储（SQLite 事实层）。卡片 markdown 文件见 memory.retrieve。"""
+"""任务归档的 SQLite 事实层。
 
-from __future__ import annotations
+task_archive 一行一次 lab；archive_cards 挂在其上。
+卡片 markdown 与向量索引由 memory.retrieve / memory.vectors 派生；本模块不写文件。
+card_type 仅 lesson / strategy / pattern。retired_at 非空视为淘汰，读接口一律排除。
+"""
 
 import hashlib
 import os
@@ -8,13 +11,14 @@ import sqlite3
 from typing import Any
 
 from config.runtime import get_settings
+from memory.db import connect
 
-# card_type 白名单
+# card_type 仅允许这三项；其余在 create_cards 中丢弃。
 VALID_CARD_TYPES = frozenset({"lesson", "strategy", "pattern"})
 
 
 class TaskArchive:
-    """任务归档服务。"""
+    """绑定一个 memory.db 的归档读写。父目录不存在则创建。"""
 
     def __init__(self, db_path: str | None = None) -> None:
         self.db_path: str = db_path or str(get_settings().memory_db_path)
@@ -22,8 +26,8 @@ class TaskArchive:
         self._init_db()
 
     def _init_db(self) -> None:
-        """创建数据库表。"""
-        with sqlite3.connect(self.db_path) as conn:
+        """保证 task_archive 与 archive_cards 两表存在（IF NOT EXISTS）。"""
+        with connect(self.db_path) as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_archive (
@@ -57,8 +61,8 @@ class TaskArchive:
     # --- 写接口 -------------------------------------------------------
 
     def create_task(self, task_title: str, task_type: str, user_summary: str) -> int:
-        """创建任务归档条目，返回 task_id。"""
-        with sqlite3.connect(self.db_path) as conn:
+        """插入一条 task_archive，返回新 task_id。"""
+        with connect(self.db_path) as conn:
             cursor = conn.execute(
                 "INSERT INTO task_archive (task_title, task_type, user_summary) VALUES (?, ?, ?)",
                 (task_title, task_type, user_summary),
@@ -69,15 +73,14 @@ class TaskArchive:
     def create_cards(
         self, task_id: int, knowledge_cards: list[dict], task_title: str, task_type: str
     ) -> list[int]:
-        """批量写入知识卡片，返回成功写入的 card_id 列表。
+        """写入 archive_cards，返回实际插入的 card_id。
 
-        校验逻辑：
-        - card_type 不在白名单 -> 丢弃
-        - content 为空 -> 丢弃
-        - 同 task 内 card_type + content_hash 重复 -> 跳过
+        不入库：card_type 不在白名单、content 为空、
+        同 task 内 (card_type, content_hash) 已存在（UNIQUE，吞 IntegrityError）。
+        search_text 由 task_type / card_type / task_title / content 拼成。
         """
         inserted_ids: list[int] = []
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             for card in knowledge_cards:
                 card_type = str(card.get("type", "")).strip()
                 content = str(card.get("content", "")).strip()
@@ -109,8 +112,8 @@ class TaskArchive:
         return inserted_ids
 
     def mark_card_vector_error(self, card_id: int, error: str) -> None:
-        """记录卡片 Chroma 写入失败的原因。"""
-        with sqlite3.connect(self.db_path) as conn:
+        """把该卡向量索引失败原因写入 vector_error（截断 500 字）。"""
+        with connect(self.db_path) as conn:
             conn.execute(
                 "UPDATE archive_cards SET vector_error = ? WHERE id = ?",
                 (error[:500], card_id),
@@ -118,8 +121,8 @@ class TaskArchive:
             conn.commit()
 
     def clear_card_vector_error(self, card_id: int) -> None:
-        """清除卡片的 vector error 标志（供重建用）。"""
-        with sqlite3.connect(self.db_path) as conn:
+        """将该卡 vector_error 置空。"""
+        with connect(self.db_path) as conn:
             conn.execute(
                 "UPDATE archive_cards SET vector_error = NULL WHERE id = ?",
                 (card_id,),
@@ -127,11 +130,11 @@ class TaskArchive:
             conn.commit()
 
     def retire_cards(self, card_ids: list[int]) -> int:
-        """软删除卡片（/dream 治理淘汰/合并卡片）。返回实际标记数。"""
+        """把仍活跃的卡片 retired_at 置为当前时间，返回实际标记数。已淘汰的行不动。"""
         if not card_ids:
             return 0
         placeholders = ",".join("?" * len(card_ids))
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             cursor = conn.execute(
                 f"""
                 UPDATE archive_cards SET retired_at = CURRENT_TIMESTAMP
@@ -145,8 +148,8 @@ class TaskArchive:
     # --- 读接口 -------------------------------------------------------
 
     def get_cards_for_indexing(self) -> list[dict[str, Any]]:
-        """获取所有需索引的卡片（含父任务信息；排除软删除）。"""
-        with sqlite3.connect(self.db_path) as conn:
+        """全部未淘汰卡片 + 父任务字段，按 card_id 升序。供建索引。"""
+        with connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 """
@@ -161,11 +164,11 @@ class TaskArchive:
             return [dict(row) for row in cursor.fetchall()]
 
     def get_cards_by_ids(self, card_ids: list[int]) -> list[dict[str, Any]]:
-        """按 card_id 水合卡片及父任务（排除软删除）。"""
+        """按 card_id 取未淘汰卡片及父任务。返回顺序与入参中仍存在的 id 一致。"""
         if not card_ids:
             return []
         placeholders = ",".join("?" * len(card_ids))
-        with sqlite3.connect(self.db_path) as conn:
+        with connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 f"""
@@ -181,8 +184,8 @@ class TaskArchive:
             return [rows_by_id[rid] for rid in card_ids if rid in rows_by_id]
 
     def get_all_active_cards(self) -> list[dict[str, Any]]:
-        """/dream 治理的输入：所有非软删除卡片（带 card_id / 分组键 / content）。"""
-        with sqlite3.connect(self.db_path) as conn:
+        """全部未淘汰卡片（card_id / 分组键 / content），按 card_id 升序。/dream 输入。"""
+        with connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
                 """
@@ -197,13 +200,13 @@ class TaskArchive:
             return [dict(row) for row in cursor.fetchall()]
 
 
-# 模块级单例
+# 进程内唯一 TaskArchive，绑定 settings.memory_db_path。
 
 _default_archive: TaskArchive | None = None
 
 
 def get_task_archive() -> TaskArchive:
-    """获取全局 TaskArchive 实例。"""
+    """返回进程内唯一 TaskArchive。首次调用时按 settings.memory_db_path 创建。"""
     global _default_archive
     if _default_archive is None:
         _default_archive = TaskArchive()

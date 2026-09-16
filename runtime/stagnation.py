@@ -1,12 +1,14 @@
 """死循环探测：连续相同 (tool, args_hash, result_hash)。只返回信号。"""
 
-from __future__ import annotations
-
 import hashlib
 import json
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
+
+# 只用于事后诊断，不参与判重；长任务下必须有界
+_HISTORY_MAX = 50
 
 
 class StagnationSignal(str, Enum):
@@ -32,7 +34,9 @@ class StagnationTracker:
     _streak: int = 0
     _nudged: bool = False
     _grace_left: int = 0
-    history: list[tuple[str, str, str]] = field(default_factory=list)
+    history: deque[tuple[str, str, str]] = field(
+        default_factory=lambda: deque(maxlen=_HISTORY_MAX)
+    )
 
     def observe(self, tool_name: str, args: dict[str, Any] | None, result_text: str) -> StagnationSignal:
         key = (tool_name, _hash_text(_normalize_args(args)), _hash_text(result_text or ""))

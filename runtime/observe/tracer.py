@@ -1,91 +1,179 @@
-"""OTel GenAI spans。未配置 OTLP 时导出为空操作，span 仍落 JSONL。"""
+"""Tracer：真实计时 + 父子嵌套 + 贯穿一次 run 的 trace_id。
 
-from __future__ import annotations
+span 必须包住真正的操作体：事后 `with tracer.span(...): pass` 会使
+elapsed_ms 恒为 0 且丢掉因果。父子关系用 contextvars 维护；
+asyncio.create_task 会拷贝当前 context，并行 worker 挂在所在 step 的 span 下。
+Sink 自身异常被吞掉，观测失败不改变主流程。
+"""
 
-import json
+import contextvars
 import time
+import uuid
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Iterator
 
-import runtime.observe.spans as S
+from runtime.observe import spans as S
+from runtime.observe.sinks import Sink, SpanRecord
+
+_CURRENT: contextvars.ContextVar["SpanHandle | None"] = contextvars.ContextVar(
+    "labhandler_current_span", default=None
+)
+
+
+class SpanHandle:
+    """一个活跃 span。用 set/output/event 往上挂数据，结束由 Tracer 负责。"""
+
+    __slots__ = ("record", "_handles", "_tracer")
+
+    def __init__(self, record: SpanRecord, handles: list[Any], tracer: "Tracer") -> None:
+        self.record = record
+        self._handles = handles
+        self._tracer = tracer
+
+    @property
+    def trace_id(self) -> str:
+        return self.record.trace_id
+
+    @property
+    def span_id(self) -> str:
+        return self.record.span_id
+
+    def set(self, **attrs: Any) -> "SpanHandle":
+        for k, v in attrs.items():
+            if v is not None:
+                self.record.attrs[k] = v
+        return self
+
+    def output(self, value: Any) -> "SpanHandle":
+        self.record.output = value
+        return self
+
+    def event(self, name: str, **attrs: Any) -> None:
+        payload = {k: v for k, v in attrs.items() if v is not None}
+        self.record.events.append({"name": name, **payload})
+        for sink, handle in zip(self._tracer.sinks, self._handles):
+            try:
+                sink.event(self.record, handle, name, payload)
+            except Exception:
+                pass
+
+
+class _NullSpan(SpanHandle):
+    """未启用观测时的占位，保持调用点无分支。"""
+
+    def __init__(self) -> None:  # noqa: D107 - 不调用父类
+        self.record = SpanRecord(
+            name="", kind=S.KIND_SPAN, span_id="", trace_id="", parent_id=None, started_at=0.0
+        )
+        self._handles = []
+        self._tracer = None  # type: ignore[assignment]
+
+    def set(self, **attrs: Any) -> "SpanHandle":
+        return self
+
+    def output(self, value: Any) -> "SpanHandle":
+        return self
+
+    def event(self, name: str, **attrs: Any) -> None:
+        return None
+
+
+_NULL = _NullSpan()
 
 
 class Tracer:
-    def __init__(self, jsonl_path: Path | None = None, otlp_endpoint: str | None = None) -> None:
-        self.jsonl_path = jsonl_path
-        self._otel = None
-        if otlp_endpoint:
-            try:
-                from opentelemetry import trace
-                from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
-                    OTLPSpanExporter,
-                )
-                from opentelemetry.sdk.resources import Resource
-                from opentelemetry.sdk.trace import TracerProvider
-                from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    def __init__(self, sinks: list[Sink] | None = None, *, trace_id: str | None = None) -> None:
+        self.sinks = sinks or []
+        self.trace_id = trace_id or uuid.uuid4().hex
 
-                provider = TracerProvider(
-                    resource=Resource.create({"service.name": "labhandler"})
-                )
-                provider.add_span_processor(
-                    BatchSpanProcessor(OTLPSpanExporter(endpoint=otlp_endpoint))
-                )
-                trace.set_tracer_provider(provider)
-                self._otel = trace.get_tracer("labhandler")
-            except Exception:
-                self._otel = None
+    @property
+    def enabled(self) -> bool:
+        return bool(self.sinks)
 
-    def _write_jsonl(self, record: dict[str, Any]) -> None:
-        if self.jsonl_path is None:
-            return
-        try:
-            self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.jsonl_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
-        except Exception:
-            pass
+    def new_trace(self, trace_id: str | None = None) -> str:
+        """开一条新 trace（一次 lab = 一条）。"""
+        self.trace_id = trace_id or uuid.uuid4().hex
+        return self.trace_id
+
+    def current(self) -> SpanHandle | None:
+        return _CURRENT.get()
 
     @contextmanager
-    def span(self, name: str, **attrs: Any) -> Iterator[dict[str, Any]]:
-        started = time.time()
-        bag: dict[str, Any] = {"name": name, "attrs": dict(attrs)}
-        otel_cm = None
-        if self._otel is not None:
+    def span(
+        self,
+        name: str,
+        *,
+        kind: str = S.KIND_SPAN,
+        inputs: Any = None,
+        **attrs: Any,
+    ) -> Iterator[SpanHandle]:
+        """包住操作体。elapsed_ms 是真实耗时，异常会记进 span 并继续上抛。"""
+        if not self.sinks:
+            yield _NULL
+            return
+
+        parent = _CURRENT.get()
+        record = SpanRecord(
+            name=name,
+            kind=kind,
+            span_id=uuid.uuid4().hex[:16],
+            trace_id=self.trace_id,
+            parent_id=parent.span_id if parent else None,
+            started_at=time.perf_counter(),
+            attrs={S.ATTR_RUN_ID: self.trace_id, **{k: v for k, v in attrs.items() if v is not None}},
+            inputs=inputs,
+        )
+        handles = []
+        for sink in self.sinks:
             try:
-                otel_cm = self._otel.start_as_current_span(name)
-                otel_span = otel_cm.__enter__()
-                for k, v in attrs.items():
-                    if v is not None:
-                        otel_span.set_attribute(k, v if isinstance(v, (bool, int, float, str)) else str(v))
-                bag["_otel"] = otel_span
+                handles.append(sink.open(record))
             except Exception:
-                otel_cm = None
+                handles.append(None)
+
+        handle = SpanHandle(record, handles, self)
+        token = _CURRENT.set(handle)
         try:
-            yield bag
-        except Exception as e:
-            bag["error"] = f"{type(e).__name__}: {e}"
+            yield handle
+        except BaseException as e:
+            record.error = f"{type(e).__name__}: {e}"
             raise
         finally:
-            bag["elapsed_ms"] = int((time.time() - started) * 1000)
-            record = {
-                "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "name": name,
-                "elapsed_ms": bag["elapsed_ms"],
-                "attrs": bag.get("attrs") or {},
-                "error": bag.get("error"),
-            }
-            self._write_jsonl(record)
-            if otel_cm is not None:
+            _CURRENT.reset(token)
+            record.elapsed_ms = int((time.perf_counter() - record.started_at) * 1000)
+            for sink, h in zip(self.sinks, handles):
                 try:
-                    otel_cm.__exit__(None, None, None)
+                    sink.close(record, h)
                 except Exception:
                     pass
 
+    def event(self, name: str, **attrs: Any) -> None:
+        """挂在当前 span 上的点事件：重试、停滞、handoff、决策。"""
+        if not self.sinks:
+            return
+        current = _CURRENT.get()
+        if current is not None:
+            current.event(name, **attrs)
+            return
+        payload = {k: v for k, v in attrs.items() if v is not None}
+        for sink in self.sinks:
+            try:
+                sink.event(None, None, name, payload)
+            except Exception:
+                pass
 
-def bind_task_id(tracer: Tracer, task_id: str) -> None:
-    """占位：JSONL 每条 span 自己带 attrs。"""
-    _ = (tracer, task_id)
+    def flush(self) -> None:
+        for sink in self.sinks:
+            try:
+                sink.flush()
+            except Exception:
+                pass
+
+    def shutdown(self) -> None:
+        for sink in self.sinks:
+            try:
+                sink.shutdown()
+            except Exception:
+                pass
 
 
-__all__ = ["Tracer", "S", "bind_task_id"]
+__all__ = ["Tracer", "SpanHandle", "S"]

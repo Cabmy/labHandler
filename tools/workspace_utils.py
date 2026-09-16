@@ -1,7 +1,5 @@
 """共享的 workspace 文件扫描工具。"""
 
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Iterator
 

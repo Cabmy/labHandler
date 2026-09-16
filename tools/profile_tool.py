@@ -1,6 +1,8 @@
-"""profile 读写（无 langchain）。"""
+"""用户长期偏好 profile 的工具层入口。
 
-from __future__ import annotations
+read_profile / update_profile / add_profile_field 委托 memory.profile；
+本模块只暴露工具签名，不持有存储。
+"""
 
 from typing import Any
 

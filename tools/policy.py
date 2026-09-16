@@ -1,20 +1,15 @@
-"""policy - PreToolUse 安全策略层 + 工具审计。
+"""host 端工具的 PreToolUse 策略与实时审计。
 
-将 fs_tools 中 host 端工具安全检查收拢为独立的策略类，
-以分离关注点：
-- SecurityPolicy：命令白名单 / 路径逃逸正则 / workspace 路径边界
-  三道防线的唯一实现。检查失败抛 PermissionError
-  （由工具层翻译成 [ERROR/PermissionError] 观测供 ReAct
-  自纠正；危险命令永远到不了 subprocess.run）。
-- ToolAuditor：每次工具调用实时追加一行 JSONL 到
-  workspace/.labhandler/audit.jsonl（实时审计点，取代从 messages
-  事后提取轨迹）。审计失败静默——审计不能拖垮工具。
+SecurityPolicy 是 host 路径边界、host_bash 命令白名单、路径逃逸正则
+的唯一实现。检查失败抛 PermissionError；fs_tools 译成
+[ERROR/PermissionError] 观测供 ReAct 自纠正。危险命令到不了 subprocess.run。
 
-四种典型越界（/etc/passwd、../../etc、cd .. && ls、~ 展开）
-必须始终被拒绝；回归测试见 AGENTS.md 安全边界节。
+ToolAuditor 把每次调用追加一行 JSONL 到
+workspace/.labhandler/audit.jsonl。审计失败静默，不阻断工具。
+
+不变量：/etc/passwd、../../etc、cd .. && ls、~ 展开一律拒绝。
+回归见 AGENTS.md 安全边界节。
 """
-
-from __future__ import annotations
 
 import json
 import re
@@ -53,21 +48,23 @@ def _extract_cmd_names(cmd: str) -> list[str]:
 class SecurityPolicy:
     """host 端工具安全策略：路径边界 + 命令白名单 + 逃逸正则。"""
 
-    # host_bash 命令白名单：仅允许以下基础命令
-    # 原则：白名单优先，不在白名单的命令名直接拒绝；
-    # 路径逃逸模式作第二道防线（cwd=WORKSPACE_DIR 是第三道）
+    # host_bash 白名单：只放行下列基础命令；不在集合内的命令名直接拒绝。
+    # 路径逃逸正则是第二道；cwd=WORKSPACE_DIR 是第三道。
+    #
+    # bash / sh / docker 不在白名单：载荷是字符串，逃逸正则挡不住
+    # `bash -c` 里编码过的路径；docker 还能把宿主机挂进容器。
+    # 复杂 shell 走 sandbox_execute_bash（容器隔离）。
     ALLOWED_COMMANDS = frozenset({
         'pytest', 'python', 'python3', 'ls', 'mkdir', 'rm', 'cp', 'mv',
-        'cat', 'echo', 'git', 'pip', 'pip3', 'conda', 'chmod', 'touch',
-        'head', 'tail', 'wc', 'sort', 'uniq', 'diff', 'which', 'type',
-        'docker', 'ln', 'find', 'grep', 'sed', 'awk', 'tree', 'env',
-        'python2', 'pypy', 'bash', 'sh',
+        'cat', 'echo', 'git', 'pip', 'pip3', 'chmod', 'touch',
+        'head', 'tail', 'wc', 'sort', 'uniq', 'diff', 'which',
+        'ln', 'find', 'grep', 'sed', 'awk', 'tree',
     })
 
     # 路径逃逸防护（不论是否在白名单都检查）
-    # 边界字符含引号/括号/等号：拦截藏在字符串里的绝对路径
-    # （如 python -c "open('/etc/passwd')"）；不再仅依赖 "空白前缀"，
-    # 避免命令用带引号的绝对路径 / .. 穿越绕过检测。
+    # 边界字符含引号/括号/等号，以便拦截藏在字符串里的绝对路径
+    # （如 python -c "open('/etc/passwd')"）：只认空白前缀的话，
+    # 带引号的绝对路径和 .. 穿越都能绕过。
     _BOUNDARY = r"(^|[\s'\"=(])"
     ESCAPE_PATTERNS = [
         re.compile(_BOUNDARY + r"\.\.([/\\\s'\")]|$)"),  # 独立 .. token / 路径穿越（含引号、括号内）
@@ -108,6 +105,32 @@ class SecurityPolicy:
                 f"session files under .labhandler/ are Pro/harness-only; role={role!r} cannot write {p!r}"
             )
         return resolved
+
+    def check_glob(self, pattern: str) -> str:
+        """glob/grep 的 pattern 校验：必须相对 workspace，禁止 /、~、..。
+
+        glob/grep 不走 safe_path；pathlib 会展开 `../`，`root.glob('../**/*')`
+        能列出 workspace 外文件。非法 pattern 抛 PermissionError。
+        """
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise PermissionError(f"Illegal glob pattern: {pattern!r}")
+        if pattern.startswith("/") or pattern.startswith("~"):
+            raise PermissionError(
+                f"glob pattern must be relative to workspace: {pattern!r}"
+            )
+        if ".." in Path(pattern).parts:
+            raise PermissionError(
+                f"glob pattern may not traverse outside workspace: {pattern!r}"
+            )
+        return pattern
+
+    def contains(self, path: Path) -> bool:
+        """路径是否落在 workspace 内。用于过滤 glob 结果，不抛异常。"""
+        try:
+            path.resolve().relative_to(self.workspace_dir)
+        except (ValueError, OSError):
+            return False
+        return True
 
     def check_command(self, cmd: str) -> None:
         """host_bash cmd 字符串白名单预检 + 路径逃逸巡查；抛 PermissionError。"""

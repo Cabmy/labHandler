@@ -1,28 +1,21 @@
-# Citation Norm Details (essay skill reference material)
+# Citation (essay)
 
-## Direct citation (verbatim quoting)
+## Direct
 
-- Format: `"original text" — author(year)《title》` or numbered style `[1] 作者. 标题. 期刊, 年份.`
-- Single item ≤ 30 characters; beyond that switch to indirect citation (paraphrase in your own words + mark the source)
-- In-text numbers [1][2] must correspond one-to-one with reference entries
+`"original text" — author(year)《title》` or `[1] 作者. 标题. 期刊, 年份.`
+One quote ≤ 30 characters; longer → paraphrase. Numbers `[1][2]` must match the reference list.
 
-## Indirect citation (paraphrasing a viewpoint)
+## Indirect
 
-- Mark `(author, year)` at the sentence end; do not silently weave it into your own words
-- Paraphrasing must use your own sentence structure and wording, not mere synonym substitution
+Mark `(author, year)` at sentence end. Own wording, not synonym swap.
 
-## Common formats
+## Formats
 
-- GB/T 7714 (default for domestic courses): `[1] 作者. 标题[J]. 期刊名, 年份, 卷(期): 页码.`
+- GB/T 7714 (default domestic): `[1] 作者. 标题[J]. 期刊名, 年份, 卷(期): 页码.`
 - APA: `Author, A. (Year). Title. Journal, Vol(Issue), pages.`
-- Web source: title + URL + access date
-
-## Citing PDF reading materials
-
-- Call sandbox_convert_to_markdown to convert to markdown before reading
-- When citing, include the original page number (e.g. `p.42`) so the TA can verify
+- Web: title + URL + access date
+- PDF materials: convert with `sandbox_convert_to_markdown`, cite page (`p.42`)
 
 ## Forbidden
 
-- Fabricating non-existent references / DOIs
-- Citing Wikipedia as an academic argument (it may serve as a background lead; use primary sources for formal arguments)
+Fabricated references / DOIs. Wikipedia is background only, not an academic source.

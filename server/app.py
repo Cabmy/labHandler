@@ -1,7 +1,5 @@
 """labHandler Web 服务器（FastAPI + SSE）。入口：python -m server。"""
 
-from __future__ import annotations
-
 import asyncio
 import json
 import shutil
@@ -9,25 +7,28 @@ import time
 from pathlib import Path
 from typing import Any
 
-from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from sse_starlette.sse import EventSourceResponse
 
-load_dotenv(Path(__file__).resolve().parent.parent / "config" / ".env")
-
-from fastapi import FastAPI, HTTPException, UploadFile  # noqa: E402
-from fastapi.responses import FileResponse, JSONResponse  # noqa: E402
-from fastapi.staticfiles import StaticFiles  # noqa: E402
-from pydantic import BaseModel  # noqa: E402
-from sse_starlette.sse import EventSourceResponse  # noqa: E402
-
-from config.runtime import get_settings  # noqa: E402
-from runtime.persist import latest_incomplete  # noqa: E402
-from runtime.session import LabSession  # noqa: E402
-from tools.workspace_utils import iter_workspace_files  # noqa: E402
+from config.runtime import get_settings
+from runtime.persist import latest_incomplete
+from runtime.session import LabSession
+from tools.workspace_utils import iter_workspace_files
 
 WORKSPACE_DIR: Path = get_settings().workspace_dir
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 app = FastAPI(title="labHandler", docs_url=None, redoc_url=None)
+
+
+@app.on_event("shutdown")
+async def _shutdown_llm() -> None:
+    close = getattr(_session.llm, "aclose", None)
+    if close is not None:
+        await close()
 
 
 @app.middleware("http")
@@ -48,6 +49,14 @@ _event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
 def _is_running() -> bool:
     return _current_task is not None and not _current_task.done()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    """进程退出前把 span 刷出去，否则最后一段 trace 会丢在缓冲里。"""
+    _session.request_stop()
+    _session.tracer.shutdown()
+    await _session.llm.aclose()
 
 
 def _safe_workspace_path(name: str) -> Path:
@@ -94,11 +103,7 @@ async def upload_files(files: list[UploadFile]) -> dict[str, Any]:
 
 @app.get("/api/files/{name:path}")
 async def download_file(name: str) -> FileResponse:
-    resolved = (WORKSPACE_DIR / name).resolve()
-    try:
-        resolved.relative_to(WORKSPACE_DIR)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="越界路径")
+    resolved = _safe_workspace_path(name)
     if not resolved.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
     return FileResponse(resolved, filename=resolved.name)
@@ -121,7 +126,12 @@ class TaskRequest(BaseModel):
     question: str
 
 
-async def _run_lab(question: str, resume: bool = False) -> None:
+async def _run_lab(question: str) -> None:
+    """把一次 LabSession.run 写成 final/error 事件并关闭 SSE。
+
+    续跑 vs 新开由 session 是否已 attach tree 决定。
+    """
+
     async def sink(ev: dict[str, Any]) -> None:
         await _event_queue.put(ev)
 
@@ -133,12 +143,13 @@ async def _run_lab(question: str, resume: bool = False) -> None:
                 "kind": "final",
                 "verdict": result.get("verdict", "unknown"),
                 "elapsed": round(time.time() - started, 1),
-                "artifacts": _list_workspace_files(),
+                "artifacts": await asyncio.to_thread(_list_workspace_files),
             }
         )
     except Exception as e:
         await _event_queue.put({"kind": "error", "detail": f"{type(e).__name__}: {e}"})
     finally:
+        _session.tracer.flush()
         await _event_queue.put(None)
 
 
@@ -171,18 +182,19 @@ async def resume_info() -> dict[str, Any]:
 @app.post("/api/resume")
 async def resume_lab(req: ResumeRequest) -> dict[str, Any]:
     global _current_task
-    if _is_running():
-        raise HTTPException(status_code=409, detail="已有任务在运行")
-    peek = latest_incomplete(WORKSPACE_DIR)
-    if not peek:
-        raise HTTPException(status_code=404, detail="没有未完成的 lab")
-    tid, tree = peek
-    if not req.continue_lab:
-        return await asyncio.to_thread(_session.decline_resume)
-    _session.attach_resume(tid, tree)
-    while not _event_queue.empty():
-        _event_queue.get_nowait()
-    _current_task = asyncio.create_task(_run_lab(req.question, resume=True))
+    async with _task_lock:
+        if _is_running():
+            raise HTTPException(status_code=409, detail="已有任务在运行")
+        peek = await asyncio.to_thread(latest_incomplete, WORKSPACE_DIR)
+        if not peek:
+            raise HTTPException(status_code=404, detail="没有未完成的 lab")
+        tid, tree = peek
+        if not req.continue_lab:
+            return await asyncio.to_thread(_session.decline_resume)
+        _session.attach_resume(tid, tree)
+        while not _event_queue.empty():
+            _event_queue.get_nowait()
+        _current_task = asyncio.create_task(_run_lab(req.question))
     return {"accepted": True, "thread_id": tid, "resumed": True}
 
 
@@ -360,7 +372,7 @@ async def done() -> dict[str, Any]:
     from memory.retrieve import index_card_ids
 
     cards = (_session.last_result or {}).get("knowledge_cards") or []
-    # 先异步索引卡片，再走同步复位
+    # 卡片先入档并向量索引，再 _session.done 复位；反序会丢掉未索引卡片。
     archive_extra: dict[str, Any] = {}
     if cards:
         from memory.archive import get_task_archive
@@ -374,7 +386,7 @@ async def done() -> dict[str, Any]:
             archive_extra = await index_card_ids(card_ids, _session.llm, _session.settings)
             archive_extra["task_id"] = task_id
             archive_extra["card_ids"] = card_ids
-            _session.last_result["knowledge_cards"] = []  # 避免 done() 再归档一遍
+            _session.last_result["knowledge_cards"] = []  # 已入档，清空以免 _session.done 二次归档
     result = await asyncio.to_thread(_session.done, lambda m: None)
     if archive_extra:
         result["archive"] = {**(result.get("archive") or {}), **archive_extra}
