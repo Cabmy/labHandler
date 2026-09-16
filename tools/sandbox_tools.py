@@ -110,7 +110,16 @@ async def call_sandbox(tool_name: str, **kwargs: Any) -> str:
     return text
 
 
+_CONVERTIBLE = {".pdf", ".docx", ".pptx", ".doc", ".ppt"}
+
+
 async def sandbox_convert_to_markdown(file_path: str) -> str:
+    suffix = Path(file_path).suffix.lower()
+    if suffix not in _CONVERTIBLE:
+        return (
+            f"[ERROR/Validation] sandbox_convert_to_markdown is for PDF/DOCX/PPT, "
+            f"not {suffix or 'this path'}"
+        )
     container_path = _translate_path(file_path)
     if not container_path.startswith(("file://", "http://", "https://", "data:")):
         container_path = f"file://{container_path}"

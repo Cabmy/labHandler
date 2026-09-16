@@ -1,8 +1,8 @@
 """SPEC 模型：ProjectSpec（总纲）与 Assignment（单份 Flash 任务书）。
 
-SPEC.md 由 Pro 维护，是后续每一步派发的共同依据。一份 Assignment 自包含，
-且 domain 在同一次派发内互不重叠。一次派发最多 MAX_ASSIGNMENTS 个 Flash；
-多于 1 个时全部降只读。
+SPEC.md 由 Pro 维护，是后续每一步派发的共同依据。里程碑是交给 Flash 的产品
+步骤，不是 Pro 自己的阅读/写门禁日程。一份 Assignment 自包含，且 domain 在
+同一次派发内互不重叠。一次派发最多 MAX_ASSIGNMENTS 个 Flash；多于 1 个时全部降只读。
 """
 
 import json
@@ -100,7 +100,7 @@ class ProjectSpec:
             ]
         parts += _section("交付物", self.deliverables)
         parts += _section("全局约束", self.constraints)
-        parts += _section("里程碑（自顶向下的推进顺序）", self.milestones)
+        parts += _section("里程碑（交给 Flash 的产品步骤）", self.milestones)
         if self.acceptance_strategy:
             parts += ["", "## 验收策略", self.acceptance_strategy]
         return "\n".join(parts).strip() + "\n"
@@ -256,6 +256,7 @@ def render_assignment(
             "## 验收方式",
             f"本步有可量化指标，测试已预先写好（{files}）。{assignment.acceptance_intent}",
             "你提交 brief 后 harness 会自动在沙箱里跑这些测试，结果不由你填写。",
+            "不要写 test_*.py，不要加 __main__ / _self_test 当单元测试，除非「预期产物」里点名了那个文件。",
         ]
     else:
         parts += [

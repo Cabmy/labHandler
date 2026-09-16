@@ -27,5 +27,5 @@ def test_search(arr, target, expect):
     assert binary_search(arr, target) == expect
 ```
 
-Run with `sandbox_execute_bash`: `pytest test_<name>.py -v`.
-Write the gate through `write_acceptance` against SPEC interfaces. Partial pass is fail, not done.
+Run with the harness gate (`write_acceptance`), not a workspace `test_*.py` and not
+`sandbox_execute_code`. Partial pass is fail, not done.

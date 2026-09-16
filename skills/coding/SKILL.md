@@ -1,10 +1,11 @@
 ---
 name: coding
 description: |
-  Runnable code plus tests. Artifacts: source files and test_*.py.
+  Primary deliverable is runnable source (functions, scripts, CLIs).
+  The harness gate is Pro write_acceptance, not a worker writing test_*.py.
 when_to_use: |
-  The work needs a program (实现 / 写代码 / 编程, algorithms, scripts).
-  Not this: experiment + lab report → lab_report; pure argumentation → essay.
+  Primary artifact is code: 实现 / 编程 / 力扣 / 算法 / 脚本.
+  Not this: the graded hand-in is an 实验报告 → lab_report; 论文/论述 → essay.
 ---
 
 # Coding SOP
@@ -20,13 +21,22 @@ For Pro: plan, dispatch, and judge coding work. Flash never sees this file — p
 
 ## Dispatch
 
-Slice so one Flash finishes one assignment: read constraints → implement one unit → run tests.
-A whole homework in one assignment will be half-done and marked success.
+One problem or one shippable file = one assignment. A single-function homework is one
+milestone and one dispatch — do not slice it into design / implement / edge cases / polish.
+Split only at independent problems or files; a whole multi-question set in one assignment
+will be half-done. Do not dispatch Flash to read MATERIALS.md — put constraints in the
+assignment.
 
 Each assignment must be self-contained: exact names, paths, forbidden libraries, boundary behavior.
-If testable, declare `interfaces` and write acceptance via `write_acceptance`.
+If testable, declare `interfaces` and write acceptance via `write_acceptance`
+(`task_id` = that assignment `id`).
 
 ## Tests
+
+作业材料里的「单元测试 / 样例 / 能跑通 / 自写测试」是你的 `write_acceptance` 门禁，不是 Flash
+任务。不要把写测试派成第二个 worker，不要把「提供单元测试」写进 step_goal。
+Only if the graded hand-in names a workspace `test_*.py` may Flash write that path;
+you still write the gate.
 
 Write a gate only when the target is quantifiable and the artifact can be checked by code.
 Otherwise `testable=false` — a missing gate is honest.

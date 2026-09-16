@@ -32,9 +32,9 @@ def _denied(tool_name: str, args: dict, e: PermissionError) -> str:
     return _perm_msg(e)
 
 
-def read_file(path: str, offset: int = 1, limit: int | None = None) -> str:
+def read_file(path: str, offset: int = 1, limit: int | None = None, role: str = "readonly") -> str:
     try:
-        p = get_policy().safe_path(path)
+        p = get_policy().check_read(path, role)
     except PermissionError as e:
         return _denied("read_file", {"path": path}, e)
     if not p.exists():
@@ -79,7 +79,22 @@ def read_file(path: str, offset: int = 1, limit: int | None = None) -> str:
     return chunk
 
 
+def _gate_via_write_file(path: str) -> str | None:
+    """workspace/acceptance/ 不是门禁目录；门禁必须走 write_acceptance。"""
+    rel = path.replace("\\", "/").lstrip("./")
+    if rel == "acceptance" or rel.startswith("acceptance/"):
+        return (
+            f"[ERROR/PermissionError] {path!r} is not the harness gate. "
+            "Call write_acceptance(task_id, filename, content)."
+        )
+    return None
+
+
 def write_file(path: str, content: str, role: str = "write") -> str:
+    blocked = _gate_via_write_file(path)
+    if blocked:
+        get_auditor().record("write_file", {"path": path}, "denied:workspace_acceptance")
+        return blocked
     try:
         p = get_policy().check_write(path, role)
     except PermissionError as e:
@@ -90,9 +105,9 @@ def write_file(path: str, content: str, role: str = "write") -> str:
     return f"wrote {len(content)} chars to {p.relative_to(WORKSPACE_DIR)}"
 
 
-def list_dir(path: str = ".") -> list[str] | str:
+def list_dir(path: str = ".", role: str = "readonly") -> list[str] | str:
     try:
-        p = get_policy().safe_path(path)
+        p = get_policy().check_read(path, role)
     except PermissionError as e:
         return _denied("list_dir", {"path": path}, e)
     if not p.exists():
@@ -102,13 +117,26 @@ def list_dir(path: str = ".") -> list[str] | str:
         get_auditor().record("list_dir", {"path": path}, "error:NotADirectoryError")
         raise NotADirectoryError(f"Not a directory: {path}")
     get_auditor().record("list_dir", {"path": path}, "ok")
-    names = sorted(x.name for x in p.iterdir())
+    rel = p.relative_to(WORKSPACE_DIR)
+    inside_dot = bool(rel.parts) and any(
+        part.startswith(".") or part == "__pycache__" for part in rel.parts
+    )
+    names = sorted(
+        x.name
+        for x in p.iterdir()
+        if (inside_dot or not (x.name.startswith(".") or x.name == "__pycache__"))
+        and not get_policy().is_control_file(x)
+    )
     if len(names) > _GLOB_LIMIT:
         return names[:_GLOB_LIMIT] + [f"[truncated {len(names) - _GLOB_LIMIT} entries]"]
     return names
 
 
 def patch_file(path: str, old: str, new: str, role: str = "write") -> str:
+    blocked = _gate_via_write_file(path)
+    if blocked:
+        get_auditor().record("patch_file", {"path": path}, "denied:workspace_acceptance")
+        return blocked
     try:
         p = get_policy().check_write(path, role)
     except PermissionError as e:
@@ -161,7 +189,7 @@ def grep_files(pattern: str, glob: str = "**/*", limit: int = _GREP_LIMIT) -> st
         if not p.is_file() or not get_policy().contains(p):
             continue
         rel = p.relative_to(root)
-        if is_excluded_path(rel) and ".labhandler" not in rel.parts:
+        if is_excluded_path(rel):
             continue
         try:
             text = p.read_text(encoding="utf-8", errors="replace")

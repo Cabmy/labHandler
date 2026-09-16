@@ -2,6 +2,10 @@
 
 瞬时失败分类后原样返回 ChatResult.error_class；退避与放弃由 control.decide
 按 Task 剩余步数和墙钟决定。本层 max_retries=0。
+
+熔断与 sandbox_tools 同构：连续瞬时失败到 llm_breaker_max 就升级成 FATAL。
+control.decide 见 FATAL 直接停——网关本身挂了的时候，换工具换思路的 nudge
+是无效的，只会把 step_budget 和退避睡眠白烧完。
 """
 
 import asyncio
@@ -14,7 +18,7 @@ from openai import AsyncOpenAI
 from config.runtime import RuntimeSettings
 from runtime.errors import ErrorClass, classify
 from runtime.observe import spans as S
-from runtime.observe.tracer import Tracer
+from runtime.observe.tracer import Tracer, as_tracer
 
 
 @dataclass
@@ -45,7 +49,8 @@ class LLMGateway:
     ) -> None:
         self.settings = settings
         self._sem = asyncio.Semaphore(settings.llm_max_concurrency)
-        self.tracer = tracer
+        self._consecutive_fail = 0
+        self.tracer = as_tracer(tracer)
         self.chat_client = chat_client or AsyncOpenAI(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
@@ -98,18 +103,11 @@ class LLMGateway:
         on_delta: Callable[[str, bool], Awaitable[None]] | None = None,
         span_name: str = S.LLM,
     ) -> ChatResult:
-        tracer = self.tracer
-        span_cm = (
-            tracer.span(
-                span_name,
-                kind=S.KIND_GENERATION,
-                **{S.ATTR_MODEL: model, "messages": len(messages)},
-            )
-            if tracer is not None
-            else None
-        )
-        span = span_cm.__enter__() if span_cm is not None else None
-        try:
+        with self.tracer.span(
+            span_name,
+            kind=S.KIND_GENERATION,
+            **{S.ATTR_MODEL: model, "messages": len(messages)},
+        ) as span:
             try:
                 result = await self._openai_chat(
                     model=model,
@@ -128,27 +126,42 @@ class LLMGateway:
                     usage={},
                     error_class=classify(e),
                 )
-            if span is not None:
-                span.set(
-                    **{
-                        S.ATTR_TOKENS_IN: result.usage.get("input_tokens", 0),
-                        S.ATTR_TOKENS_OUT: result.usage.get("output_tokens", 0),
-                        S.ATTR_TOKENS_REASONING: result.usage.get("reasoning_tokens", 0),
-                        S.ATTR_FINISH_REASON: result.finish_reason,
-                        S.ATTR_ERROR_CLASS: result.error_class.value,
-                    }
-                )
-                span.output(
-                    {
-                        "tool_calls": [tc.get("name") for tc in result.tool_calls],
-                        "content_chars": len(result.content),
-                        "truncated": result.truncated,
-                    }
-                )
+            result.error_class = self._breaker(result.error_class)
+            span.set(
+                **{
+                    S.ATTR_TOKENS_IN: result.usage.get("input_tokens", 0),
+                    S.ATTR_TOKENS_OUT: result.usage.get("output_tokens", 0),
+                    S.ATTR_TOKENS_REASONING: result.usage.get("reasoning_tokens", 0),
+                    S.ATTR_FINISH_REASON: result.finish_reason,
+                    S.ATTR_ERROR_CLASS: result.error_class.value,
+                }
+            )
+            span.output(
+                {
+                    "tool_calls": [tc.get("name") for tc in result.tool_calls],
+                    "content_chars": len(result.content),
+                    "truncated": result.truncated,
+                }
+            )
             return result
-        finally:
-            if span_cm is not None:
-                span_cm.__exit__(None, None, None)
+
+    def _breaker(self, error_class: ErrorClass) -> ErrorClass:
+        """网关级熔断：连续瞬时失败到上限就升级成 FATAL，让 decide 直接停。
+
+        计数跨 Task，因为网关是所有 Task 共用的资源；一次成功就清零。
+        """
+        if error_class is not ErrorClass.TRANSIENT:
+            if error_class is ErrorClass.OK:
+                self._consecutive_fail = 0
+            return error_class
+        self._consecutive_fail += 1
+        if self._consecutive_fail < self.settings.llm_breaker_max:
+            return error_class
+        self.tracer.event(
+            S.GUARDRAIL,
+            **{S.ATTR_REASON: f"llm gateway failed {self._consecutive_fail} times in a row"},
+        )
+        return ErrorClass.FATAL
 
     async def _openai_chat(
         self,

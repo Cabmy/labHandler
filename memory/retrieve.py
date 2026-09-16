@@ -11,6 +11,7 @@ from typing import Any
 from config.runtime import RuntimeSettings, get_settings
 from memory.archive import get_task_archive
 from memory.vectors import VectorIndex, content_sha256
+from tools.policy import get_policy
 
 
 def _cards_dir(settings: RuntimeSettings | None = None) -> Path:
@@ -174,7 +175,7 @@ def memory_grep(
         if not root.exists():
             continue
         for p in root.rglob("*"):
-            if not p.is_file():
+            if not p.is_file() or get_policy().is_control_file(p):
                 continue
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
@@ -204,6 +205,8 @@ def memory_read(path: str, settings: RuntimeSettings | None = None) -> str:
             except ValueError:
                 continue
             if p.is_file():
+                if get_policy().is_control_file(p):
+                    return f"[ERROR/PermissionError] harness control file is not readable: {path}"
                 return p.read_text(encoding="utf-8", errors="replace")[:80_000]
         return f"[ERROR/FileNotFoundError] {path}"
     resolved = candidate.resolve()
@@ -212,6 +215,8 @@ def memory_read(path: str, settings: RuntimeSettings | None = None) -> str:
         return f"[ERROR/PermissionError] path not allowed: {path}"
     if not resolved.is_file():
         return f"[ERROR/FileNotFoundError] {path}"
+    if get_policy().is_control_file(resolved):
+        return f"[ERROR/PermissionError] harness control file is not readable: {path}"
     return resolved.read_text(encoding="utf-8", errors="replace")[:80_000]
 
 

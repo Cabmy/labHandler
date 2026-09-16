@@ -58,7 +58,8 @@ async def run_wave(
         while pending:
             _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             if any(
-                (results.get(w.task_id) or {}).get("outcome") == "spec_invalid" for w in workers
+                (results.get(w.task_id) or {}).get("outcome") in {"spec_invalid", "halt"}
+                for w in workers
             ):
                 for t in pending:
                     t.cancel()
@@ -87,7 +88,7 @@ async def run_wave(
         if brief is None:
             brief = synthetic_brief(
                 outcome="failed",
-                brief="Sibling workers were cancelled after spec_invalid.",
+                brief="Sibling workers were cancelled after spec_invalid or halt.",
             )
             if w.status is TaskStatus.RUNNING:
                 try:

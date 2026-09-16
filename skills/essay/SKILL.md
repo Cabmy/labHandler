@@ -19,13 +19,13 @@ Extract word-count range, required sections, stance (neutral vs take a side), ci
 
 ## Dispatch
 
-Outline before prose. Typical sequence (one Flash each, not parallel writers):
-1. outline (intro / arguments / optional rebuttal / conclusion / references)
-2. draft the body
-3. citations + self-check
+A short essay is one milestone and one assignment. Only split a long paper (outline then
+draft) when one worker would half-finish it. Do not make citations or self-check their own
+milestones.
 
 Do not split one essay across parallel workers. The assignment's `spec` must include
-word-count, stance, section list, and citation rules — Flash cannot see SPEC.md's rationale.
+word-count, stance, section list, and citation rules — Flash's conversation is empty;
+copy those facts in even though it also gets a SPEC.md snapshot.
 
 ## Writing
 

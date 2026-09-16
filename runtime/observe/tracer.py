@@ -176,4 +176,16 @@ class Tracer:
                 pass
 
 
-__all__ = ["Tracer", "SpanHandle", "S"]
+NULL_TRACER = Tracer([])
+"""未启用观测时的 Tracer：span 让出 _NULL，event / flush / shutdown 都是空操作。
+
+调用点因此永远可以直接 `with tracer.span(...) as span:`，不必写 None 分支，
+也不必手工 __enter__ / __exit__。可选参数在入口用 as_tracer 归一。
+"""
+
+
+def as_tracer(tracer: Tracer | None) -> Tracer:
+    return tracer if tracer is not None else NULL_TRACER
+
+
+__all__ = ["Tracer", "SpanHandle", "NULL_TRACER", "as_tracer", "S"]

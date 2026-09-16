@@ -5,6 +5,7 @@ history 里 tool 消息仍按模型给出的顺序回填；并行只发生在相
 """
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, TypeVar
@@ -16,6 +17,7 @@ from runtime.loop.registry import ToolContext, ToolRegistry
 from runtime.loop.schema import (
     SUBMIT_BRIEF,
     SUBMIT_DISPATCH,
+    SUBMIT_HALT,
     SUBMIT_JUDGE,
     SUBMIT_REMEMBER,
     SUBMIT_SPEC,
@@ -31,6 +33,7 @@ _SUBMIT = {
     SUBMIT_JUDGE,
     SUBMIT_REMEMBER,
     SUBMIT_SUMMARY,
+    SUBMIT_HALT,
 }
 
 T = TypeVar("T")
@@ -157,18 +160,19 @@ async def _one(
 ) -> CallResult:
     name = tc["name"]
     call_id = tc["id"]
-    await emit("tool", node=node, name=name, args=tc["arguments"][:200], result="")
 
     parsed, perr = parse_args(tc["arguments"])
     if parsed is None:
         validation_streak[name] = validation_streak.get(name, 0) + 1
-        return CallResult(
+        result = CallResult(
             name, call_id, None, VALIDATION_TOOL_RESULT.format(err=perr), ErrorClass.VALIDATION
         )
-
-    if name in _SUBMIT:
-        if name != submit_tool:
-            return CallResult(
+    elif name in _SUBMIT:
+        allowed = name == submit_tool or (
+            name == SUBMIT_HALT and SUBMIT_HALT in registry.names()
+        )
+        if not allowed:
+            result = CallResult(
                 name,
                 call_id,
                 parsed,
@@ -177,28 +181,33 @@ async def _one(
                 ),
                 ErrorClass.VALIDATION,
             )
-        degraded = validation_streak.get(name, 0) >= settings.validation_retry_max
-        err = validate_payload(name, parsed, degraded=degraded)
-        if err:
-            validation_streak[name] = validation_streak.get(name, 0) + 1
-            return CallResult(
-                name, call_id, parsed, VALIDATION_TOOL_RESULT.format(err=err), ErrorClass.VALIDATION
-            )
-        validation_streak[name] = 0
-        return CallResult(
-            name, call_id, parsed, "ok", ErrorClass.OK, submit_name=name, submit_payload=parsed
+        else:
+            degraded = validation_streak.get(name, 0) >= settings.validation_retry_max
+            err = validate_payload(name, parsed, degraded=degraded)
+            if err:
+                validation_streak[name] = validation_streak.get(name, 0) + 1
+                result = CallResult(
+                    name, call_id, parsed, VALIDATION_TOOL_RESULT.format(err=err), ErrorClass.VALIDATION
+                )
+            else:
+                validation_streak[name] = 0
+                result = CallResult(
+                    name, call_id, parsed, "ok", ErrorClass.OK, submit_name=name, submit_payload=parsed
+                )
+    else:
+        local = replace(ctx, extras={**ctx.extras, "tool_call_id": call_id})
+        outcome = await registry.execute(
+            name, parsed, local, timeout=settings.tool_timeout_s, tracer=tracer
         )
+        result = CallResult(name, call_id, parsed, outcome.text, outcome.error_class, ran=True)
 
-    local = replace(ctx, extras={**ctx.extras, "tool_call_id": call_id})
-    outcome = await registry.execute(
-        name, parsed, local, timeout=settings.tool_timeout_s, tracer=tracer
-    )
+    shown = json.dumps(parsed, ensure_ascii=False)[:200] if parsed is not None else tc["arguments"][:200]
     await emit(
         "tool",
         node=node,
         name=name,
-        args=str(parsed)[:200],
-        result=outcome.text[:200],
-        error_class=outcome.error_class.value,
+        args=shown,
+        result=result.text[:200],
+        error_class=result.error.value,
     )
-    return CallResult(name, call_id, parsed, outcome.text, outcome.error_class, ran=True)
+    return result

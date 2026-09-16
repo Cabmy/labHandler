@@ -117,6 +117,7 @@ class RuntimeSettings:
     tool_timeout_s: float
     transient_retry_max: int
     validation_retry_max: int
+    llm_breaker_max: int
     stagnation_repeat_threshold: int
     stagnation_grace_steps: int
     consecutive_logic_failure_max: int
@@ -197,6 +198,7 @@ def get_settings() -> RuntimeSettings:
         tool_timeout_s=_env_float("TOOL_TIMEOUT_S", 120.0, minimum=1.0),
         transient_retry_max=_env_int("TRANSIENT_RETRY_MAX", 3, minimum=1),
         validation_retry_max=_env_int("VALIDATION_RETRY_MAX", 3, minimum=1),
+        llm_breaker_max=_env_int("LLM_BREAKER_MAX", 6, minimum=1),
         stagnation_repeat_threshold=_env_int("STAGNATION_REPEAT_THRESHOLD", 3, minimum=2),
         stagnation_grace_steps=_env_int("STAGNATION_GRACE_STEPS", 2, minimum=0),
         consecutive_logic_failure_max=_env_int("CONSECUTIVE_LOGIC_FAILURE_MAX", 3, minimum=1),

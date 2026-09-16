@@ -1,6 +1,7 @@
-"""submit_* 参数解析、schema 校验、oneshot 交卷。"""
+"""参数解析、类型提示、schema 校验、oneshot 交卷。"""
 
 import json
+import re
 from typing import Any
 
 import jsonschema
@@ -37,25 +38,107 @@ def parse_args(raw: str) -> tuple[dict[str, Any] | None, str]:
         return None, f"invalid json: {e}"
     if not isinstance(data, dict):
         return None, "arguments must be a JSON object"
-    return _coerce_nested_json(data), ""
+    return data, ""
 
 
-def _coerce_nested_json(data: dict[str, Any]) -> dict[str, Any]:
-    """部分模型会把 assignments 等数组字段再 JSON 编码成字符串。能解成 list/dict 就解开。"""
-    out = dict(data)
-    for key, value in data.items():
-        if not isinstance(value, str):
+def json_type_name(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    if value is None:
+        return "null"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return type(value).__name__
+
+
+# 正文类 string：模型常把换行拆成 array。标识类 string：必须是单个 token。
+_ID_STRING_FIELDS = {
+    "task_id": "two_sum",
+    "id": "two_sum",
+    "filename": "test_two_sum.py",
+    "path": "two_sum.py",
+    "domain": "coding",
+    "decision": "continue",
+    "outcome": "done",
+    "name": "two_sum",
+    "kind": "function",
+    "type": "lesson",
+    "action": "write",
+    "file": "SKILL.md",
+}
+
+
+def type_hint(path: str, expected: Any, raw: Any) -> str:
+    """类型对不上时给一句可执行的改法，不改入参。"""
+    want = expected[0] if isinstance(expected, list) and len(expected) == 1 else expected
+    leaf = path.rsplit(".", 1)[-1]
+    if want == "string" and isinstance(raw, list):
+        example = _ID_STRING_FIELDS.get(leaf)
+        if example is not None:
+            return f'{path} must be one string like {example!r}, not an array'
+        return (
+            f'{path} must be one string, not an array; join lines with \\n '
+            f'(example: "{leaf}": "line1\\nline2")'
+        )
+    if want == "string" and isinstance(raw, dict):
+        example = _ID_STRING_FIELDS.get(leaf)
+        if example is not None:
+            return f'{path} must be one string like {example!r}, not an object'
+        keys = ", ".join(str(k) for k in list(raw.keys())[:8])
+        extra = f" flatten fields ({keys}) into a paragraph;" if keys else ""
+        return (
+            f'{path} must be one string, not an object;{extra} '
+            f'example: "{leaf}": "encode the 3 samples as pytest via write_acceptance"'
+        )
+    if want == "array" and isinstance(raw, str):
+        return f'{path} must be a JSON array, not a string; pass [...] not a quoted "[...]"'
+    if want == "object" and isinstance(raw, str):
+        return f'{path} must be a JSON object, not a string; pass {{...}} not a quoted "{{...}}"'
+    return f'{path} must be {want}, got {json_type_name(raw)}'
+
+
+def schema_error_hint(err: jsonschema.ValidationError) -> str:
+    path = ".".join(str(p) for p in err.absolute_path) or "payload"
+    if err.validator == "type":
+        return type_hint(path, err.validator_value, err.instance)
+    extra = {
+        "enum": f"{path} must be one of {err.validator_value}",
+        "minLength": f"{path} is too short (min {err.validator_value})",
+        "minItems": f"{path} needs at least {err.validator_value} item(s)",
+    }
+    return extra.get(err.validator) or err.message or "schema validation failed"
+
+
+def check_args(schema: dict[str, Any], args: dict[str, Any]) -> str:
+    """普通工具：required + 类型提示，不拦截额外字段。integer 字符串仍可转成 int。"""
+    miss = [
+        k
+        for k in (schema.get("required") or [])
+        if (v := args.get(k)) is None or (isinstance(v, str) and not v.strip())
+    ]
+    if miss:
+        return f"[ERROR/Validation] missing {', '.join(miss)}"
+    for key, spec in (schema.get("properties") or {}).items():
+        if not isinstance(spec, dict):
             continue
-        stripped = value.lstrip()
-        if not stripped[:1] in "[{":
+        raw = args.get(key)
+        if raw in (None, ""):
             continue
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, (list, dict)):
-            out[key] = parsed
-    return out
+        t = spec.get("type")
+        if t == "integer":
+            try:
+                args[key] = int(raw)
+            except (TypeError, ValueError):
+                return f"[ERROR/Validation] {type_hint(key, 'integer', raw)}"
+        elif t == "string" and not isinstance(raw, str):
+            return f"[ERROR/Validation] {type_hint(key, 'string', raw)}"
+    return ""
 
 
 def validate_payload(name: str, payload: dict[str, Any], *, degraded: bool = False) -> str:
@@ -65,7 +148,7 @@ def validate_payload(name: str, payload: dict[str, Any], *, degraded: bool = Fal
     try:
         jsonschema.validate(payload, schema)
     except jsonschema.ValidationError as e:
-        return e.message
+        return schema_error_hint(e)
     if name == SUBMIT_JUDGE:
         evidence = str(payload.get("evidence") or "")
         if "no_hard_criteria" in evidence.lower() and len(evidence) < 24:
@@ -80,7 +163,7 @@ def validate_payload(name: str, payload: dict[str, Any], *, degraded: bool = Fal
 
 
 def _validate_dispatch(payload: dict[str, Any]) -> str:
-    """派发自洽性：id 唯一、领域不重叠、可测的必须给接口契约。"""
+    """派发自洽性：写任务单独成波、测试不交给 Flash、id/领域不重叠、可测要有接口。"""
     assignments = payload.get("assignments") or []
     if len(assignments) > MAX_ASSIGNMENTS:
         return f"at most {MAX_ASSIGNMENTS} assignments per dispatch; split into more steps"
@@ -89,14 +172,32 @@ def _validate_dispatch(payload: dict[str, Any]) -> str:
     if len(set(ids)) != len(ids):
         return "assignment id must be unique within a dispatch"
 
+    rows = [a for a in assignments if isinstance(a, dict)]
+    testable_n = sum(1 for a in rows if a.get("testable"))
+    if testable_n and len(assignments) > 1:
+        return (
+            "a testable assignment must be the only Flash this wave (1 worker = write). "
+            "Tests are write_acceptance(task_id=that assignment id), not a second Flash. "
+            "Other product files go in later steps."
+        )
+
+    flash_tests = _dispatch_asks_flash_for_tests(payload)
+    if flash_tests:
+        return flash_tests
+
+    gate_job = _dispatch_touches_gate(payload)
+    if gate_job:
+        return gate_job
+
     domains = [str(a.get("domain") or "").strip().lower() for a in assignments]
     if len(assignments) > 1 and len(set(domains)) != len(domains):
         return (
-            "parallel assignments must own disjoint domains; "
-            "give each worker a distinct domain or dispatch them in separate steps"
+            "parallel assignments must own disjoint domains and must all be readonly. "
+            "A product write is one assignment this wave; tests are write_acceptance, "
+            "not another Flash. If you meant one product, send one assignment."
         )
 
-    for assignment in assignments:
+    for assignment in rows:
         aid = str(assignment.get("id") or "")
         if assignment.get("testable") and not (
             assignment.get("interfaces") or assignment.get("acceptance_files")
@@ -105,7 +206,93 @@ def _validate_dispatch(payload: dict[str, Any]) -> str:
                 f"assignment {aid!r} is testable but declares no interfaces; "
                 "acceptance code needs exact names to import and call"
             )
+        if _verify_only(assignment):
+            return (
+                f"assignment {aid!r} only runs tests; the harness gate does that after Flash submits. "
+                "If SPEC is done, submit_dispatch with empty assignments. "
+                "If a gate is missing, set testable=true and write_acceptance in this dispatch."
+            )
     return ""
+
+
+_VERIFY_ONLY = re.compile(
+    r"(运行.{0,8}测试|跑.{0,8}测试|跑一遍|验证通过|run tests|run pytest|verify all|unittest discover)",
+    re.I,
+)
+_FLASH_TEST_JOB = re.compile(
+    r"(写(单元)?测试|提供单元测试|编写(单元)?测试|补(充|上)(单元)?测试|"
+    r"添加(单元)?测试|自写(单元)?测试|"
+    r"write (?:the )?(?:unit )?tests?|add (?:unit )?tests?|provide (?:unit )?tests?)",
+    re.I,
+)
+_ACCEPT_WORKER_ID = re.compile(r"(?:^|[-_])(accept|acceptance|tests?|unittest)$", re.I)
+_TEST_PRODUCT = re.compile(r"(?:^|/)test_[^/]+\.py$")
+_GATE_JOB = re.compile(
+    r"(acceptance test|acceptance file|the gate|pytest gate|门禁|验收(测试|文件|用例)|"
+    r"acceptance/)",
+    re.I,
+)
+
+
+def _dispatch_touches_gate(payload: dict[str, Any]) -> str:
+    """门禁是 Pro 自己的活：不准把「修/改验收测试」写进 step_goal 或 assignment。"""
+    rows = [a for a in (payload.get("assignments") or []) if isinstance(a, dict)]
+    blob = " ".join(
+        [str(payload.get("step_goal") or "")]
+        + [f"{a.get('goal')} {a.get('spec')}" for a in rows]
+    )
+    if not _GATE_JOB.search(blob):
+        return ""
+    return (
+        "The gate belongs to you, not to Flash: no dispatch may mention fixing, updating or "
+        "passing the acceptance tests. Call write_acceptance(task_id=<product assignment id>) "
+        "yourself, and describe the assignment purely as product work. If the product is done "
+        "and only the gate is broken, submit_dispatch with the same product id and no gate talk, "
+        "or with empty assignments."
+    )
+
+
+def _named_test_product(assignment: dict[str, Any]) -> bool:
+    """作业把 workspace 的 test_*.py 点名为交付物时，Flash 才可以写那个文件。"""
+    arts = assignment.get("expected_artifacts") or []
+    if not isinstance(arts, list):
+        return False
+    return any(_TEST_PRODUCT.search(str(p).strip()) for p in arts)
+
+
+def _dispatch_asks_flash_for_tests(payload: dict[str, Any]) -> str:
+    """作业没点名 test 文件时，禁止把写/提供测试派给 Flash。"""
+    rows = [a for a in (payload.get("assignments") or []) if isinstance(a, dict)]
+    if any(_named_test_product(a) for a in rows):
+        return ""
+    for assignment in rows:
+        aid = str(assignment.get("id") or "")
+        if _ACCEPT_WORKER_ID.search(aid):
+            return (
+                f"assignment {aid!r} looks like a tests worker. "
+                "Tests are write_acceptance(task_id=<product assignment id>), not a Flash. "
+                "Dispatch one product worker (e.g. two_sum.py)."
+            )
+    blob = " ".join(
+        [str(payload.get("step_goal") or "")]
+        + [f"{a.get('id')} {a.get('goal')} {a.get('spec')}" for a in rows]
+    )
+    if not _FLASH_TEST_JOB.search(blob):
+        return ""
+    return (
+        "Do not dispatch Flash to write or provide unit tests. "
+        "Call write_acceptance(task_id=<assignment id>, filename=\"test_foo.py\", "
+        "content=<one python string>) then dispatch Flash only for the product file. "
+        "step_goal / goal must not say 提供单元测试 unless expected_artifacts names a "
+        "test_*.py to hand in."
+    )
+
+
+def _verify_only(assignment: dict[str, Any]) -> bool:
+    if assignment.get("testable") or assignment.get("expected_artifacts") or assignment.get("interfaces"):
+        return False
+    blob = f"{assignment.get('goal') or ''} {assignment.get('spec') or ''}"
+    return bool(_VERIFY_ONLY.search(blob))
 
 
 def _clip(text: str, limit: int) -> str:

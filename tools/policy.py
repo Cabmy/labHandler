@@ -74,6 +74,14 @@ class SecurityPolicy:
         re.compile(_BOUNDARY + r"~/"),                   # ~/path 家目录展开
         re.compile(_BOUNDARY + r"~($|[\s'\")])"),        # 独立 ~ token
     ]
+    # LLM 不可见的控制面文件。SPEC.md / MEMORY.md / 卸盘正文不在此列。
+    CONTROL_FILES = frozenset({
+        "STATE.json",
+        "EFFECTS.json",
+        "REMEMBER.json",
+        "traces.jsonl",
+        "audit.jsonl",
+    })
 
     def __init__(self, workspace_dir: Path) -> None:
         self.workspace_dir = workspace_dir
@@ -91,6 +99,31 @@ class SecurityPolicy:
                 f"Out-of-bounds path: {p!r} resolves to {resolved}, not under {self.workspace_dir}"
             ) from e
         return resolved
+
+    def is_control_file(self, path: Path) -> bool:
+        name = path.name
+        if name in self.CONTROL_FILES:
+            return True
+        if name.endswith(".tmp") and name[: -len(".tmp")] in self.CONTROL_FILES:
+            return True
+        return False
+
+    def check_read(self, p: str, role: str) -> Path:
+        """读路径：Flash 不能进点目录（.labhandler/scripts 除外）。控制面文件谁都不能用工具读。"""
+        resolved = self.safe_path(p)
+        if self.is_control_file(resolved):
+            raise PermissionError(f"harness control file is not readable by agents: {p!r}")
+        parts = resolved.relative_to(self.workspace_dir).parts
+        hidden = any(part.startswith(".") or part == "__pycache__" for part in parts)
+        if not hidden:
+            return resolved
+        if role == "pro":
+            return resolved
+        if ".labhandler" in parts and "scripts" in parts:
+            return resolved
+        raise PermissionError(
+            f"dot-directories are Pro/harness-only; role={role!r} cannot read {p!r}"
+        )
 
     def check_write(self, p: str, role: str) -> Path:
         """写路径检查：workspace 边界 + acceptance/ 仅 Pro + session 文件仅 Pro。"""

@@ -76,8 +76,8 @@ def _worse_stagnation(a: StagnationSignal, b: StagnationSignal) -> StagnationSig
 class AgentSpec:
     """一拍 agent 的全部参数，由 runtime.phase 解析好后传进来。
 
-    permission 是节点权限（ctx.role，决定写检查放不放行）；visible_role 与
-    extra_tools 只管工具表里出现哪些名字，两者由阶段定义给出。
+    permission 是节点权限（ctx.role，决定写检查放不放行）；visible_role、
+    extra_tools、allow_tools 只管工具表里出现哪些名字，由阶段定义给出。
     tool_extras 原样进 ToolContext（例如全程共用的 SkillBind）。
     """
 
@@ -88,6 +88,7 @@ class AgentSpec:
     submit_tool: str
     visible_role: str
     extra_tools: frozenset[str] = frozenset()
+    allow_tools: frozenset[str] | None = None
     tool_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -141,7 +142,10 @@ async def run_loop(
 ) -> LoopResult:
     role = spec.permission.value
     tools_reg = registry.for_role(
-        spec.visible_role, submit_tool=spec.submit_tool, extra=spec.extra_tools
+        spec.visible_role,
+        submit_tool=spec.submit_tool,
+        extra=spec.extra_tools,
+        allow=spec.allow_tools,
     )
     openai_tools = tools_reg.openai_tools()
     tracker = StagnationTracker(
@@ -266,6 +270,10 @@ async def run_loop(
             if result.error_class is ErrorClass.TRANSIENT:
                 task.record(result.error_class, StagnationSignal.NONE, result.usage)
                 return None
+            if result.error_class is not ErrorClass.OK and not result.tool_calls:
+                # 网关报错却被记成 OK 时，会空转把 step_budget 耗尽（SPEC 长时间不动）。
+                task.record(result.error_class, StagnationSignal.NONE, result.usage)
+                return None
             if result.truncated:
                 # finish_reason=length：content / tool_calls 可能是半截。events 注入截断提示。
                 trace_event(S.EV_DECISION, reason="output_truncated")
@@ -277,6 +285,16 @@ async def run_loop(
                 task.record(ErrorClass.OK, StagnationSignal.NONE, result.usage)
                 if result.content:
                     history.append({"role": "assistant", "content": result.content})
+                    task.events.append(
+                        {
+                            "text": (
+                                f"This phase only finishes by calling {spec.submit_tool}. "
+                                "A schema error is not a dead end: resubmit with the type the hint "
+                                "asked for (a string field is one string, not an object or array). "
+                                "Do not say you cannot complete the task."
+                            )
+                        }
+                    )
                 if force_brief:
                     return done(
                         synthetic_brief(
@@ -338,7 +356,9 @@ async def run_loop(
                 turn_error = _worse_error(turn_error, out.error)
                 if out.submit_payload is not None:
                     submit_name, submit_payload = out.submit_name, out.submit_payload
-                if not out.ran or out.args is None:
+                if out.args is None:
+                    continue
+                if not out.ran and out.error is not ErrorClass.VALIDATION:
                     continue
                 signal = tracker.observe(out.name, out.args, out.text)
                 turn_stag = _worse_stagnation(turn_stag, signal)

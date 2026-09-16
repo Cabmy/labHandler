@@ -85,6 +85,7 @@ class RuntimeTask:
     step_count: int = 0
     tool_failures: int = 0
     transient_count: int = 0
+    """连续瞬时失败数，一次成功清零。tool_failures 才是本节点的累计失败数。"""
     validation_count: int = 0
     consecutive_logic: int = 0
     execution_state: dict[str, Any] = field(default_factory=dict)
@@ -119,6 +120,7 @@ class RuntimeTask:
                 self.consecutive_logic += 1
             elif error_class in {ErrorClass.OK, ErrorClass.ACCEPTABLE}:
                 self.consecutive_logic = 0
+                self.transient_count = 0
             elif error_class is ErrorClass.LOOP:
                 self.events.append(
                     {

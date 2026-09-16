@@ -14,12 +14,14 @@ def build_base_specs() -> list[ToolSpec]:
         ACCEPT_FILE_SCHEMA,
         BRIEF_SCHEMA,
         DISPATCH_SCHEMA,
+        HALT_SCHEMA,
         JUDGE_SCHEMA,
         REMEMBER_SCHEMA,
         SPEC_SCHEMA,
         SUMMARY_SCHEMA,
         SUBMIT_BRIEF,
         SUBMIT_DISPATCH,
+        SUBMIT_HALT,
         SUBMIT_JUDGE,
         SUBMIT_REMEMBER,
         SUBMIT_SPEC,
@@ -46,13 +48,14 @@ def build_base_specs() -> list[ToolSpec]:
             args["path"],
             int(args.get("offset") or 1),
             None if limit in (None, "") else int(limit),
+            ctx.role,
         )
 
     async def h_write(args: dict[str, Any], ctx: ToolContext) -> str:
         return await asyncio.to_thread(write_file, args["path"], args["content"], ctx.role)
 
     async def h_list(args: dict[str, Any], ctx: ToolContext) -> str:
-        r = await asyncio.to_thread(list_dir, args.get("path") or ".")
+        r = await asyncio.to_thread(list_dir, args.get("path") or ".", ctx.role)
         return r if isinstance(r, str) else "\n".join(r)
 
     async def h_patch(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -118,9 +121,12 @@ def build_base_specs() -> list[ToolSpec]:
         return json.dumps(await asyncio.to_thread(read_profile), ensure_ascii=False)
 
     async def h_accept(args: dict[str, Any], ctx: ToolContext) -> str:
-        path = write_acceptance_file(
-            ctx.session_dir, args["task_id"], args["filename"], args["content"], role=ctx.role
-        )
+        try:
+            path = write_acceptance_file(
+                ctx.session_dir, args["task_id"], args["filename"], args["content"], role=ctx.role
+            )
+        except FileExistsError as e:
+            return f"[ERROR/Validation] {e}"
         return f"wrote acceptance file {path.name} for task {args['task_id']}"
 
     async def h_submit(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -269,12 +275,39 @@ def build_base_specs() -> list[ToolSpec]:
             write,
             h_sandbox("sandbox_file_operations"),
         ),
-        ToolSpec(WRITE_ACCEPTANCE, "Write one acceptance test file (Pro only).", ACCEPT_FILE_SCHEMA, pro, h_accept),
+        ToolSpec(
+            WRITE_ACCEPTANCE,
+            "Write one pytest gate file under acceptance/<task_id>/ (Pro only). "
+            "All three args are required strings, never arrays: "
+            'task_id is the assignment id (e.g. "two_sum"); '
+            'filename is only "test_foo.py"; '
+            r'content is the whole file with lines joined by \n '
+            r'(e.g. "import pytest\nfrom two_sum import two_sum\n\ndef test_ex():\n    assert two_sum([2,7],9)==[0,1]\n").',
+            ACCEPT_FILE_SCHEMA,
+            pro,
+            h_accept,
+        ),
         ToolSpec(SUBMIT_SPEC, "Submit SPEC.md: the top-down specification governing the whole task.", SPEC_SCHEMA, pro, h_submit),
-        ToolSpec(SUBMIT_DISPATCH, "Submit the assignments for the next single step. Empty assignments means the work is done.", DISPATCH_SCHEMA, pro, h_submit),
+        ToolSpec(
+            SUBMIT_DISPATCH,
+            "Submit the next Flash wave. One testable write assignment per wave. "
+            "Tests are write_acceptance, not a Flash. Empty assignments = Flash work is done.",
+            DISPATCH_SCHEMA,
+            pro,
+            h_submit,
+        ),
         ToolSpec(SUBMIT_JUDGE, "Submit the judge decision.", JUDGE_SCHEMA, pro, h_submit),
         ToolSpec(SUBMIT_REMEMBER, "Submit which /remember rules apply to this lab.", REMEMBER_SCHEMA, pro, h_submit),
         ToolSpec(SUBMIT_SUMMARY, "Submit SUMMARY.md plus knowledge cards.", SUMMARY_SCHEMA, pro, h_submit),
+        ToolSpec(
+            SUBMIT_HALT,
+            "Last resort: halt the lab because a required fact is missing and only the user can "
+            "supply it. Skips remaining work and jumps to SUMMARY. Do not use for missing product "
+            "files, inapplicable /remember, or a homework you can complete with a reasonable default.",
+            HALT_SCHEMA,
+            pro | write | readonly,
+            h_submit,
+        ),
         ToolSpec(SUBMIT_BRIEF, "Submit the worker brief. This is the only Flash→Pro exit.", BRIEF_SCHEMA, write | readonly | pro, h_submit),
     ]
     return specs

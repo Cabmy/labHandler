@@ -17,7 +17,7 @@ from config.runtime import RuntimeSettings
 from runtime.errors import ErrorClass, classify
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer
-from runtime.loop.parse import openai_tool
+from runtime.loop.parse import check_args, openai_tool
 from runtime.loop.schema import SCHEMA_TOOLS
 from tools.policy import get_auditor
 
@@ -62,35 +62,8 @@ def _fields(*required: str, extra: bool = False, **props: str) -> dict[str, Any]
 
 
 def _advertise(schema: dict[str, Any]) -> dict[str, Any]:
-    advertised = {**schema, "additionalProperties": True}
-    advertised.pop("required", None)
-    return advertised
-
-
-def _blank(value: Any) -> bool:
-    return value is None or (isinstance(value, str) and not value.strip())
-
-
-def _check_args(schema: dict[str, Any], args: dict[str, Any]) -> str:
-    """按 schema.required / 类型给出缺参提示，不拦截额外字段。"""
-    miss = [k for k in (schema.get("required") or []) if _blank(args.get(k))]
-    if miss:
-        return f"[ERROR/Validation] missing {', '.join(miss)}"
-    for key, spec in (schema.get("properties") or {}).items():
-        if not isinstance(spec, dict):
-            continue
-        raw = args.get(key)
-        if raw in (None, ""):
-            continue
-        t = spec.get("type")
-        if t == "integer":
-            try:
-                args[key] = int(raw)
-            except (TypeError, ValueError):
-                return f"[ERROR/Validation] {key} must be an integer"
-        elif t == "string" and not isinstance(raw, str):
-            return f"[ERROR/Validation] {key} must be a string"
-    return ""
+    """普通工具：保留 required，额外字段仍放行。不要把 required 藏起来，否则模型会漏必填项。"""
+    return {**schema, "additionalProperties": True}
 
 
 class ToolRegistry:
@@ -98,19 +71,28 @@ class ToolRegistry:
         self._specs = {s.name: s for s in specs}
 
     def for_role(
-        self, role: str, submit_tool: str, extra: frozenset[str] = frozenset()
+        self,
+        role: str,
+        submit_tool: str,
+        extra: frozenset[str] = frozenset(),
+        allow: frozenset[str] | None = None,
     ) -> "ToolRegistry":
-        """本拍实际可见的工具：role 允许的，加 extra 点名的，加唯一出口 submit_tool。
+        """本拍实际可见的工具：role 允许的，加 extra 点名的，加主出口 submit_tool。
 
-        role / extra 由 runtime.phase 决定，本模块不认识阶段。收窄后的这份
+        extra 可以点名第二个 SCHEMA_TOOLS 出口（submit_halt）。allow 非空则再交集。
+        role / extra / allow 由 runtime.phase 决定，本模块不认识阶段。收窄后的这份
         registry 同时用于 execute，所以不在表里的名字调不动。
         """
+        named = extra | {submit_tool}
         specs = [
             s
             for s in self._specs.values()
-            if (role in s.permissions or s.name in extra or s.name == submit_tool)
-            and (s.name not in SCHEMA_TOOLS or s.name == submit_tool)
+            if (role in s.permissions or s.name in named)
+            and (s.name not in SCHEMA_TOOLS or s.name in named)
         ]
+        if allow is not None:
+            keep = allow | named
+            specs = [s for s in specs if s.name in keep]
         return ToolRegistry(specs)
 
     def openai_tools(self) -> list[dict[str, Any]]:
@@ -194,7 +176,7 @@ class ToolRegistry:
         if not isinstance(args, dict):
             return ToolOutcome("[ERROR/Validation] arguments must be an object", ErrorClass.VALIDATION)
         if name not in SCHEMA_TOOLS:
-            hint = _check_args(spec.input_schema, args)
+            hint = check_args(spec.input_schema, args)
             if hint:
                 return ToolOutcome(hint, ErrorClass.VALIDATION)
 

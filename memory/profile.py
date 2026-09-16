@@ -105,7 +105,7 @@ def inject_for_agent(
     """把 identity / preferences 以及本 lab 适用的 style_rules 拼到 system 末尾。
 
     仅 coder / planner / verifier / summarizer / pro / flash 会注入。
-    include_rules=False 时不写规则段（起草 SPEC、remember_judge 裁定前）。
+    include_rules=False 时不写规则段（remember_judge 裁定前）。
     rules 非 None 时只用这份名单，不再读 profile 全量 style_rules。
     优先级：当轮用户指令 > 本 lab 适用规则 > skill SOP。
     """

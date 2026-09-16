@@ -4,8 +4,8 @@ description: |
   Lab report with experiment process: objective / principle / steps / results / analysis / conclusion.
   Artifacts: report document plus optional code or data.
 when_to_use: |
-  写实验报告 / Lab N / 实验指导, or a lab that must submit process + evidence.
-  Not this: implement + tests only → coding; argumentation with no experiment → essay.
+  Primary artifact is an 实验报告 (实验指导书, 实验目的/步骤/结果). Helper code may exist.
+  Not this: 力扣 / 实现某函数 / 只交 .py → coding; 论述作文 → essay.
 ---
 
 # Lab Report SOP
@@ -29,10 +29,9 @@ Required sections (all must appear):
 
 ## Dispatch
 
-Typical sequence, one Flash at a time:
+Typical sequence, one Flash at a time — these are kinds of work, not one milestone per heading:
 1. reproduce / collect real output (commands, numbers, errors)
-2. write process sections (thinking → command → phenomenon per Task)
-3. results table + analysis + conclusion
+2. write the report (process + results + analysis + conclusion)
 
 Writing style and table templates: `load_skill_reference("lab_report", "writing_guide.md")`.
 

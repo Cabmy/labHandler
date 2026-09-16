@@ -7,6 +7,7 @@ no_hard_criteria。collect-only 失败 → test_invalid。跑通且 exit 0 → p
 """
 
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +50,43 @@ def acceptance_dir(session_dir: Path, task_id: str) -> Path:
     return session_dir / "acceptance" / task_id
 
 
+def has_gate(session_dir: Path, task_id: str) -> bool:
+    root = acceptance_dir(session_dir, task_id)
+    return root.is_dir() and any(root.glob("*.py"))
+
+
+def _existing_gate_ids(session_dir: Path) -> list[str]:
+    root = session_dir / "acceptance"
+    if not root.is_dir():
+        return []
+    return sorted(
+        p.name for p in root.iterdir() if p.is_dir() and any(p.glob("*.py"))
+    )
+
+
+def missing_gate(session_dir: Path, assignments: list) -> str:
+    """testable 的 assignment 必须已经有 write_acceptance 文件，否则不启动 Flash。"""
+    missing = [
+        a.id
+        for a in assignments
+        if getattr(a, "testable", False) and not has_gate(session_dir, a.gate_id)
+    ]
+    if not missing:
+        return ""
+    found = _existing_gate_ids(session_dir)
+    hint = (
+        f"testable assignment(s) {missing} have no files in acceptance/<id>/. "
+        "THIS TURN: write_acceptance(task_id=<that assignment id>, "
+        'filename="test_foo.py", content=<one python string, join lines with \\n>) '
+        "then submit_dispatch with the SAME product assignment. "
+        "filename is only the .py name, not acceptance/<id>/.... "
+        "Do not add a second Flash to write tests."
+    )
+    if found:
+        hint += f" Existing acceptance/ dirs: {found}. task_id must equal the assignment id."
+    return hint
+
+
 def write_acceptance_file(
     session_dir: Path, task_id: str, filename: str, content: str, *, role: str
 ) -> Path:
@@ -65,6 +103,13 @@ def write_acceptance_file(
     path = dest / name
     policy = get_policy()
     policy.check_write(str(path.relative_to(policy.workspace_dir)), role)
+    if path.is_file() and path.read_text(encoding="utf-8") == content:
+        raise FileExistsError(
+            f"acceptance/{task_id}/{name} already has exactly this content; nothing changed. "
+            "Rewriting identical bytes cannot change the gate result. If the gate keeps "
+            "reporting test_invalid, the sandbox could not run it — that is not a content "
+            "problem. Judge finish instead of rewriting."
+        )
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -81,10 +126,38 @@ def parse_pytest_counts(text: str) -> tuple[int, int]:
     return passed, failed
 
 
+_NO_PYTEST = "no module named pytest"
+
+
 async def _pytest(target: str, extra: list[str], timeout: float) -> tuple[int, str]:
-    """在沙箱里跑 pytest。返回 (exit_code, 合并日志)。"""
-    args = " ".join(extra)
-    command = f"cd /workspace && python -m pytest -q --tb=short {args} {target}".strip()
+    """在沙箱里跑 pytest。PYTHONPATH=/workspace，避免验收目录抢掉产品模块的导入。
+
+    容器里没装 pytest 时装一次再重跑：门禁跑不起来不是 Pro 能靠改测试修好的，
+    否则每一步都会退回 test_invalid，Pro 只能反复重写同一份验收文件。
+    """
+    # -p no:cacheprovider：rootdir 是 /workspace，别把 .pytest_cache 留进交付目录。
+    flags = shlex.join(
+        [
+            "--tb=short",
+            "--import-mode=importlib",
+            "--rootdir=/workspace",
+            "-p",
+            "no:cacheprovider",
+            *extra,
+        ]
+    )
+    command = (
+        "cd /workspace && PYTHONPATH=/workspace "
+        f"python -m pytest -q {flags} {shlex.quote(target)}"
+    )
+    code, log = await sandbox_run(command, timeout=timeout)
+    if code == 0 or _NO_PYTEST not in log.lower():
+        return code, log
+    install, install_log = await sandbox_run(
+        "python -m pip install -q pytest", timeout=timeout
+    )
+    if install != 0:
+        return code, f"{log}\n[labhandler] pip install pytest 失败：{install_log}"
     return await sandbox_run(command, timeout=timeout)
 
 
@@ -127,6 +200,7 @@ _INFRA_MARKERS = (
     "[timeout",
     "internalerror>",      # pytest 自身崩溃，不是被测代码的问题
     "no such file or directory",
+    "no module named 'pytest'",
 )
 
 

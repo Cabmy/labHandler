@@ -12,8 +12,9 @@ def skill_catalog_block() -> str:
     if not metas:
         return ""
     lines = [
-        "## Skills (optional; mutually exclusive)",
-        "Call load_skill at most once this lab to pull one SOP, or skip.",
+        "## Skills (optional; mutually exclusive — pick by primary deliverable, or skip)",
+        "Call load_skill at most once this lab to pull one SOP.",
+        "coding = graded artifact is code; lab_report = graded artifact is 实验报告; essay = 论述/论文.",
         "After that, load_skill_reference / use_skill_script only work for the bound skill.",
         "",
     ]

@@ -599,6 +599,11 @@
         const d = JSON.parse(e.data);
         if (d.trace_id) logLine('toolret', 'trace ' + d.trace_id);
       });
+      es.addEventListener('halt', (e) => {
+        const d = JSON.parse(e.data);
+        logLine('err', 'halt: ' + (d.reason || '').slice(0, 200));
+        if (d.need_from_user) logLine('toolret', '└ 需要用户：' + String(d.need_from_user).slice(0, 200));
+      });
       es.addEventListener('error', (e) => {
         // 只处理服务端推的 kind=error。浏览器自带的 EventSource error 没有 data，
         // 断线重连时也会触发；当成任务失败会把进度停死在最后一个 node。

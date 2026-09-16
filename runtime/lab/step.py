@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from runtime.lab.accept import AcceptResult, NO_HARD_CRITERIA, PASS, sanity_and_run
-from runtime.lab.helpers import step_gate
+from runtime.lab.helpers import halt_of, step_gate
 from runtime.lab.persist import (
     EffectLedger,
     SPEC_FILE,
@@ -19,6 +19,7 @@ from runtime.lab.scheduler import permission_for_wave, run_wave
 from runtime.lab.spec import Assignment, render_assignment
 from runtime.loop import run_loop
 from runtime.loop.parse import synthetic_brief
+from runtime.loop.schema import SUBMIT_HALT
 from runtime.observe import spans as S
 from runtime.task import RuntimeTask, TaskKind, TaskStatus, TaskTree
 
@@ -64,7 +65,7 @@ async def run_step(
     ledger: EffectLedger,
     progress: list[tuple[str, str]],
     on_event: EventSink | None,
-) -> tuple[list[dict[str, Any]], bool, AcceptResult]:
+) -> tuple[list[dict[str, Any]], bool, AcceptResult, dict[str, Any] | None]:
     permission = permission_for_wave(len(assignments))
     workers = [
         tree.add_child(
@@ -121,16 +122,20 @@ async def run_step(
 
     briefs = []
     spec_invalid = False
+    halt: dict[str, Any] | None = None
     for worker, brief in results:
         briefs.append(brief)
+        found = halt_of(brief)
+        if found:
+            halt = found
         aid = str((worker.node_spec or {}).get("id") or "")
         if not aid:
             continue
         if brief.get("outcome") == "spec_invalid":
             spec_invalid = True
-        progress.append((aid, str(brief.get("brief") or "")))
+        progress.append((aid, str(brief.get("brief") or (found or {}).get("reason") or "")))
 
-    return briefs, spec_invalid, step_gate(results)
+    return briefs, spec_invalid, step_gate(results), halt
 
 
 async def run_worker(
@@ -201,6 +206,34 @@ async def run_worker(
             brief = result.brief or synthetic_brief(
                 outcome="failed", brief=result.reason or "no brief"
             )
+            halted = halt_of(result.submit)
+            if halted:
+                payload = {
+                    "name": SUBMIT_HALT,
+                    "payload": halted,
+                    "outcome": "halt",
+                    "brief": halted.get("reason"),
+                }
+                worker.brief = payload
+                try:
+                    worker.transit(TaskStatus.COMPLETED)
+                except ValueError:
+                    pass
+                ledger.drop(assignment.id)
+                save_tree(session_dir, tree)
+                if task_span is not None:
+                    task_span.set(**{S.ATTR_OUTCOME: "halt"})
+                    task_span.output(str(halted.get("reason") or "")[:2000])
+                await runner._emit(
+                    on_event,
+                    {
+                        "kind": "halt",
+                        "reason": str(halted.get("reason") or "")[:800],
+                        "need_from_user": str(halted.get("need_from_user") or "")[:800],
+                        "assignment_id": assignment.id,
+                    },
+                )
+                return payload
         except asyncio.TimeoutError:
             brief = synthetic_brief(
                 outcome="failed",

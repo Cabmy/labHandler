@@ -26,6 +26,7 @@ from config.prompts import (
 from runtime.loop.schema import (
     SUBMIT_BRIEF,
     SUBMIT_DISPATCH,
+    SUBMIT_HALT,
     SUBMIT_JUDGE,
     SUBMIT_REMEMBER,
     SUBMIT_SPEC,
@@ -38,8 +39,10 @@ from tools.skill_tool import LOAD_SKILL, LOAD_SKILL_REFERENCE
 PRO = "pro"
 FLASH = "flash"
 # 只读 Pro 阶段默认看不见 pro 权限工具；skill 读取经 extra 点名放行。
-# Flash 不在 extra 里，因此调不到。
+# Flash 不加载 skill；submit_halt 经 extra 点名放行。
 _SKILL_READ = frozenset({LOAD_SKILL, LOAD_SKILL_REFERENCE})
+# 除 SUMMARY 外均可短路：规划时可能看不出来，做到一半才发现缺用户才能给的信息。
+_HALT = frozenset({SUBMIT_HALT})
 
 
 @dataclass(frozen=True)
@@ -49,7 +52,8 @@ class PhaseSpec:
 
     system: str
     submit_tool: str
-    """本阶段唯一的结构化出口。调别的 submit_* 会被 loop 当校验错误退回。"""
+    """本阶段主结构化出口。调别的 submit_* 会被 loop 当校验错误退回。
+    submit_halt 经 extra_tools 点名，作为万不得已的第二出口。"""
 
     permission: Permission | None = None
     """节点权限。留空表示由调用方给——只有 WORKER 如此，它按本波人数决定。"""
@@ -60,8 +64,15 @@ class PhaseSpec:
     extra_tools: frozenset[str] = frozenset()
     """visible 之外额外开放的具体工具名。"""
 
+    allow_tools: frozenset[str] | None = None
+    """非空时工具表只保留这些名字（再加 extra_tools 与 submit_tool）。Remember-Judge 用。"""
+
     shares_thread: bool = False
     """是否并入 Pro 那条贯穿全程的 transcript。"""
+
+    carry_prose: bool = True
+    """存回共享 transcript 时是否保留纯文字的 assistant 轮。
+    Remember-Judge 只该留下裁定，它顺手写的代码/报告建议不能漏给后面的阶段。"""
 
     def node_permission(self, fallback: Permission | None = None) -> Permission:
         chosen = self.permission or fallback
@@ -80,7 +91,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_SPEC,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        extra_tools=_SKILL_READ,
+        extra_tools=_SKILL_READ | _HALT,
         shares_thread=True,
     ),
     TaskKind.REMEMBER_JUDGE: PhaseSpec(
@@ -89,8 +100,11 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_REMEMBER,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        # 紧接 SPEC：同一条 Pro 对话里裁定哪些 /remember 适用于本 lab。
+        extra_tools=_HALT,
+        allow_tools=frozenset({"read_file", "list_dir", "glob_files"}),
+        # 写 SPEC 之前：同一条 Pro 对话里先裁定哪些 /remember 适用于本 lab。
         shares_thread=True,
+        carry_prose=False,
     ),
     TaskKind.DISPATCH: PhaseSpec(
         agent=PRO,
@@ -98,8 +112,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_DISPATCH,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        # 验收测试在派活时预先写好，所以这一拍要开 write_acceptance。
-        extra_tools=_SKILL_READ | {WRITE_ACCEPTANCE},
+        extra_tools=_SKILL_READ | {WRITE_ACCEPTANCE} | _HALT,
         shares_thread=True,
     ),
     TaskKind.JUDGE: PhaseSpec(
@@ -108,8 +121,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_JUDGE,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        # 门禁已在沙箱跑过，判决只读代码与 briefs；test_invalid 时可重写测试。
-        extra_tools=_SKILL_READ | {WRITE_ACCEPTANCE},
+        extra_tools=_SKILL_READ | {WRITE_ACCEPTANCE} | _HALT,
         shares_thread=True,
     ),
     TaskKind.TAKEOVER: PhaseSpec(
@@ -117,7 +129,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         system=TAKEOVER_SYSTEM,
         submit_tool=SUBMIT_BRIEF,
         permission=Permission.PRO,
-        # visible 留空：接管要真正改文件跑沙箱，拿节点权限的全集。
+        extra_tools=_HALT,
         shares_thread=True,
     ),
     TaskKind.SUMMARY: PhaseSpec(
@@ -133,6 +145,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         agent=FLASH,
         system=FLASH_SYSTEM,
         submit_tool=SUBMIT_BRIEF,
+        extra_tools=_HALT,
         # permission 由 permission_for_wave 给：独个 Flash 拿写权限，并行则全部只读。
         shares_thread=False,
     ),
