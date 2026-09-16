@@ -94,6 +94,21 @@ class SecurityPolicy:
             ) from e
         return resolved
 
+    def check_write(self, p: str, role: str) -> Path:
+        """写路径检查：workspace 边界 + acceptance/ 仅 Pro + session 文件仅 Pro。"""
+        resolved = self.safe_path(p)
+        rel = resolved.relative_to(self.workspace_dir)
+        parts = rel.parts
+        if role != "pro" and "acceptance" in parts:
+            raise PermissionError(
+                f"acceptance/ is Pro-only write; role={role!r} cannot write {p!r}"
+            )
+        if role != "pro" and ".labhandler" in parts and "scripts" not in parts:
+            raise PermissionError(
+                f"session files under .labhandler/ are Pro/harness-only; role={role!r} cannot write {p!r}"
+            )
+        return resolved
+
     def check_command(self, cmd: str) -> None:
         """host_bash cmd 字符串白名单预检 + 路径逃逸巡查；抛 PermissionError。"""
         if not isinstance(cmd, str) or not cmd.strip():

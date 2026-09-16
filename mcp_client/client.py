@@ -1,10 +1,4 @@
-"""MCP 客户端构建与访问入口。
-
-职责：
-1. 维护 AIO Sandbox MCP 服务连接配置；
-2. 构建客户端前做可达性探活，剔除不可用服务；
-3. 提供模块级单例的客户端与工具列表访问。
-"""
+"""MCP 客户端：官方 SDK streamable HTTP，不用 langchain。"""
 
 from __future__ import annotations
 
@@ -14,58 +8,83 @@ from typing import Any
 from config.runtime import get_settings
 from infra.net_probe import probe_port
 
+_session: Any = None
+_cm: Any = None
+_tools_cache: list[Any] | None = None
 
-def build_mcp_client() -> Any:
-    """构建 MultiServerMCPClient，过滤掉不可达的 MCP 服务。"""
-    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+async def _open_session() -> Any:
+    global _session, _cm
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
 
     mcp_url = get_settings().aio_sandbox_mcp_url
-    candidates: dict[str, dict[str, Any]] = {
-        "aio_sandbox": {
-            "transport": "streamable_http",
-            "url": mcp_url,
-            "headers": {"Accept": "application/json, text/event-stream"},
-        },
-    }
-
-    alive: dict[str, dict[str, Any]] = {}
-    for name, cfg in candidates.items():
-        if probe_port(cfg["url"]):
-            alive[name] = cfg
-        else:
-            warnings.warn(
-                f"MCP server {name} 在 {cfg['url']} 探活失败，已从注册表剔除。",
-                stacklevel=2,
-            )
-
-    if not alive:
+    if not probe_port(mcp_url):
         raise RuntimeError(
-            "所有 MCP 服务探活均失败。请检查：\n"
-            f"- AIO Sandbox 容器是否运行于 {mcp_url}？\n"
-            "- 容器健康检查是否通过（docker ps 看 health=healthy）？"
+            f"MCP 探活失败：{mcp_url}。请确认 AIO Sandbox 容器在跑且 health=healthy。"
         )
-
-    return MultiServerMCPClient(alive)
-
-
-# 模块级单例缓存
-_default_client: Any | None = None
-
-
-def get_mcp_client() -> Any:
-    global _default_client
-    if _default_client is None:
-        _default_client = build_mcp_client()
-    return _default_client
+    _cm = streamablehttp_client(
+        mcp_url,
+        headers={"Accept": "application/json, text/event-stream"},
+    )
+    read, write, _sid = await _cm.__aenter__()
+    session = ClientSession(read, write)
+    await session.__aenter__()
+    await session.initialize()
+    _session = session
+    return session
 
 
-async def get_tools() -> list[Any]:
-    """异步获取全部 MCP 工具（LangChain Tool 形式）。"""
-    client = get_mcp_client()
-    return await client.get_tools()
+async def get_session() -> Any:
+    global _session
+    if _session is None:
+        return await _open_session()
+    return _session
+
+
+async def list_mcp_tools() -> list[Any]:
+    global _tools_cache
+    if _tools_cache is not None:
+        return _tools_cache
+    session = await get_session()
+    listed = await session.list_tools()
+    _tools_cache = list(listed.tools)
+    return _tools_cache
+
+
+async def call_mcp_tool(name: str, arguments: dict[str, Any]) -> Any:
+    session = await get_session()
+    try:
+        return await session.call_tool(name, arguments)
+    except Exception:
+        reset_mcp_client()
+        session = await get_session()
+        return await session.call_tool(name, arguments)
 
 
 def reset_mcp_client() -> None:
-    """重置模块级客户端缓存，供连接拓扑变更后重建。"""
-    global _default_client
-    _default_client = None
+    global _session, _cm, _tools_cache
+    _tools_cache = None
+    sess, cm = _session, _cm
+    _session = None
+    _cm = None
+
+    async def _close() -> None:
+        if sess is not None:
+            try:
+                await sess.__aexit__(None, None, None)
+            except Exception:
+                pass
+        if cm is not None:
+            try:
+                await cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    try:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        loop.create_task(_close())
+    except RuntimeError:
+        pass

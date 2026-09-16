@@ -1,15 +1,5 @@
-"""labHandler MCP 模块入口。"""
+"""mcp_client 入口。"""
 
-from .client import (
-    build_mcp_client,
-    get_mcp_client,
-    get_tools,
-    reset_mcp_client,
-)
+from mcp_client.client import call_mcp_tool, list_mcp_tools, reset_mcp_client
 
-__all__ = [
-    "build_mcp_client",
-    "get_mcp_client",
-    "get_tools",
-    "reset_mcp_client",
-]
+__all__ = ["call_mcp_tool", "list_mcp_tools", "reset_mcp_client"]

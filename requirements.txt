@@ -1,20 +1,10 @@
 # LLM & Agent
-langchain>=0.3.0
-langchain-ollama>=0.2.0
-langchain-openai>=0.2.0
-langchain-chroma>=0.2.0
-langchain-community>=0.3.0
-langgraph>=0.2.0
-ollama
+openai>=1.40.0
+tenacity
+jsonschema
 
-# MCP (streamable-http transport 需 Accept: application/json, text/event-stream)
+# MCP
 mcp
-langchain-mcp-adapters
-
-# RAG
-chromadb>=0.5.0
-rank_bm25>=0.2.2
-jieba>=0.42.1
 
 # Web Search
 ddgs
@@ -24,19 +14,17 @@ beautifulsoup4
 # Config / 数据
 python-dotenv
 PyYAML
+numpy
 
-# CLI
-rich
-
-# Web 前端
+# Web
 fastapi
 uvicorn
 python-multipart
 sse-starlette
 
-# LangGraph checkpointer
-langgraph-checkpoint-sqlite
-aiosqlite>=0.22,<0.23
+# Observability
+opentelemetry-sdk
+opentelemetry-exporter-otlp
 
 # Verifier 在 workspace 跑 pytest
 pytest>=8.0

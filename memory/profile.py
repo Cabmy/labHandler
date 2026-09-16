@@ -110,7 +110,7 @@ def inject_for_agent(agent_name: str, system_prompt: str) -> str:
     （agents/verifier.py:467），故写侧与判侧口径一致。
     """
     agent = agent_name.lower()
-    if agent not in {"coder", "planner", "verifier", "summarizer"}:
+    if agent not in {"coder", "planner", "verifier", "summarizer", "pro", "flash"}:
         return system_prompt
 
     data = load_profile()

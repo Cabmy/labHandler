@@ -1,8 +1,4 @@
-"""任务归档存储（SQLite 事实层）。
-
-只负责 SQLite 读写（task + cards）；不涉及检索。
-Chroma / BM25 / RRF 均在 rag/archive_retriever.py 处理。
-"""
+"""任务归档存储（SQLite 事实层）。卡片 markdown 文件见 memory.retrieve。"""
 
 from __future__ import annotations
 

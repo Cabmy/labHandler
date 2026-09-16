@@ -17,8 +17,8 @@ from typing import Any
 
 from config.prompts import EDIT_SKILL_SYSTEM
 from config.runtime import get_settings
-from llm import get_llm
-from llm.invoke import invoke_llm_json
+from runtime.llm import LLMGateway
+from runtime.schema_call import SKILL_EDIT_SCHEMA, SUBMIT_SKILL_EDIT, oneshot_schema
 from skills.repository import (
     apply_skill_operations,
     list_skill_documents,
@@ -39,7 +39,7 @@ def existing_skill_names() -> list[str]:
     return sorted(s["name"] for s in list_skill_documents())
 
 
-def _collect_style_samples(instruction: str) -> tuple[dict[str, str], list[str]]:
+async def _collect_style_samples(instruction: str) -> tuple[dict[str, str], list[str]]:
     """从指令文本中匹配 workspace 顶层文件名，读作文风样本。
 
     自然语言指令可直接提及文件名（如“学一下我的实验报告.docx 的文风”），
@@ -64,13 +64,9 @@ def _collect_style_samples(instruction: str) -> tuple[dict[str, str], list[str]]
         if suffix in _TEXT_EXTS:
             text = p.read_text(encoding="utf-8", errors="replace")
         elif suffix in _PARSEABLE_EXTS:
-            # PDF/DOCX 复用沙箱解析（与 agents/intake.py:_parse_with_sandbox 同模式）；
-            # edit 命令在主/工作线程同步跑，无 running loop，asyncio.run 安全
-            import asyncio
-
             try:
                 from tools.sandbox_tools import sandbox_convert_to_markdown
-                text = asyncio.run(sandbox_convert_to_markdown(str(p)))
+                text = await sandbox_convert_to_markdown(str(p))
                 if not isinstance(text, str):
                     text = str(text)
             except Exception as e:
@@ -126,24 +122,26 @@ def _make_diffs(
     return diffs
 
 
-def propose_edit(skill_name: str, instruction: str) -> dict[str, Any]:
-    """生成编辑提案（不落盘）。
-
-    返回：{skill_name, summary, operations, diffs, style_samples}
-    异常：FileNotFoundError（skill 不在现有列表）/ LLM 输出解析 / 校验错误
-    """
+async def propose_edit(skill_name: str, instruction: str) -> dict[str, Any]:
+    """生成编辑提案（不落盘）。"""
     available = existing_skill_names()
     if skill_name not in available:
         raise FileNotFoundError(
             f"skill 不存在：{skill_name!r}（仅支持编辑现有 skill：{available}，不支持新增）"
         )
     files = read_skill_files(skill_name)
-    samples, sample_failures = _collect_style_samples(instruction)
+    samples, sample_failures = await _collect_style_samples(instruction)
 
-    llm = get_llm()
-    data = invoke_llm_json(
-        llm, EDIT_SKILL_SYSTEM,
-        _build_user_msg(skill_name, files, instruction, samples),
+    settings = get_settings()
+    llm = LLMGateway(settings)
+    data = await oneshot_schema(
+        llm,
+        model=settings.pro_model,
+        system=EDIT_SKILL_SYSTEM,
+        user=_build_user_msg(skill_name, files, instruction, samples),
+        name=SUBMIT_SKILL_EDIT,
+        schema=SKILL_EDIT_SCHEMA,
+        description="Submit skill file operations",
     )
 
     operations_raw = data.get("operations") or []
@@ -158,7 +156,6 @@ def propose_edit(skill_name: str, instruction: str) -> dict[str, Any]:
             "file": str(op.get("file", "")),
             "content": op.get("content", "") or "",
         }
-        # 提前对照落盘时校验：任一条目非法则整个提案被拒
         validate_operation(skill_name, norm)
         operations.append(norm)
 

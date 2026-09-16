@@ -375,7 +375,8 @@
       <div class="row">
         <input type="text" id="question" placeholder="例：请按 README 完成作业" value="请按 README 完成作业">
         <button id="run">开始</button>
-        <button id="dreambtn" class="ghost" title="离线治理归档卡片（LLM 合并/去重/淘汰），随时可用">知识治理（/dream）</button>
+        <button id="stopbtn" class="ghost" disabled>停止</button>
+        <button id="dreambtn" class="ghost" title="离线治理归档卡片">知识治理</button>
         <span id="status"></span>
       </div>
     </section>
@@ -439,6 +440,7 @@
     function setRunning(v) {
       running = v;
       $('run').disabled = v;
+      $('stopbtn').disabled = !v;
       $('dreambtn').disabled = v;
       $('status').textContent = v ? '运行中…' : '';
       $('drop').classList.toggle('disabled', v);
@@ -556,6 +558,26 @@
             .map(([k, v]) => `${k}=${JSON.stringify(v).slice(0, 60)}`).join(' · '));
         logLine('done', '✓ ' + (bits.join(' | ') || 'done'));
       });
+      es.addEventListener('error_class', (e) => {
+        const d = JSON.parse(e.data);
+        logLine('err', 'error_class=' + (d.error_class || d.detail || ''));
+      });
+      es.addEventListener('recovery', (e) => {
+        const d = JSON.parse(e.data);
+        logLine('done', 'recovery ' + JSON.stringify(d).slice(0, 160));
+      });
+      es.addEventListener('worker_brief', (e) => {
+        const d = JSON.parse(e.data);
+        logLine('done', 'brief ' + (d.task_id || '') + ' ' + (d.outcome || '') + ' gate=' + (d.gate || ''));
+        if (d.brief) logLine('toolret', '└ ' + String(d.brief).slice(0, 200));
+      });
+      es.addEventListener('pro_takeover', (e) => {
+        logLine('node', '• pro takeover');
+      });
+      es.addEventListener('trace', (e) => {
+        const d = JSON.parse(e.data);
+        if (d.trace_id) logLine('toolret', 'trace ' + d.trace_id);
+      });
       es.addEventListener('error', (e) => {
         if (e.data) { const d = JSON.parse(e.data); logLine('err', '✗ ' + d.detail); }
         finish(null);
@@ -586,14 +608,18 @@
       if (!final) return;
       $('secResult').classList.remove('hidden');
       const v = $('verdict');
-      v.textContent = (final.verdict === 'pass' ? '✓ 通过' : '⚠ ' + final.verdict) +
-        ` · iteration=${final.iteration} · ${final.elapsed}s`;
+      v.textContent = (final.verdict === 'pass' ? '✓ 通过' : '⚠ ' + (final.verdict || 'done')) +
+        ` · ${final.elapsed}s`;
       v.className = final.verdict === 'pass' ? 'pass' : 'fail';
       await refreshFiles($('filelist2'));
       await refreshFiles($('filelist'));
       const s = await (await fetch('/api/summary')).json();
       $('summary').textContent = s.summary || '（无 SUMMARY.md）';
     }
+
+    $('stopbtn').onclick = async () => {
+      await fetch('/api/stop', { method: 'POST' });
+    };
 
     // ─── 归档结束 ───────────────────────────────────────────────
     $('donebtn').onclick = async () => {
@@ -733,7 +759,20 @@
         if (st.running) {
           setRunning(true);
           $('log').innerHTML = '';
-          attachStream();   // 重新订阅事件流，继续看进度
+          attachStream();
+        } else if (st.resumable) {
+          if (confirm('上次 lab 未完成，是否继续？取消则归档并新开 lab。')) {
+            const resp = await fetch('/api/resume', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ continue_lab: true, question: '继续上次未完成的 lab' }),
+            });
+            if (resp.ok) { setRunning(true); $('log').innerHTML = ''; attachStream(); }
+          } else {
+            await fetch('/api/resume', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ continue_lab: false }),
+            });
+          }
         }
       } catch (e) { /* 状态接口失败不阻塞页面 */ }
     }

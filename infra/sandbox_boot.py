@@ -160,7 +160,7 @@ def ensure_sandbox(log=print) -> bool:
             "[sandbox] ⚠️ 检测到旧容器没有 workspace bind-mount。"
             f"sandbox 工具将无法读 {host_workspace} 下的 PDF/DOCX。\n"
             "  请运行：  docker rm -f aio-sandbox\n"
-            "  然后重启 cli.py（会自动用新挂载重建容器）。"
+            "  然后重启 python -m server（会自动用新挂载重建容器）。"
         )
         # 继续：旧容器仍可跑，只是读不了文件；由用户决定是否重建。
 
@@ -238,24 +238,17 @@ def recreate_sandbox(log=print) -> bool:
         else:
             log(f"[sandbox] docker rm {CONTAINER_NAME} 失败；继续尝试重建")
 
-    # 重置 coder agent 缓存（沙箱已变，旧 agent 的 MCP 工具已失效）
-    try:
-        from agents.coder import reset_coder_agent
-        reset_coder_agent()
-    except Exception as e:
-        log(f"[sandbox] reset_coder_agent 失败（继续）：{type(e).__name__}: {e}")
-
-    # 重置上层单例（容器已变，旧 MCP 会话 / 工具封装已死）
+    # 重置 MCP / sandbox 缓存（容器已变）
     try:
         from mcp_client import reset_mcp_client
         reset_mcp_client()
     except Exception as e:
         log(f"[sandbox] reset_mcp_client 失败（继续）：{type(e).__name__}: {e}")
     try:
-        import tools.sandbox_tools as _st
-        _st._tools_cache = None
+        from tools.sandbox_tools import reset_sandbox_failure_counter
+        reset_sandbox_failure_counter()
     except Exception as e:
-        log(f"[sandbox] 清 sandbox_tools._tools_cache 失败（继续）：{type(e).__name__}: {e}")
+        log(f"[sandbox] reset sandbox failures 失败（继续）：{type(e).__name__}: {e}")
 
     # 重启（等待端口就绪最多 60s）
     return ensure_sandbox(log=log)

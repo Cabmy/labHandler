@@ -1,19 +1,4 @@
-"""labHandler Web 服务器（FastAPI + SSE）。
-
-让用户不碰代码即可使用：浏览器上传作业材料
-（等效放入 workspace/）-> 输入任务 -> SSE 实时执行进度 ->
-下载产物 / 查看 SUMMARY -> 归档收尾；
-另提供 skill 编辑（等效 CLI /edit_skill：提案 -> diff 确认 -> 落盘）。
-
-架构约定：
-- 复用 orchestrator/session.py:TaskSession（与 CLI 同一套会话逻辑，单进程单任务）
-- 复用 ui/events.py:iter_graph_events（与终端渲染同一套事件流，序列化为 SSE）
-- 单任务锁：同一时刻只跑一个任务（与单进程单 HwState
-  架构一致）；执行期间提交返回 409
-- 仅本地使用（默认 127.0.0.1:8000，无鉴权）；如需暴露局域网请自行加反向代理 + token
-
-启动：python -m server
-"""
+"""labHandler Web 服务器（FastAPI + SSE）。入口：python -m server。"""
 
 from __future__ import annotations
 
@@ -26,7 +11,6 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-# .env 集中于 config/ 目录管理（与 cli.py 同路径约定）
 load_dotenv(Path(__file__).resolve().parent.parent / "config" / ".env")
 
 from fastapi import FastAPI, HTTPException, UploadFile  # noqa: E402
@@ -36,7 +20,8 @@ from pydantic import BaseModel  # noqa: E402
 from sse_starlette.sse import EventSourceResponse  # noqa: E402
 
 from config.runtime import get_settings  # noqa: E402
-from orchestrator.session import TaskSession  # noqa: E402
+from runtime.persist import latest_incomplete  # noqa: E402
+from runtime.session import LabSession  # noqa: E402
 from tools.workspace_utils import iter_workspace_files  # noqa: E402
 
 WORKSPACE_DIR: Path = get_settings().workspace_dir
@@ -47,7 +32,6 @@ app = FastAPI(title="labHandler", docs_url=None, redoc_url=None)
 
 @app.middleware("http")
 async def _no_cache_static(request, call_next):
-    """静态页禁用缓存：前端迭代频繁，浏览器缓存会让人看不到最新改动。"""
     resp = await call_next(request)
     if request.url.path in ("/", "/index.html") or request.url.path.endswith(
         (".html", ".js", ".css")
@@ -55,12 +39,10 @@ async def _no_cache_static(request, call_next):
         resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     return resp
 
-# ─── 会话与任务运行时（模块级单例：单进程单任务） ───
 
-_session = TaskSession()
+_session = LabSession()
 _task_lock = asyncio.Lock()
 _current_task: asyncio.Task | None = None
-# SSE 消费队列：任务运行期间事件推入此处；None 哨兵标记流结束
 _event_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
 
 
@@ -68,15 +50,7 @@ def _is_running() -> bool:
     return _current_task is not None and not _current_task.done()
 
 
-# ─── 文件管理（上传等效放入 workspace/） ────────────
-
-
 def _safe_workspace_path(name: str) -> Path:
-    """防上传/删除路径越界：拒绝隐藏段与绝对路径，
-    解析后路径须仍在 WORKSPACE_DIR 内。
-
-    保留相对子路径（src/x.py）：delete 端点若 basename 化会误指
-    根目录下同名文件。"""
     rel = Path(name)
     if not name or rel.is_absolute() or any(
         not part or part.startswith(".") for part in rel.parts
@@ -120,7 +94,6 @@ async def upload_files(files: list[UploadFile]) -> dict[str, Any]:
 
 @app.get("/api/files/{name:path}")
 async def download_file(name: str) -> FileResponse:
-    # 下载允许一级子目录产物（src/x.py 等）：先按相对路径解析再验边界
     resolved = (WORKSPACE_DIR / name).resolve()
     try:
         resolved.relative_to(WORKSPACE_DIR)
@@ -133,7 +106,6 @@ async def download_file(name: str) -> FileResponse:
 
 @app.delete("/api/files/{name:path}")
 async def delete_file(name: str) -> dict[str, Any]:
-    """删除单个已上传文件：mv 到 .trash/<ts>/（与 clear_workspace 同约定），非真删。"""
     if _is_running():
         raise HTTPException(status_code=409, detail="任务运行中，暂不能修改 workspace")
     resolved = _safe_workspace_path(name)
@@ -145,58 +117,29 @@ async def delete_file(name: str) -> dict[str, Any]:
     return {"deleted": resolved.name, "trashed_to": str(bucket)}
 
 
-# ─── 任务执行 + SSE 进度流 ────────────────────────────────
-
-
 class TaskRequest(BaseModel):
     question: str
 
 
-async def _run_graph_task(state: dict[str, Any]) -> None:
-    """后台执行主图，序列化 GraphEvents 推入 SSE 队列。"""
-    from orchestrator import get_graph
-    from ui.events import iter_graph_events
+async def _run_lab(question: str, resume: bool = False) -> None:
+    async def sink(ev: dict[str, Any]) -> None:
+        await _event_queue.put(ev)
 
+    started = time.time()
     try:
-        graph = get_graph()
-        async for ev in iter_graph_events(graph, state, config=_session.run_config()):
-            if ev.kind == "final":
-                final_state = ev.payload.get("state") or {}
-                _session.state = final_state
-                runs = final_state.get("verifier_runs") or []
-                await _event_queue.put({
-                    "kind": "final",
-                    "verdict": runs[-1].get("verdict", "unknown") if runs else "unknown",
-                    "iteration": final_state.get("iteration", 0),
-                    "elapsed": round(float(ev.payload.get("elapsed", 0)), 1),
-                    "artifacts": _list_workspace_files(),
-                })
-            elif ev.kind == "content":
-                await _event_queue.put({
-                    "kind": "content", "node": ev.node,
-                    "text": ev.payload.get("text", ""),
-                    "reasoning": bool(ev.payload.get("reasoning")),
-                })
-            elif ev.kind == "tool":
-                await _event_queue.put({
-                    "kind": "tool", "node": ev.node,
-                    "name": ev.payload.get("name", ""),
-                    "args": str(ev.payload.get("args", ""))[:200],
-                    "result": str(ev.payload.get("content", ""))[:200],
-                })
-            elif ev.kind == "node_start":
-                await _event_queue.put({"kind": "node_start", "node": ev.node})
-            elif ev.kind == "node_done":
-                await _event_queue.put({
-                    "kind": "node_done", "node": ev.node,
-                    "log": ev.payload.get("log") or [],
-                })
+        result = await _session.run(question, on_event=sink)
+        await _event_queue.put(
+            {
+                "kind": "final",
+                "verdict": result.get("verdict", "unknown"),
+                "elapsed": round(time.time() - started, 1),
+                "artifacts": _list_workspace_files(),
+            }
+        )
     except Exception as e:
-        await _event_queue.put({
-            "kind": "error", "detail": f"{type(e).__name__}: {e}",
-        })
+        await _event_queue.put({"kind": "error", "detail": f"{type(e).__name__}: {e}"})
     finally:
-        await _event_queue.put(None)  # 流结束哨兵
+        await _event_queue.put(None)
 
 
 @app.post("/api/task")
@@ -208,17 +151,43 @@ async def submit_task(req: TaskRequest) -> dict[str, Any]:
     async with _task_lock:
         if _is_running():
             raise HTTPException(status_code=409, detail="已有任务在运行（单任务约束）")
-        # 清掉上个任务残留的未消费事件
         while not _event_queue.empty():
             _event_queue.get_nowait()
-        state = _session.prepare_task(question)
-        _current_task = asyncio.create_task(_run_graph_task(state))
-    return {"accepted": True, "question": question}
+        _current_task = asyncio.create_task(_run_lab(question))
+    return {"accepted": True, "question": question, "thread_id": _session.thread_id}
+
+
+class ResumeRequest(BaseModel):
+    continue_lab: bool
+    question: str = "继续上次未完成的 lab"
+
+
+@app.get("/api/resume")
+async def resume_info() -> dict[str, Any]:
+    peek = _session.peek_resume()
+    return {"resumable": peek}
+
+
+@app.post("/api/resume")
+async def resume_lab(req: ResumeRequest) -> dict[str, Any]:
+    global _current_task
+    if _is_running():
+        raise HTTPException(status_code=409, detail="已有任务在运行")
+    peek = latest_incomplete(WORKSPACE_DIR)
+    if not peek:
+        raise HTTPException(status_code=404, detail="没有未完成的 lab")
+    tid, tree = peek
+    if not req.continue_lab:
+        return await asyncio.to_thread(_session.decline_resume)
+    _session.attach_resume(tid, tree)
+    while not _event_queue.empty():
+        _event_queue.get_nowait()
+    _current_task = asyncio.create_task(_run_lab(req.question, resume=True))
+    return {"accepted": True, "thread_id": tid, "resumed": True}
 
 
 @app.get("/api/task/stream")
 async def task_stream() -> EventSourceResponse:
-    """SSE：推送当前任务的 GraphEvent 流；final/error 后关闭。"""
     async def _gen():
         while True:
             try:
@@ -228,27 +197,30 @@ async def task_stream() -> EventSourceResponse:
                 continue
             if item is None:
                 break
-            yield {"event": item.get("kind", "message"),
-                   "data": json.dumps(item, ensure_ascii=False, default=str)}
+            yield {
+                "event": item.get("kind", "message"),
+                "data": json.dumps(item, ensure_ascii=False, default=str),
+            }
+
     return EventSourceResponse(_gen())
 
 
-# ─── 状态 / SUMMARY / 归档 ────────────────────────────────────────
+@app.post("/api/stop")
+async def stop_task() -> dict[str, Any]:
+    if not _is_running():
+        return {"stopped": False}
+    _session.request_stop()
+    return {"stopped": True}
 
 
 @app.get("/api/state")
 async def get_state() -> dict[str, Any]:
-    state = _session.state
-    intake = state.get("intake_result") or {}
-    runs = state.get("verifier_runs") or []
+    peek = _session.peek_resume()
     return {
         "running": _is_running(),
-        "question": state.get("question", ""),
-        "iteration": state.get("iteration", 0),
-        "intake_type": intake.get("type", "-"),
-        "intake_title": intake.get("title", "-"),
-        "n_messages": len(state.get("messages") or []),
-        "verdicts": [r.get("verdict") for r in runs],
+        "thread_id": _session.thread_id,
+        "resumable": peek,
+        "verdict": (_session.last_result or {}).get("verdict"),
     }
 
 
@@ -261,22 +233,14 @@ async def get_summary() -> JSONResponse:
 
 @app.post("/api/dream")
 async def dream() -> dict[str, Any]:
-    """离线知识治理（等效 CLI /dream）：LLM 合并/去重/淘汰归档卡片 + 重建索引。
-
-    同步 LLM 调用慢，卸载到线程池避免阻塞事件循环；
-    任务执行期间不允许治理。
-    """
     if _is_running():
         raise HTTPException(status_code=409, detail="任务运行中，先等它结束")
     from memory.dream import run_dream
 
     try:
-        return await asyncio.to_thread(run_dream)
+        return await run_dream(_session.llm)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
-
-# ─── 用户偏好（等效 CLI /profile 与 /remember） ───────────
 
 
 class RememberRequest(BaseModel):
@@ -285,7 +249,6 @@ class RememberRequest(BaseModel):
 
 @app.get("/api/profile")
 async def get_profile_api() -> dict[str, Any]:
-    """当前 profile（me.yaml）全文（等效 CLI /profile）。"""
     from memory.profile import load_profile
 
     return load_profile() or {}
@@ -293,7 +256,6 @@ async def get_profile_api() -> dict[str, Any]:
 
 @app.post("/api/remember")
 async def remember(req: RememberRequest) -> dict[str, Any]:
-    """向 preferences.style_rules 追加一条长期偏好规则（等效 CLI /remember，不调 LLM）。"""
     from memory.profile import append_rule
 
     try:
@@ -304,12 +266,8 @@ async def remember(req: RememberRequest) -> dict[str, Any]:
     return {"style_rules": rules}
 
 
-# ─── Skill 编辑（等效 CLI /edit_skill：提案 -> diff 确认 -> 落盘） ──
-
-# 待确认提案单槽位：单进程单用户，新提案覆盖旧提案；
-# 确认需 edit_id 匹配且未超时
 _PENDING_EDIT: dict[str, Any] | None = None
-_EDIT_PENDING_TTL = 600  # 秒
+_EDIT_PENDING_TTL = 600
 
 
 class EditSkillRequest(BaseModel):
@@ -325,12 +283,12 @@ class EditApplyRequest(BaseModel):
 @app.get("/api/skills")
 async def list_skills_api() -> list[dict[str, str]]:
     from tools.skill_tool import list_skill_meta
+
     return list_skill_meta()
 
 
 @app.post("/api/edit_skill")
 async def edit_skill(req: EditSkillRequest) -> dict[str, Any]:
-    """生成 skill 编辑提案（不落盘）；返回 diff 供前端展示，经 /api/edit_skill/apply 确认。"""
     global _PENDING_EDIT
     if _is_running():
         raise HTTPException(status_code=409, detail="任务运行中，先等它结束")
@@ -347,7 +305,7 @@ async def edit_skill(req: EditSkillRequest) -> dict[str, Any]:
     if not instruction:
         raise HTTPException(status_code=400, detail="instruction 为空")
     try:
-        proposal = await asyncio.to_thread(propose_edit, skill_name, instruction)
+        proposal = await propose_edit(skill_name, instruction)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
@@ -366,7 +324,6 @@ async def edit_skill(req: EditSkillRequest) -> dict[str, Any]:
 
 @app.post("/api/edit_skill/apply")
 async def edit_skill_apply(req: EditApplyRequest) -> dict[str, Any]:
-    """确认/取消待确认编辑提案；确认时整批落盘并清槽位。"""
     global _PENDING_EDIT
     if _PENDING_EDIT is None:
         raise HTTPException(status_code=404, detail="没有待确认的编辑提案")
@@ -393,15 +350,35 @@ async def edit_skill_apply(req: EditApplyRequest) -> dict[str, Any]:
 
 @app.post("/api/done")
 async def done() -> dict[str, Any]:
-    """等效 CLI /done：归档 -> 清理 -> 强制重建沙箱 -> 会话复位（逻辑等效进程重启）。
-
-    复位序列在 orchestrator/session.py:reset（与 CLI 共用）；沙箱重建
-    同步耗时可达几十秒，卸载到线程池避免阻塞事件循环。
-    """
     if _is_running():
-        raise HTTPException(status_code=409, detail="任务运行中，先等它结束")
-    return await asyncio.to_thread(_session.reset, lambda m: None)
+        _session.request_stop()
+        if _current_task is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(_current_task), timeout=15)
+            except Exception:
+                pass
+    from memory.retrieve import index_card_ids
+
+    cards = (_session.last_result or {}).get("knowledge_cards") or []
+    # 先异步索引卡片，再走同步复位
+    archive_extra: dict[str, Any] = {}
+    if cards:
+        from memory.archive import get_task_archive
+
+        title = (_session.last_result or {}).get("question") or "未命名任务"
+        summary = (_session.last_result or {}).get("summary") or ""
+        archive = get_task_archive()
+        task_id = archive.create_task(title, "other", summary[:4000])
+        card_ids = archive.create_cards(task_id, cards, title, "other")
+        if card_ids:
+            archive_extra = await index_card_ids(card_ids, _session.llm, _session.settings)
+            archive_extra["task_id"] = task_id
+            archive_extra["card_ids"] = card_ids
+            _session.last_result["knowledge_cards"] = []  # 避免 done() 再归档一遍
+    result = await asyncio.to_thread(_session.done, lambda m: None)
+    if archive_extra:
+        result["archive"] = {**(result.get("archive") or {}), **archive_extra}
+    return result
 
 
-# 静态单页（最后注册，避免吞掉 /api/*）
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
