@@ -12,6 +12,8 @@ from runtime.loop.schema import (
     SUBMIT_BRIEF,
     SUBMIT_DISPATCH,
     SUBMIT_JUDGE,
+    SUBMIT_REMEMBER,
+    SUBMIT_SPEC,
     _FULL,
     _MIN,
 )
@@ -157,8 +159,57 @@ def validate_payload(name: str, payload: dict[str, Any], *, degraded: bool = Fal
         brief = str(payload.get("brief") or "").strip()
         if brief in {"已完成", "done", "ok", "做不了"}:
             return "brief is too generic; say what you changed and any errors you hit"
+    if name == SUBMIT_SPEC and not degraded:
+        return _validate_spec(payload)
     if name == SUBMIT_DISPATCH and not degraded:
         return _validate_dispatch(payload)
+    if name == SUBMIT_REMEMBER and not degraded:
+        return _validate_remember(payload)
+    return ""
+
+
+# 别的工具的字段名。模型会把 submit_dispatch / write_acceptance 的形状摊平成
+# ["step_goal: ...", "goal: ...", "task_id: ..."] 塞进 milestones。
+_FOREIGN_FIELD = re.compile(
+    r"^\s*(step_goal|goal|spec|task_id|id|domain|testable|filename|content|assignments|"
+    r"interfaces|expected_artifacts|acceptance_strategy|acceptance_intent|acceptance_files|"
+    r"done_when|constraints|deliverables|overview|verdicts|decision|evidence|applies|rule)"
+    r"\s*[:：]",
+    re.I,
+)
+
+
+def _validate_spec(payload: dict[str, Any]) -> str:
+    """里程碑是句子，不是别的工具的字段。"""
+    for raw in payload.get("milestones") or []:
+        text = str(raw)
+        hit = _FOREIGN_FIELD.match(text)
+        if hit:
+            return (
+                f"milestone {text[:60]!r} starts with {hit.group(1)!r}, which is a field of "
+                "another tool, not a milestone. milestones is a list of plain sentences, one per "
+                "Flash product step, e.g. \"实现 two_sum.py 中的 two_sum 函数\". One problem is one "
+                "milestone. step_goal / goal / spec / task_id belong to submit_dispatch and "
+                "write_acceptance in later phases — do not flatten those fields in here."
+            )
+    return ""
+
+
+def _validate_remember(payload: dict[str, Any]) -> str:
+    """裁定按编号对齐。模型手抄规则文本会抄错，错了就静默丢失那条规则。"""
+    seen: set[int] = set()
+    for row in payload.get("verdicts") or []:
+        if not isinstance(row, dict):
+            return "each verdict is an object with index and applies"
+        index = row.get("index")
+        if not isinstance(index, int) or isinstance(index, bool):
+            return (
+                "each verdict needs index: the integer number printed in front of that rule in "
+                "the user message. Do not retype the rule text as the identifier."
+            )
+        if index in seen:
+            return f"rule index {index} judged twice; one verdict per rule"
+        seen.add(index)
     return ""
 
 

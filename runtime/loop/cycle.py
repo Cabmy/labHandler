@@ -89,6 +89,7 @@ class AgentSpec:
     visible_role: str
     extra_tools: frozenset[str] = frozenset()
     allow_tools: frozenset[str] | None = None
+    tool_choice: str = "auto"
     tool_extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -249,7 +250,9 @@ async def run_loop(
             if problems:
                 trace_event(S.EV_DECISION, reason="protocol_violation", detail="; ".join(problems))
 
-            choice: Any = tool_choice_required(spec.submit_tool) if force_brief else "auto"
+            choice: Any = (
+                tool_choice_required(spec.submit_tool) if force_brief else spec.tool_choice
+            )
 
             async def on_delta(text: str, reasoning: bool) -> None:
                 await emit("content", node=spec.name, text=text, reasoning=reasoning)

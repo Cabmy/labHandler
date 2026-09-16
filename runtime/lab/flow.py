@@ -265,17 +265,18 @@ async def remember(st: LabState) -> None:
         save_applied(st.session_dir, [])
         return
     await st.emit({"kind": "node_start", "node": "remember_judge"})
-    listed = "\n".join(f"- {rule}" for rule in catalog)
+    listed = "\n".join(f"{i}. {rule}" for i, rule in enumerate(catalog))
     submit = await st.drive_pro(
         TaskKind.REMEMBER_JUDGE,
         (
             f"User request:\n{st.question}\n\n{st.catalog}\n\n"
-            f"## /remember rules\n{listed}\n\n"
+            f"## /remember rules（编号即身份）\n{listed}\n\n"
             "Read the listed files if you need to know what this homework will hand in "
             "(code vs 实验报告 vs essay). Do not write code or 实验报告 here; do not grep for "
             "the rule text. labHandler calling this run a lab does not mean 实验报告. "
             "Default each /remember rule to applies=false. "
-            "Then call submit_remember. Do not write SPEC.md."
+            "Then call submit_remember with one verdict per rule, identified by its index "
+            "above. Do not retype the rule text as the identifier. Do not write SPEC.md."
         ),
         "remember",
     )

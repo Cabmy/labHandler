@@ -246,12 +246,20 @@ REMEMBER_SCHEMA: dict[str, Any] = {
     "properties": {
         "verdicts": {
             "type": "array",
+            "description": "每条 /remember 规则一个裁定，按用户消息里的编号对齐",
             "items": {
                 "type": "object",
-                "required": ["rule", "applies"],
+                "required": ["index", "applies"],
                 "properties": {
-                    "rule": {"type": "string"},
+                    "index": {
+                        "type": "integer",
+                        "description": "用户消息里印在该规则前面的编号。身份靠它对齐，不要靠抄规则原文",
+                    },
                     "applies": {"type": "boolean"},
+                    "rule": {
+                        "type": "string",
+                        "description": "可选，仅作可读标注；抄错不影响对齐",
+                    },
                 },
             },
         },

@@ -18,14 +18,28 @@ def catalog_rules(profile: dict[str, Any]) -> list[str]:
 
 
 def applied_from_payload(catalog: list[str], payload: dict[str, Any]) -> list[str]:
+    """按 index 取回规则原文。
+
+    以前靠模型把 rule 原文抄回来做精确匹配，抄错（改写、错字）时那条裁定会被
+    静默丢掉——applies=true 也等于没说。编号是稳定标识，原文只当标注。
+    """
     chosen: list[str] = []
     for row in payload.get("verdicts") or []:
         if not isinstance(row, dict) or not row.get("applies"):
             continue
-        text = str(row.get("rule") or "").strip()
-        if text in catalog and text not in chosen:
+        text = _resolve(catalog, row)
+        if text and text not in chosen:
             chosen.append(text)
     return chosen
+
+
+def _resolve(catalog: list[str], row: dict[str, Any]) -> str:
+    """index 优先。degraded 模式的 schema 不带 index，退回原文精确匹配。"""
+    index = row.get("index")
+    if isinstance(index, int) and not isinstance(index, bool):
+        return catalog[index] if 0 <= index < len(catalog) else ""
+    text = str(row.get("rule") or "").strip()
+    return text if text in catalog else ""
 
 
 def load_applied(session_dir: Path) -> list[str] | None:

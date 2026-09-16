@@ -133,6 +133,11 @@ A specification of the finished work plus a Flash work queue — not your privat
   file, one milestone is correct. Split a true multi-part project at those parts — do not
   invent steps for reading, designing, testing, or polishing. Details go in overview /
   interfaces; you will write the concrete assignment later, one wave at a time.
+  Each milestone is one plain sentence naming the product step, e.g.
+  "实现 two_sum.py 中的 two_sum 函数". It is NOT a set of `field: value` lines: `step_goal`,
+  `goal`, `spec`, `task_id`, `id`, `domain`, `testable` belong to submit_dispatch and
+  write_acceptance in later phases. Flattening those fields into milestones is rejected, and
+  it is not how you split work — four such lines are still one milestone.
 
 ## Rules
 - Do not invent requirements the materials / user request never stated. Specifying the function
@@ -290,7 +295,12 @@ apply. The word lab does not make it apply.
 - 力扣 / 实现函数 / 只交 .py → not 实验报告. Rules about 截图 / markdown '>' placeholders are false.
 - 实验报告 / 截图 rules are true only if materials are an 实验指导书 (实验目的 / 步骤 / 结果).
 The rule texts are already in the user message. Do not grep/search the workspace for them.
-When unsure, applies=false. Call submit_remember with the exact rule text. No other output.
+When unsure, applies=false.
+
+Every turn of this phase must be a tool call — plain prose is not accepted here, so do not
+answer the homework, do not draft code, do not explain your reasoning in text. Read a listed
+file, or call submit_remember. One verdict per rule, identified by the `index` printed in front
+of it; `rule` is an optional label and retyping it wrong changes nothing.
 submit_halt only if the homework itself cannot be identified from the materials.
 """
 

@@ -74,6 +74,10 @@ class PhaseSpec:
     """存回共享 transcript 时是否保留纯文字的 assistant 轮。
     Remember-Judge 只该留下裁定，它顺手写的代码/报告建议不能漏给后面的阶段。"""
 
+    tool_choice: str = "auto"
+    """本阶段每拍的 tool_choice。`required` = 必须调某个工具，纯文字回复不成立。
+    Remember-Judge 用它：光靠 prompt 拦不住它顺手把作业做了。"""
+
     def node_permission(self, fallback: Permission | None = None) -> Permission:
         chosen = self.permission or fallback
         if chosen is None:
@@ -105,6 +109,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         # 写 SPEC 之前：同一条 Pro 对话里先裁定哪些 /remember 适用于本 lab。
         shares_thread=True,
         carry_prose=False,
+        tool_choice="required",
     ),
     TaskKind.DISPATCH: PhaseSpec(
         agent=PRO,

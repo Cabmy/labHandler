@@ -99,6 +99,7 @@ class LabRunner:
             visible_role=phase.visible_role(permission),
             extra_tools=phase.extra_tools,
             allow_tools=phase.allow_tools,
+            tool_choice=phase.tool_choice,
             tool_extras={"skill": self._skill} if phase.agent == PRO else {},
         )
 
