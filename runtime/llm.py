@@ -53,6 +53,22 @@ class LLMGateway:
             max_retries=0,
             timeout=120.0,
         )
+        same_flash = (
+            settings.flash_base_url == settings.llm_base_url
+            and settings.flash_api_key == settings.llm_api_key
+            and settings.flash_default_headers == settings.llm_default_headers
+        )
+        self.flash_client = (
+            self.chat_client
+            if same_flash
+            else AsyncOpenAI(
+                api_key=settings.flash_api_key,
+                base_url=settings.flash_base_url,
+                default_headers=settings.flash_default_headers,
+                max_retries=0,
+                timeout=120.0,
+            )
+        )
         self.embed_client = embed_client or AsyncOpenAI(
             api_key=settings.embedding_api_key or "empty",
             base_url=settings.embedding_base_url,
@@ -60,10 +76,16 @@ class LLMGateway:
             timeout=60.0,
         )
 
+    def _client_for(self, model: str) -> AsyncOpenAI:
+        if model == self.settings.flash_model:
+            return self.flash_client
+        return self.chat_client
+
     async def aclose(self) -> None:
-        close = getattr(self.chat_client, "close", None)
-        if callable(close):
-            await close()
+        for client in {self.chat_client, self.flash_client}:
+            close = getattr(client, "close", None)
+            if callable(close):
+                await close()
 
     async def chat(
         self,
@@ -158,7 +180,7 @@ class LLMGateway:
         finish_reason: str | None = None
 
         async with self._sem:
-            stream = await self.chat_client.chat.completions.create(**kwargs)
+            stream = await self._client_for(model).chat.completions.create(**kwargs)
             async for chunk in stream:
                 if getattr(chunk, "usage", None):
                     u = chunk.usage

@@ -73,17 +73,17 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"false", "0", "no", "off"}
 
 
-def _env_headers() -> dict[str, str]:
-    """LLM_DEFAULT_HEADERS：合法 JSON 对象 → str→str；空则 _DEFAULT_LLM_HEADERS；非法 JSON 抛 ConfigError。"""
-    raw = _env_str("LLM_DEFAULT_HEADERS")
+def _env_headers(name: str, *, default: dict[str, str] | None = None) -> dict[str, str]:
+    """读 JSON 对象请求头。空则用 default（再空则 {}）；非法 JSON 抛 ConfigError。"""
+    raw = _env_str(name)
     if not raw:
-        return dict(_DEFAULT_LLM_HEADERS)
+        return dict(default or {})
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise ConfigError(f"LLM_DEFAULT_HEADERS 不是合法 JSON：{e}") from e
+        raise ConfigError(f"{name} 不是合法 JSON：{e}") from e
     if not isinstance(data, dict):
-        raise ConfigError("LLM_DEFAULT_HEADERS 必须是 JSON 对象")
+        raise ConfigError(f"{name} 必须是 JSON 对象")
     return {str(k): str(v) for k, v in data.items()}
 
 
@@ -102,7 +102,10 @@ class RuntimeSettings:
     llm_api_key: str
     pro_model: str
     flash_model: str
+    flash_base_url: str
+    flash_api_key: str
     llm_default_headers: dict[str, str]
+    flash_default_headers: dict[str, str]
     # Embedding
     embedding_base_url: str
     embedding_api_key: str
@@ -158,6 +161,12 @@ def get_settings() -> RuntimeSettings:
     if not pro_model or not flash_model:
         raise ConfigError("PRO_MODEL 与 FLASH_MODEL 不能为空")
 
+    llm_base_url = _env_str("LLM_BASE_URL", "https://agentrouter.org/v1")
+    llm_headers = _env_headers("LLM_DEFAULT_HEADERS", default=_DEFAULT_LLM_HEADERS)
+    flash_base_url = _env_str("FLASH_BASE_URL") or llm_base_url
+    flash_api_key = _env_str("FLASH_API_KEY") or llm_key
+    flash_headers = _env_headers("FLASH_DEFAULT_HEADERS", default=llm_headers)
+
     context_budget = _env_int("CONTEXT_BUDGET_TOKENS", 200000, minimum=4096)
     output_reserve = _env_int("OUTPUT_RESERVE_TOKENS", 8192, minimum=256)
     if output_reserve >= context_budget:
@@ -171,11 +180,14 @@ def get_settings() -> RuntimeSettings:
         profile_path=Path(_env_str("PROFILE_PATH", "./profile/me.yaml")).resolve(),
         memory_db_path=Path(_env_str("MEMORY_DB_PATH", "./.labhandler_data/memory.db")).resolve(),
         cards_dir=Path(_env_str("CARDS_DIR", "./.labhandler_data/cards")).resolve(),
-        llm_base_url=_env_str("LLM_BASE_URL", "https://agentrouter.org/v1"),
+        llm_base_url=llm_base_url,
         llm_api_key=llm_key,
         pro_model=pro_model,
         flash_model=flash_model,
-        llm_default_headers=_env_headers(),
+        flash_base_url=flash_base_url,
+        flash_api_key=flash_api_key,
+        llm_default_headers=llm_headers,
+        flash_default_headers=flash_headers,
         embedding_base_url=_env_str("EMBEDDING_BASE_URL", "https://llmapi.paratera.com/v1/"),
         embedding_api_key=_env_str("EMBEDDING_API_KEY"),
         embedding_model=_env_str("EMBEDDING_MODEL", "GLM-Embedding-3"),
