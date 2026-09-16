@@ -357,6 +357,7 @@
     <h1>labHandler <small>把作业材料拖进来，剩下的交给 agent</small></h1>
     <nav>
       <button id="tabTask" class="active">任务</button>
+      <button id="tabRemember">Remember</button>
       <button id="tabSkill">Skill</button>
     </nav>
   </header>
@@ -377,6 +378,7 @@
         <input type="text" id="question" placeholder="例：请按 README 完成作业" value="请按 README 完成作业">
         <button id="run">开始</button>
         <button id="stopbtn" class="ghost" disabled>停止</button>
+        <button id="rememberbtn" class="ghost" title="写入长期偏好，SPEC 后由 Remember-Judge 裁定是否适用">Remember</button>
         <button id="dreambtn" class="ghost" title="离线治理归档卡片">知识治理</button>
         <span id="status"></span>
       </div>
@@ -399,7 +401,22 @@
 
   </div>
 
-  <!-- ═══ Skill / 偏好 ═══ -->
+  <!-- ═══ Remember 偏好 ═══ -->
+  <div id="viewRemember" class="hidden">
+    <section id="secProfile">
+      <h2>长期偏好（/remember）</h2>
+      <p style="font-size:12px;color:var(--dim);margin-bottom:10px">
+        写入 profile。SPEC 后由 Remember-Judge 裁定是否适用于本 lab；步骤 Judge 对照适用条目，未满足不能结束。
+      </p>
+      <ul id="ruleList" class="files"></ul>
+      <div class="row">
+        <input id="ruleInput" type="text" placeholder="例：实验报告结论必须含「误差分析」" style="flex:1">
+        <button id="ruleAdd">Remember</button>
+      </div>
+    </section>
+  </div>
+
+  <!-- ═══ Skill ═══ -->
   <div id="viewSkill" class="hidden">
 
     <div id="skillNotice" class="hidden">任务运行中，暂不能编辑；等本次任务结束后再来。</div>
@@ -417,18 +434,6 @@
       <div class="row hidden" id="skillActions" style="margin-top:10px">
         <button id="skillApply">应用修改</button>
         <button id="skillCancel" class="ghost">取消</button>
-      </div>
-    </section>
-
-    <section id="secProfile">
-      <h2>长期偏好（/remember）</h2>
-      <p style="font-size:12px;color:var(--dim);margin-bottom:10px">
-        写入 profile。SPEC 后由 Remember-Judge 裁定是否适用于本 lab；步骤 Judge 对照适用条目，未满足不能结束。
-      </p>
-      <ul id="ruleList" class="files"></ul>
-      <div class="row">
-        <input id="ruleInput" type="text" placeholder="例：实验报告结论必须含「误差分析」" style="flex:1">
-        <button id="ruleAdd">追加规则</button>
       </div>
     </section>
 
@@ -450,21 +455,33 @@
       $('drop').classList.toggle('disabled', v);
       $('fileinput').disabled = v;
       $('tabSkill').disabled = v;
+      $('tabRemember').disabled = v;
+      $('rememberbtn').disabled = v;
       $('skillNotice').classList.toggle('hidden', !v);
       $('secSkill').classList.toggle('hidden', v);
-      if (v && !$('viewSkill').classList.contains('hidden')) switchTab('task');
+      if (v && (!$('viewSkill').classList.contains('hidden') || !$('viewRemember').classList.contains('hidden'))) {
+        switchTab('task');
+      }
     }
 
     // ─── tab 切换 ───────────────────────────────────────────────
     function switchTab(name) {
-      const task = name === 'task';
-      $('viewTask').classList.toggle('hidden', !task);
-      $('viewSkill').classList.toggle('hidden', task);
-      $('tabTask').classList.toggle('active', task);
-      $('tabSkill').classList.toggle('active', !task);
+      $('viewTask').classList.toggle('hidden', name !== 'task');
+      $('viewRemember').classList.toggle('hidden', name !== 'remember');
+      $('viewSkill').classList.toggle('hidden', name !== 'skill');
+      $('tabTask').classList.toggle('active', name === 'task');
+      $('tabRemember').classList.toggle('active', name === 'remember');
+      $('tabSkill').classList.toggle('active', name === 'skill');
+      if (name === 'remember') {
+        loadRules();
+        const input = $('ruleInput');
+        if (input) setTimeout(() => input.focus(), 0);
+      }
     }
     $('tabTask').onclick = () => switchTab('task');
+    $('tabRemember').onclick = () => { if (!running) switchTab('remember'); };
     $('tabSkill').onclick = () => { if (!running) switchTab('skill'); };
+    $('rememberbtn').onclick = () => { if (!running) switchTab('remember'); };
 
     // ─── 文件上传 / 删除 ────────────────────────────────────────
     async function refreshFiles(listEl) {

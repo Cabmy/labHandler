@@ -78,6 +78,6 @@ python -m server
 | 上传材料 + 下达任务 | 跑当前 lab |
 | 停止 | 取消 in-flight Task，lab 仍在 |
 | 归档结束 | 卡片入档 → workspace 进 `.trash/` → 重建沙箱 → 下一个 lab |
+| Remember | 写入 profile 长期偏好；Remember-Judge 裁定是否适用，步骤 Judge 对照后才能结束 |
 | 知识治理 | 离线合并/淘汰卡片并重建向量索引 |
 | Skill 编辑 | 自然语言改现有 skill，diff 确认后落盘 |
-| 追加规则 | 写入 profile；Remember-Judge 裁定是否适用，步骤 Judge 对照后才能结束 |

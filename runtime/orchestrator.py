@@ -232,7 +232,8 @@ class LabRunner:
         executed_ids: set[str] = set()
         # 续跑时产物仍完好的 id：Pro 再派到它就直接跳过
         resumable: set[str] = set()
-        # Pro 全链路共用；Flash 不走这份。remember_judge 单独开，不写入。
+        # Pro 全链路共用（SPEC / remember_judge / dispatch / judge / 接管 / summary）。
+        # Flash 不走这份。
         pro_history: list[dict[str, Any]] = []
 
         async def run_pro(kind: TaskKind, user: str, label: str) -> dict[str, Any]:
@@ -375,6 +376,16 @@ class LabRunner:
             )
             await self._emit(on_event, {"kind": "node_start", "node": f"dispatch:{step}"})
             submit = await run_pro(TaskKind.DISPATCH, dispatch_user, f"dispatch{step}")
+            if not submit or submit.get("name") != SUBMIT_DISPATCH:
+                # 预算耗尽 / 校验失败时 submit 为空。不能当成「空 assignments = 做完了」。
+                await self._emit(
+                    on_event,
+                    {
+                        "kind": "error",
+                        "detail": "Pro 未能产出有效派发（校验失败或步数耗尽），未启动 worker",
+                    },
+                )
+                break
             dispatch = Dispatch.from_payload(payload_of(submit, SUBMIT_DISPATCH))
 
             if dispatch.is_empty:

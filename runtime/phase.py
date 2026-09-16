@@ -38,7 +38,7 @@ from tools.skill_tool import LOAD_SKILL, LOAD_SKILL_REFERENCE
 PRO = "pro"
 FLASH = "flash"
 # 只读 Pro 阶段默认看不见 pro 权限工具；skill 读取经 extra 点名放行。
-# Flash / remember_judge 不在 extra 里，因此调不到。
+# Flash 不在 extra 里，因此调不到。
 _SKILL_READ = frozenset({LOAD_SKILL, LOAD_SKILL_REFERENCE})
 
 
@@ -89,8 +89,8 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_REMEMBER,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        # 只裁定规则适用性，与主线无关，不占 Pro 的 transcript。
-        shares_thread=False,
+        # 紧接 SPEC：同一条 Pro 对话里裁定哪些 /remember 适用于本 lab。
+        shares_thread=True,
     ),
     TaskKind.DISPATCH: PhaseSpec(
         agent=PRO,

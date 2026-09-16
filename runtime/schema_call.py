@@ -369,7 +369,25 @@ def parse_args(raw: str) -> tuple[dict[str, Any] | None, str]:
         return None, f"invalid json: {e}"
     if not isinstance(data, dict):
         return None, "arguments must be a JSON object"
-    return data, ""
+    return _coerce_nested_json(data), ""
+
+
+def _coerce_nested_json(data: dict[str, Any]) -> dict[str, Any]:
+    """部分模型会把 assignments 等数组字段再 JSON 编码成字符串。能解成 list/dict 就解开。"""
+    out = dict(data)
+    for key, value in data.items():
+        if not isinstance(value, str):
+            continue
+        stripped = value.lstrip()
+        if not stripped[:1] in "[{":
+            continue
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, (list, dict)):
+            out[key] = parsed
+    return out
 
 
 def validate_payload(name: str, payload: dict[str, Any], *, degraded: bool = False) -> str:

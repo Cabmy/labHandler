@@ -5,6 +5,7 @@ SPEC.md 由 Pro 维护，是后续每一步派发的共同依据。一份 Assign
 多于 1 个时全部降只读。
 """
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -172,12 +173,19 @@ class Dispatch:
 
     @classmethod
     def from_payload(cls, raw: dict[str, Any]) -> "Dispatch":
+        items = raw.get("assignments") or []
+        if isinstance(items, str):
+            try:
+                parsed = json.loads(items)
+            except json.JSONDecodeError:
+                parsed = []
+            items = parsed if isinstance(parsed, list) else []
+        if not isinstance(items, list):
+            items = []
         return cls(
             step_goal=str(raw.get("step_goal") or "").strip(),
             assignments=[
-                Assignment.from_payload(a)
-                for a in (raw.get("assignments") or [])
-                if isinstance(a, dict)
+                Assignment.from_payload(a) for a in items if isinstance(a, dict)
             ],
         )
 
