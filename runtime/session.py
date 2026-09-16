@@ -15,10 +15,10 @@ from config.runtime import RuntimeSettings, get_settings
 from runtime.llm import LLMGateway
 from runtime.observe.sinks import build_sinks
 from runtime.observe.tracer import Tracer
-from runtime.orchestrator import LabRunner
-from runtime.persist import latest_incomplete, session_dir as make_session_dir
+from runtime.lab.runner import LabRunner
+from runtime.lab.persist import latest_incomplete, session_dir as make_session_dir
 from runtime.task import TaskTree, new_session_task
-from runtime.tools import build_registry
+from runtime.loop.tools import build_registry
 
 
 def _new_thread_id() -> str:

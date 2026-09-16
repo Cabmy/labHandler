@@ -14,7 +14,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from config.runtime import get_settings
-from runtime.persist import latest_incomplete
+from runtime.lab.persist import latest_incomplete
 from runtime.session import LabSession
 from tools.workspace_utils import iter_workspace_files
 

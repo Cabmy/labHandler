@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from runtime.persist import read_text, write_text
+from runtime.lab.persist import read_text, write_text
 
 MEMORY_FILE = "MEMORY.md"
 FORGET_FILE = "FORGET.md"

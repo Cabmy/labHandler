@@ -15,7 +15,8 @@ from typing import Any
 from config.prompts import EDIT_SKILL_SYSTEM
 from config.runtime import get_settings
 from runtime.llm import LLMGateway
-from runtime.schema_call import SKILL_EDIT_SCHEMA, SUBMIT_SKILL_EDIT, oneshot_schema
+from runtime.loop.schema import SKILL_EDIT_SCHEMA, SUBMIT_SKILL_EDIT
+from runtime.loop.parse import oneshot_schema
 from skills.repository import (
     apply_skill_operations,
     list_skill_documents,

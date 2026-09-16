@@ -1,74 +1,68 @@
-"""Task 树解释器。一次 lab = 一份 SPEC.md + 至多 _MAX_STEPS 步派发，每步 1~3 个 Flash。
+"""一次 lab：SPEC → Remember-Judge → 逐步派发 → Judge → Summary。
 
-所有权与数据流：
-- Pro 全链路共用一份 history（SPEC / dispatch / judge / 接管 / 改 SPEC / summary）。
-  Flash 每次 assignment 新开 loop。
-- 每步验收结论进 last_gate；整个 run 的 verdict 取各步最差的那个。
-- 派发粒度固定在「一个 Flash 一步能做完」。空 assignments 或 judge=finish 结束推进。
+Pro 全链路共用一份 history。Flash 每次 assignment 新开 loop。
+派发粒度固定在「一个 Flash 一步能做完」。空 assignments 或 judge=finish 结束推进。
 """
 
 import asyncio
 import json
 import time
-from dataclasses import replace
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 from config.runtime import RuntimeSettings
 from memory.profile import inject_for_agent, load_profile
-from runtime.accept import AcceptResult, NO_HARD_CRITERIA, PASS, sanity_and_run
 from runtime.context.disclosure import skill_catalog_block
 from runtime.context.notes import append_forget, apply_memory
-from runtime.llm import LLMGateway
-from runtime.loop import AgentSpec, drop_dangling_tool_calls, run_loop
-from runtime.observe import spans as S
-from runtime.observe.tracer import Tracer
-from runtime.phase import PRO, phase_of
-from runtime.persist import (
+from runtime.lab.accept import AcceptResult, NO_HARD_CRITERIA
+from runtime.lab.helpers import (
+    partition,
+    payload_of,
+    render_progress,
+    resume_spec,
+    worst_gate,
+)
+from runtime.lab.ingest import ingest
+from runtime.lab.persist import (
     EffectLedger,
-    MATERIALS_FILE,
+    CATALOG_FILE,
     SPEC_FILE,
-    audit_offset,
-    changed_files_from_audit,
     read_text,
     save_tree,
     write_text,
 )
-from runtime.remember import (
+from runtime.lab.remember import (
     applied_from_payload,
     catalog_rules,
     load_applied,
     rules_satisfied,
     save_applied,
 )
-from runtime.schema_call import (
+from runtime.lab.spec import Dispatch, ProjectSpec
+from runtime.lab.step import run_gate as evaluate_gate, run_step
+from runtime.llm import LLMGateway
+from runtime.loop import AgentSpec, drop_dangling_tool_calls, run_loop
+from runtime.loop.schema import (
     SUBMIT_BRIEF,
     SUBMIT_DISPATCH,
     SUBMIT_JUDGE,
     SUBMIT_REMEMBER,
     SUBMIT_SPEC,
     SUBMIT_SUMMARY,
-    synthetic_brief,
 )
-from runtime.scheduler import permission_for_wave, run_wave
-from runtime.spec import Assignment, Dispatch, ProjectSpec, render_assignment
+from runtime.loop.tools import ToolRegistry, build_registry
+from runtime.observe import spans as S
+from runtime.observe.tracer import Tracer
+from runtime.phase import PRO, phase_of
 from runtime.task import Permission, RuntimeTask, TaskKind, TaskStatus, TaskTree
-from runtime.tools import ToolRegistry, build_registry
-from tools.sandbox_tools import reset_sandbox_failure_counter, sandbox_convert_to_markdown
+from tools.sandbox_tools import reset_sandbox_failure_counter
 from tools.skill_tool import SkillBind
-from tools.workspace_utils import iter_workspace_files
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
-_PARSEABLE = {".pdf", ".docx", ".pptx"}
-_TEXT_EXT = {".md", ".txt", ".py", ".json", ".yml", ".yaml", ".toml", ".csv", ".rst"}
-_MATERIALS_CAP = 16000
 _BRIEFS_CAP = 12000
-_PROGRESS_CAP = 8000
-# 一次 lab 最多推进多少步。超过此上限无论 judge 如何都进入 summary。
 _MAX_STEPS = 12
-# SPEC.md 最多重写几次。用尽后不再 revise_spec，进入 summary。
 _MAX_SPEC_REVISIONS = 2
 
 
@@ -108,36 +102,6 @@ class LabRunner:
     def _trace_event(self, name: str, **attrs: Any) -> None:
         if self.tracer is not None:
             self.tracer.event(name, **attrs)
-
-    # ── 材料摄取 ────────────────────────────────────────
-
-    async def ingest(self, session_dir: Path) -> str:
-        ws = self.settings.workspace_dir
-        if not ws.exists():
-            write_text(session_dir, MATERIALS_FILE, "# Materials\n\n(empty workspace)\n")
-            return read_text(session_dir, MATERIALS_FILE)
-
-        lines = ["# Materials", ""]
-        for p in iter_workspace_files(ws, max_files=40):
-            rel = p.relative_to(ws)
-            suffix = p.suffix.lower()
-            lines.append(f"## {rel}")
-            if suffix in _PARSEABLE:
-                try:
-                    lines.append((await sandbox_convert_to_markdown(str(p)))[:12000])
-                except Exception as e:
-                    lines.append(f"(parse failed: {type(e).__name__}: {e})")
-            elif suffix in _TEXT_EXT:
-                lines.append("```")
-                lines.append(p.read_text(encoding="utf-8", errors="replace")[:8000])
-                lines.append("```")
-            else:
-                lines.append(f"(binary, {p.stat().st_size} bytes)")
-            lines.append("")
-
-        text = "\n".join(lines)
-        write_text(session_dir, MATERIALS_FILE, text)
-        return text
 
     def _agent_spec(self, kind: TaskKind, permission: Permission) -> AgentSpec:
         """把阶段定义解析成这一拍的 AgentSpec：模型、注入后的 system、工具可见范围。"""
@@ -221,7 +185,7 @@ class LabRunner:
 
         reset_sandbox_failure_counter()
         ledger = EffectLedger.load(session_dir, self.settings.workspace_dir)
-        materials = read_text(session_dir, MATERIALS_FILE) or await self.ingest(session_dir)
+        catalog = read_text(session_dir, CATALOG_FILE) or await ingest(self.settings, session_dir)
 
         last_gate = AcceptResult(state=NO_HARD_CRITERIA)
         # 整个 run 的结论取各步里最差的那个：中间失败的一步不能被后面一步洗白
@@ -301,22 +265,14 @@ class LabRunner:
             save_tree(session_dir, tree)
             return result.submit or {}
 
-        def payload_of(submit: dict[str, Any], name: str) -> dict[str, Any]:
-            """名字对得上才取出 payload；对不上返回空 dict，上层不会读到错阶段字段。"""
-            if not submit:
-                return {}
-            if "name" not in submit:
-                return submit
-            return submit.get("payload", {}) if submit["name"] == name else {}
-
         # ── SPEC.md ─────────────────────────────────────
         spec_user = (
-            f"User request:\n{question}\n\n## {MATERIALS_FILE}\n{materials[:_MATERIALS_CAP]}\n\n"
-            "Write SPEC.md for this task and call submit_spec. Decompose the work top-down into "
-            "milestones that a single weak worker can each finish in one assignment."
+            f"User request:\n{question}\n\n{catalog}\n"
+            "Use read_file on the listed paths. Write SPEC.md and call submit_spec. "
+            "Decompose the work top-down into milestones that a single weak worker can each finish in one assignment."
         )
 
-        project = self._resume_spec(tree) if resume else None
+        project = resume_spec(tree) if resume else None
         if project is not None:
             await self._emit(on_event, {"kind": "node_done", "node": "spec", "log": [{"resumed": True}]})
         else:
@@ -345,7 +301,7 @@ class LabRunner:
             )
         write_text(session_dir, SPEC_FILE, project.render())
         await self._scope_remember(
-            question, session_dir, run_pro, payload_of, on_event, resume=resume
+            question, session_dir, run_pro, on_event, resume=resume
         )
 
         if resume:
@@ -370,7 +326,7 @@ class LabRunner:
             dispatch_user = (
                 f"User request: {question}\n\n"
                 f"## SPEC.md\n{read_text(session_dir, SPEC_FILE)}\n\n"
-                f"## 已完成的步骤\n{self._render_progress(progress)}\n\n"
+                f"## 已完成的步骤\n{render_progress(progress)}\n\n"
                 f"这是第 {step} 步（最多 {_MAX_STEPS} 步）。决定接下来这一步做什么，调用 submit_dispatch。"
                 "只派这一步的活；全部做完时给空的 assignments。"
             )
@@ -395,7 +351,7 @@ class LabRunner:
                 )
                 break
 
-            assignments, skipped = self._partition(dispatch.assignments, resumable, executed_ids, step)
+            assignments, skipped = partition(dispatch.assignments, resumable, executed_ids, step)
             if skipped:
                 await self._emit(on_event, {"kind": "resume_skip", "assignments": skipped})
             await self._emit(
@@ -416,7 +372,8 @@ class LabRunner:
                 # 本步 assignments 全部命中 resumable，progress 已有摘要，不跑 worker
                 continue
 
-            briefs, spec_invalid, last_gate = await self._run_step(
+            briefs, spec_invalid, last_gate = await run_step(
+                self,
                 assignments,
                 question=question,
                 step_goal=dispatch.step_goal,
@@ -427,7 +384,7 @@ class LabRunner:
                 progress=progress,
                 on_event=on_event,
             )
-            run_gate = self._worst_gate(run_gate, last_gate)
+            run_gate = worst_gate(run_gate, last_gate)
 
             # ── Judge ───────────────────────────────────
             judge_user = (
@@ -485,7 +442,7 @@ class LabRunner:
                     progress.append((f"step{step}-pro", str(payload["brief"])))
                     # 接管也写了文件，门禁必须重跑，不能沿用 worker 那次的结论
                     for a in assignments:
-                        last_gate = await self._gate(session_dir, a.gate_id)
+                        last_gate = await evaluate_gate(self, session_dir, a.gate_id)
                         if not last_gate.is_pass:
                             break
                 else:
@@ -523,7 +480,7 @@ class LabRunner:
             f"The lab is complete. You are still Pro — write the wrap-up from this conversation "
             f"and the artifacts below.\n\n"
             f"User request: {question}\n\n## SPEC.md\n{read_text(session_dir, SPEC_FILE)}\n\n"
-            f"## 完成情况\n{self._render_progress(progress)}\n\n"
+            f"## 完成情况\n{render_progress(progress)}\n\n"
             f"Gate: {run_gate.state}\n"
             "Call submit_summary. If the gate was no_hard_criteria, say so in user_summary."
         )
@@ -550,219 +507,6 @@ class LabRunner:
             "question": question,
         }
 
-    # ── 一步内的派发 ────────────────────────────────────
-
-    async def _run_step(
-        self,
-        assignments: list[Assignment],
-        *,
-        question: str,
-        step_goal: str,
-        session_dir: Path,
-        tree: TaskTree,
-        root: RuntimeTask,
-        ledger: EffectLedger,
-        progress: list[tuple[str, str]],
-        on_event: EventSink | None,
-    ) -> tuple[list[dict[str, Any]], bool, AcceptResult]:
-        permission = permission_for_wave(len(assignments))
-        workers = [
-            tree.add_child(
-                root.task_id,
-                kind=TaskKind.WORKER,
-                permission=permission,
-                step_budget=self.settings.flash_step_budget,
-                deadline=self.clock() + self.settings.task_wall_time_s,
-                node_spec=a.to_dict(),
-            )
-            for a in assignments
-        ]
-        save_tree(session_dir, tree)
-
-        domains = [a.domain or a.goal for a in assignments]
-        done_so_far = list(progress)
-
-        span_cm = (
-            self.tracer.span(
-                S.STEP,
-                kind=S.KIND_CHAIN,
-                **{
-                    S.ATTR_WAVE_SIZE: len(workers),
-                    S.ATTR_PERMISSION: permission.value,
-                    S.ATTR_STEP_GOAL: step_goal,
-                },
-            )
-            if self.tracer is not None
-            else None
-        )
-        if span_cm is not None:
-            span_cm.__enter__()
-        try:
-            results = await run_wave(
-                workers,
-                lambda w: self._run_worker(
-                    w,
-                    question=question,
-                    step_goal=step_goal,
-                    session_dir=session_dir,
-                    tree=tree,
-                    ledger=ledger,
-                    done_so_far=done_so_far,
-                    domains=domains,
-                    on_event=on_event,
-                ),
-                self.settings,
-                tracer=self.tracer,
-            )
-        finally:
-            if span_cm is not None:
-                span_cm.__exit__(None, None, None)
-
-        briefs = []
-        spec_invalid = False
-        for worker, brief in results:
-            briefs.append(brief)
-            aid = str((worker.node_spec or {}).get("id") or "")
-            if not aid:
-                continue
-            if brief.get("outcome") == "spec_invalid":
-                spec_invalid = True
-            progress.append((aid, str(brief.get("brief") or "")))
-
-        return briefs, spec_invalid, self._step_gate(results)
-
-    async def _run_worker(
-        self,
-        worker: RuntimeTask,
-        *,
-        question: str,
-        step_goal: str,
-        session_dir: Path,
-        tree: TaskTree,
-        ledger: EffectLedger,
-        done_so_far: list[tuple[str, str]],
-        domains: list[str],
-        on_event: EventSink | None,
-    ) -> dict[str, Any]:
-        if worker.status is TaskStatus.PENDING:
-            worker.transit(TaskStatus.RUNNING)
-        # 只统计这个 worker 自己写过的文件，不要把整个会话的写入都算给它
-        audit_mark = audit_offset(self.settings.workspace_dir)
-
-        assignment = Assignment.from_payload(worker.node_spec or {})
-        others = [d for d in domains if d and d != (assignment.domain or assignment.goal)]
-        prompt = render_assignment(
-            assignment,
-            user_request=question,
-            project_spec=read_text(session_dir, SPEC_FILE),
-            step_goal=step_goal,
-            done_so_far=done_so_far,
-            parallel_domains=others if len(domains) > 1 else None,
-        )
-
-        span_cm = (
-            self.tracer.span(
-                S.TASK,
-                kind=S.KIND_AGENT,
-                inputs=prompt,
-                **{
-                    S.ATTR_TASK_ID: worker.task_id,
-                    S.ATTR_TASK_KIND: TaskKind.WORKER.value,
-                    S.ATTR_ASSIGNMENT_ID: assignment.id,
-                    S.ATTR_DOMAIN: assignment.domain,
-                    S.ATTR_AGENT: f"flash:{assignment.id}",
-                    S.ATTR_PERMISSION: worker.permission.value,
-                },
-            )
-            if self.tracer is not None
-            else None
-        )
-        task_span = span_cm.__enter__() if span_cm is not None else None
-        try:
-            await self._emit(on_event, {"kind": "node_start", "node": f"flash:{assignment.id}"})
-            try:
-                result = await asyncio.wait_for(
-                    run_loop(
-                        worker,
-                        self._agent_spec(TaskKind.WORKER, worker.permission),
-                        settings=self.settings,
-                        llm=self.llm,
-                        registry=self.registry,
-                        session_dir=session_dir,
-                        user_input=prompt,
-                        project_spec="",
-                        on_event=on_event,
-                        tracer=self.tracer,
-                        clock=self.clock,
-                    ),
-                    timeout=max(1.0, worker.deadline - self.clock()),
-                )
-                brief = result.brief or synthetic_brief(
-                    outcome="failed", brief=result.reason or "no brief"
-                )
-            except asyncio.TimeoutError:
-                brief = synthetic_brief(
-                    outcome="failed",
-                    brief="Your assignment was stopped because the execution budget was exhausted.",
-                    changed_files=changed_files_from_audit(
-                        self.settings.workspace_dir, since=audit_mark
-                    ),
-                )
-                try:
-                    worker.transit(TaskStatus.CANCELLED)
-                except ValueError:
-                    pass
-                worker.brief = brief
-                # 超时留下的是半成品：撤掉账本条目，否则续跑会把它当成已完成
-                ledger.drop(assignment.id)
-                save_tree(session_dir, tree)
-                return brief
-
-            brief["changed_files"] = brief.get("changed_files") or changed_files_from_audit(
-                self.settings.workspace_dir, since=audit_mark
-            )
-            gate = await self._gate(session_dir, assignment.gate_id)
-            brief["tests"] = gate.as_tests()
-            worker.brief = brief
-
-            succeeded = brief.get("outcome") == "done" and gate.state in {PASS, NO_HARD_CRITERIA}
-            if succeeded:
-                ledger.record(assignment.id, brief["changed_files"])
-            else:
-                ledger.drop(assignment.id)
-
-            try:
-                if succeeded:
-                    worker.transit(TaskStatus.COMPLETED)
-                elif worker.status is TaskStatus.RUNNING:
-                    worker.transit(TaskStatus.FAILED)
-            except ValueError:
-                pass
-
-            if task_span is not None:
-                task_span.set(
-                    **{S.ATTR_OUTCOME: brief.get("outcome"), S.ATTR_GATE_STATE: gate.state}
-                )
-                task_span.output(str(brief.get("brief") or "")[:2000])
-
-            await self._emit(
-                on_event,
-                {
-                    "kind": "worker_brief",
-                    "assignment_id": assignment.id,
-                    "domain": assignment.domain,
-                    "outcome": brief.get("outcome"),
-                    "brief": brief.get("brief"),
-                    "tests": brief.get("tests"),
-                    "gate": gate.state,
-                },
-            )
-            save_tree(session_dir, tree)
-            return brief
-        finally:
-            if span_cm is not None:
-                span_cm.__exit__(None, None, None)
-
     def _remember_block(self) -> str:
         rules = self._applied_rules or []
         if not rules:
@@ -774,7 +518,6 @@ class LabRunner:
         question: str,
         session_dir: Path,
         run_pro: Callable[..., Awaitable[dict[str, Any]]],
-        payload_of: Callable[[dict[str, Any], str], dict[str, Any]],
         on_event: EventSink | None,
         *,
         resume: bool,
@@ -809,100 +552,3 @@ class LabRunner:
                 "log": [{"applicable": len(self._applied_rules)}],
             },
         )
-
-    async def _gate(self, session_dir: Path, assignment_id: str) -> AcceptResult:
-        span_cm = (
-            self.tracer.span(
-                S.ACCEPT, kind=S.KIND_EVALUATOR, **{S.ATTR_ASSIGNMENT_ID: assignment_id}
-            )
-            if self.tracer is not None
-            else None
-        )
-        span = span_cm.__enter__() if span_cm is not None else None
-        try:
-            gate = await sanity_and_run(session_dir, assignment_id, settings=self.settings)
-            if span is not None:
-                span.set(
-                    **{
-                        S.ATTR_GATE_STATE: gate.state,
-                        S.ATTR_GATE_PASSED: gate.passed,
-                        S.ATTR_GATE_FAILED: gate.failed,
-                        S.ATTR_GATE_EXIT: gate.exit_code,
-                    }
-                )
-                span.output(gate.log[-1000:])
-            return gate
-        finally:
-            if span_cm is not None:
-                span_cm.__exit__(None, None, None)
-
-    # ── 辅助 ────────────────────────────────────────────
-
-    @staticmethod
-    def _partition(
-        assignments: list[Assignment],
-        resumable: set[str],
-        executed: set[str],
-        step: int,
-    ) -> tuple[list[Assignment], list[str]]:
-        """把 assignments 分成「本步要跑」和「续跑可跳过」；跑的那组 id 在本次 run 内唯一。
-
-        resumable 命中：产物指纹仍完好，跳过重跑，已落地的文件不被覆盖。
-        去重只改 executed 里出现过的 id：账本以 id 为键，给 resumable 候选改名会让
-        satisfied() 永远对不上。
-        """
-        run: list[Assignment] = []
-        skipped: list[str] = []
-        for i, a in enumerate(assignments):
-            original = a.id or f"s{step}_{i}"
-            if original in resumable:
-                resumable.discard(original)
-                skipped.append(original)
-                continue
-
-            aid = original
-            suffix = 0
-            while aid in executed:
-                suffix += 1
-                aid = f"{original}_s{step}" if suffix == 1 else f"{original}_s{step}_{suffix}"
-            executed.add(aid)
-
-            # 改名只影响账本与 span 的键；验收目录仍按 Pro 写测试时用的原名查找
-            run.append(replace(a, id=aid, acceptance_id=a.gate_id or original))
-        return run, skipped
-
-    @staticmethod
-    def _render_progress(progress: list[tuple[str, str]]) -> str:
-        if not progress:
-            return "（还没有完成任何步骤）"
-        lines = [f"- **{aid}**：{summary}" for aid, summary in progress if summary]
-        return "\n".join(lines)[-_PROGRESS_CAP:] or "（还没有完成任何步骤）"
-
-    @staticmethod
-    def _worst_gate(a: AcceptResult, b: AcceptResult) -> AcceptResult:
-        order = {PASS: 1, NO_HARD_CRITERIA: 2, "test_invalid": 3, "fail": 4}
-        return b if order.get(b.state, 0) > order.get(a.state, 0) else a
-
-    @staticmethod
-    def _step_gate(results: list[tuple[RuntimeTask, dict[str, Any]]]) -> AcceptResult:
-        """整步的门禁结论：有 fail 取 fail，全无硬指标取 no_hard_criteria。"""
-        states = [
-            str((brief.get("tests") or {}).get("state") or NO_HARD_CRITERIA)
-            for _, brief in results
-        ]
-        for priority in ("fail", "test_invalid", PASS):
-            if priority in states:
-                return AcceptResult(state=priority)
-        return AcceptResult(state=NO_HARD_CRITERIA)
-
-    @staticmethod
-    def _resume_spec(tree: TaskTree) -> ProjectSpec | None:
-        """从已 COMPLETED 的 SPEC 节点取出 payload。没有可用 goal 时返回 None，走新起草路径。"""
-        for task in tree.nodes.values():
-            if task.kind is not TaskKind.SPEC or task.status is not TaskStatus.COMPLETED:
-                continue
-            brief = task.brief or {}
-            payload = brief.get("payload") if brief.get("name") == SUBMIT_SPEC else brief
-            if payload and payload.get("goal"):
-                return ProjectSpec.from_payload(payload)
-        return None

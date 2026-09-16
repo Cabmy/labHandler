@@ -19,40 +19,21 @@ from runtime.context.assemble import AgentContext, assemble, validate_message_se
 from runtime.context.budget import TokenBudget
 from runtime.context.compact import DumpScope, compact_history
 from runtime.context.notes import load_notes, memory_block
-from runtime.control import decide
+from runtime.loop.control import decide
 from runtime.errors import ErrorClass
 from runtime.llm import LLMGateway
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer
 from runtime.phase import PRO
-from runtime.retry import sleep_delay
-from runtime.schema_call import (
-    SUBMIT_BRIEF,
-    SUBMIT_JUDGE,
-    SUBMIT_REMEMBER,
-    SUBMIT_DISPATCH,
-    SUBMIT_SPEC,
-    SUBMIT_SUMMARY,
-    VALIDATION_TOOL_RESULT,
-    coerce_brief,
-    parse_args,
-    synthetic_brief,
-    tool_choice_required,
-    validate_payload,
-)
-from runtime.stagnation import NUDGE_TEXT, StagnationSignal, StagnationTracker
+from runtime.loop.retry import sleep_delay
+from runtime.loop.calls import run_calls
+from runtime.loop.parse import coerce_brief, synthetic_brief, tool_choice_required
+from runtime.loop.schema import SUBMIT_BRIEF
+from runtime.loop.stagnation import NUDGE_TEXT, StagnationSignal, StagnationTracker
 from runtime.task import Permission, RuntimeTask, TaskStatus
-from runtime.tools import ToolContext, ToolRegistry
+from runtime.loop.registry import ToolContext, ToolRegistry
 from tools.skill_tool import LOAD_SKILL, LOAD_SKILL_REFERENCE
 
-_SUBMIT_TOOLS = {
-    SUBMIT_SPEC,
-    SUBMIT_DISPATCH,
-    SUBMIT_BRIEF,
-    SUBMIT_JUDGE,
-    SUBMIT_REMEMBER,
-    SUBMIT_SUMMARY,
-}
 _RETRIEVAL_TOOLS = {
     "memory_search",
     "memory_grep",
@@ -196,9 +177,7 @@ async def run_loop(
         nonlocal history
         history = drop_dangling_tool_calls(history)
         notes = load_notes(session_dir)
-        working = (
-            f"changed_files={task.execution_state.get('changed_files', [])}"
-        )
+        working = ""
 
         def build() -> AgentContext:
             return assemble(
@@ -338,72 +317,38 @@ async def run_loop(
                 }
             )
 
-            def reply(call_id: str, content: str) -> None:
-                tool_messages.append(
-                    {"role": "tool", "tool_call_id": call_id, "content": content}
-                )
+            outcomes = await run_calls(
+                calls,
+                submit_tool=spec.submit_tool,
+                node=spec.name,
+                registry=tools_reg,
+                ctx=tctx,
+                settings=settings,
+                tracer=tracer,
+                validation_streak=validation_streak,
+                emit=emit,
+            )
 
             turn_error = ErrorClass.OK
             turn_stag = StagnationSignal.NONE
-
-            for tc in calls:
-                name = tc["name"]
-                call_id = tc["id"]
-                await emit("tool", node=spec.name, name=name, args=tc["arguments"][:200], result="")
-
-                parsed, perr = parse_args(tc["arguments"])
-                if parsed is None:
-                    validation_streak[name] = validation_streak.get(name, 0) + 1
-                    turn_error = _worse_error(turn_error, ErrorClass.VALIDATION)
-                    reply(call_id, VALIDATION_TOOL_RESULT.format(err=perr))
-                    continue
-
-                if name in _SUBMIT_TOOLS:
-                    if name != spec.submit_tool:
-                        # 本阶段出口固定为 spec.submit_tool。错调的 payload 不交给上层，只回校验错误。
-                        turn_error = _worse_error(turn_error, ErrorClass.VALIDATION)
-                        reply(
-                            call_id,
-                            VALIDATION_TOOL_RESULT.format(
-                                err=f"{name} is not the exit for this stage; call {spec.submit_tool}"
-                            ),
-                        )
-                        continue
-                    degraded = validation_streak.get(name, 0) >= settings.validation_retry_max
-                    err = validate_payload(name, parsed, degraded=degraded)
-                    if err:
-                        validation_streak[name] = validation_streak.get(name, 0) + 1
-                        turn_error = _worse_error(turn_error, ErrorClass.VALIDATION)
-                        reply(call_id, VALIDATION_TOOL_RESULT.format(err=err))
-                        continue
-                    validation_streak[name] = 0
-                    submit_name, submit_payload = name, parsed
-                    reply(call_id, "ok")
-                    continue
-
-                tctx.extras["tool_call_id"] = call_id
-                outcome = await tools_reg.execute(
-                    name, parsed, tctx, timeout=settings.tool_timeout_s, tracer=tracer
+            for out in outcomes:
+                tool_messages.append(
+                    {"role": "tool", "tool_call_id": out.call_id, "content": out.text}
                 )
-                turn_error = _worse_error(turn_error, outcome.error_class)
-                signal = tracker.observe(name, parsed, outcome.text)
+                turn_error = _worse_error(turn_error, out.error)
+                if out.submit_payload is not None:
+                    submit_name, submit_payload = out.submit_name, out.submit_payload
+                if not out.ran or out.args is None:
+                    continue
+                signal = tracker.observe(out.name, out.args, out.text)
                 turn_stag = _worse_stagnation(turn_stag, signal)
                 if signal is not StagnationSignal.NONE:
                     trace_event(
                         S.EV_STAGNATION,
-                        **{S.ATTR_SIGNAL: signal.value, S.ATTR_TOOL: name},
+                        **{S.ATTR_SIGNAL: signal.value, S.ATTR_TOOL: out.name},
                     )
-                if name in _RETRIEVAL_TOOLS:
-                    retrieved = (retrieved + "\n" + outcome.text)[-_RETRIEVED_CAP:]
-                reply(call_id, outcome.text)
-                await emit(
-                    "tool",
-                    node=spec.name,
-                    name=name,
-                    args=str(parsed)[:200],
-                    result=outcome.text[:200],
-                    error_class=outcome.error_class.value,
-                )
+                if out.name in _RETRIEVAL_TOOLS:
+                    retrieved = (retrieved + "\n" + out.text)[-_RETRIEVED_CAP:]
 
             history.extend(tool_messages)
             last_error, last_stag = turn_error, turn_stag

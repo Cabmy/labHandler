@@ -10,6 +10,7 @@ MEMORY.md 不在 history 里、不经摘要——assemble 每轮从文件重新�
 """
 
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -159,20 +160,24 @@ def _next_dump_seq(dump_dir: Path) -> int:
     return seq
 
 
+_DUMP_LOCK = threading.Lock()
+
+
 def write_tool_dump(scope: DumpScope, *, tool: str, call_id: str, body: str) -> str | None:
     """把全文写入本 loop 的 tool_results 槽，返回文件名。空正文、已是桩、或写盘失败时返回 None。"""
     if not body or is_offloaded(body):
         return None
     dump_dir = scope.dump_dir
-    filename = (
-        f"{_next_dump_seq(dump_dir):04d}-"
-        f"{_safe_name(tool)}-{_safe_name(call_id)[:12]}.txt"
-    )
-    try:
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        (dump_dir / filename).write_text(body, encoding="utf-8")
-    except OSError:
-        return None
+    with _DUMP_LOCK:
+        filename = (
+            f"{_next_dump_seq(dump_dir):04d}-"
+            f"{_safe_name(tool)}-{_safe_name(call_id)[:12]}.txt"
+        )
+        try:
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            (dump_dir / filename).write_text(body, encoding="utf-8")
+        except OSError:
+            return None
     return filename
 
 

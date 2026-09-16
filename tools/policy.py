@@ -13,6 +13,7 @@ workspace/.labhandler/audit.jsonl。审计失败静默，不阻断工具。
 
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -158,6 +159,7 @@ class ToolAuditor:
 
     def __init__(self, audit_path: Path) -> None:
         self.audit_path = audit_path
+        self._lock = threading.Lock()
 
     def record(self, tool: str, args: dict[str, Any], outcome: str) -> None:
         """记录一条审计（outcome 取 ok | denied:<reason> | error:<exception>）。失败静默。"""
@@ -173,8 +175,10 @@ class ToolAuditor:
                 "outcome": outcome[:500],
             }
             self.audit_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.audit_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+            line = json.dumps(entry, ensure_ascii=False, default=str) + "\n"
+            with self._lock:
+                with self.audit_path.open("a", encoding="utf-8") as f:
+                    f.write(line)
         except Exception:
             pass  # 审计不能拖垮工具调用
 

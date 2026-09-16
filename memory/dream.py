@@ -13,7 +13,8 @@ from config.runtime import get_settings
 from memory.archive import VALID_CARD_TYPES, get_task_archive
 from memory.retrieve import delete_card_file, index_card_ids, write_card_file
 from runtime.llm import LLMGateway
-from runtime.schema_call import DREAM_SCHEMA, SUBMIT_DREAM, oneshot_schema
+from runtime.loop.schema import DREAM_SCHEMA, SUBMIT_DREAM
+from runtime.loop.parse import oneshot_schema
 
 _MIN_GROUP_SIZE = 2  # 少于此张数的分组不进入治理
 

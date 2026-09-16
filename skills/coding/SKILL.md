@@ -15,7 +15,8 @@ For Pro: plan, dispatch, and judge coding work. Flash never sees this file — p
 
 - Pin interfaces (function / class / CLI / file names and signatures). Acceptance imports them verbatim.
 - Name files by topic or problem id (`binary_search.py`, `hw4_q1.py`). Never `solution.py` / `main.py`.
-- Do not invent constraints absent from MATERIALS.md or the user request.
+  Paths are workspace-root relative; never nest under `workspace/`.
+- Do not invent constraints absent from the files you read or the user request.
 
 ## Dispatch
 

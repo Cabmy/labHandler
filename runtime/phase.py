@@ -9,7 +9,7 @@ TaskKind 是阶段的唯一身份。system prompt、结构化出口、工具可�
   规划与判决阶段的节点仍是 pro（要调 pro 门槛的 submit_*），但工具表只给只读，
   因此「写 SPEC 时顺手改了代码」在工具表层面就不可能发生。
 
-本模块只描述阶段，不决定阶段顺序——顺序在 orchestrator 的主流程里。
+本模块只描述阶段，不决定阶段顺序——顺序在 runtime.lab.runner 的主流程里。
 """
 
 from dataclasses import dataclass
@@ -23,7 +23,7 @@ from config.prompts import (
     SUMMARY_SYSTEM,
     TAKEOVER_SYSTEM,
 )
-from runtime.schema_call import (
+from runtime.loop.schema import (
     SUBMIT_BRIEF,
     SUBMIT_DISPATCH,
     SUBMIT_JUDGE,

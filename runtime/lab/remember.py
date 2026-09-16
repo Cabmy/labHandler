@@ -7,7 +7,7 @@ remember_judge 只裁定 applies；未点名的条目默认不适用。
 from pathlib import Path
 from typing import Any
 
-from runtime.persist import read_json, write_json
+from runtime.lab.persist import read_json, write_json
 
 REMEMBER_FILE = "REMEMBER.json"
 

@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any, Self
 
 from runtime.errors import ErrorClass
-from runtime.stagnation import StagnationSignal
+from runtime.loop.stagnation import StagnationSignal
 
 
 class TaskKind(str, Enum):

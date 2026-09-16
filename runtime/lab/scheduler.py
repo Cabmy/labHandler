@@ -11,7 +11,7 @@ from typing import Any
 from config.runtime import RuntimeSettings
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer
-from runtime.schema_call import synthetic_brief
+from runtime.loop.parse import synthetic_brief
 from runtime.task import Permission, RuntimeTask, TaskStatus
 
 

@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 from config.runtime import RuntimeSettings
 from runtime.errors import ErrorClass
-from runtime.stagnation import StagnationSignal, NUDGE_TEXT
+from runtime.loop.stagnation import StagnationSignal, NUDGE_TEXT
 from runtime.task import TaskSnapshot, TaskStatus
-from runtime.retry import delay_for
+from runtime.loop.retry import delay_for
 
 
 @dataclass(frozen=True)

@@ -134,7 +134,7 @@ async def sandbox_run(command: str, *, timeout: float) -> tuple[int, str]:
     """
     try:
         raw = await asyncio.wait_for(
-            call_sandbox("sandbox_execute_bash", command=command), timeout=timeout
+            call_sandbox("sandbox_execute_bash", cmd=command), timeout=timeout
         )
     except asyncio.TimeoutError:
         return -1, f"[TIMEOUT after {timeout}s] {command}"

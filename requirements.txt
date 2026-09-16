@@ -3,7 +3,7 @@ openai>=1.40.0
 jsonschema
 
 # MCP
-mcp
+mcp>=2.2
 
 # Web Search
 ddgs

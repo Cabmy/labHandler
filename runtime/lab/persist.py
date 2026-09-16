@@ -16,7 +16,7 @@ from runtime.task import TaskTree, TaskStatus
 STATE_FILE = "STATE.json"
 LEDGER_FILE = "EFFECTS.json"
 SPEC_FILE = "SPEC.md"
-MATERIALS_FILE = "MATERIALS.md"
+CATALOG_FILE = "CATALOG.md"
 
 
 def session_root(workspace: Path) -> Path:
