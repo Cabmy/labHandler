@@ -1,11 +1,12 @@
-"""上下文压缩：最近若干轮保留原文，更早的由 Flash 收成一段纪要。
+"""上下文压缩：最近若干轮保留原文，更早的由 Flash 收成一份分节纪要。
 
 切分单位是回合：带 tool_calls 的 assistant 与其全部 tool 响应同属一个不可再分
 的单位。拆开会产出协议非法的孤儿 tool 消息。
 
 卸盘按 DumpScope（agent × task_id）分目录，Pro 与各 Flash 互不混放。
-FORGET.md 只在 Pro 压缩时作为排除指令并清空；Flash 压缩不碰它。
-MEMORY.md 不在 history 里、不经摘要——assemble 每轮从文件重新注入。
+notes 槽与 cards 槽不在 history 里、不经摘要——assemble 每轮从文件重新注入。
+FORGET.md 只在 Pro 压缩时作为排除指令并清空；Flash 压缩不碰它。被遗忘的卡片此前已经
+从 cards 槽消失，这里只负责让它不要从旧对话经摘要回流。
 是否该压、阈值、usage 校准归 TokenBudget；本模块只切回合、落盘 tool 正文、写纪要。
 """
 
@@ -25,19 +26,42 @@ DUMP_DIR = "tool_results"
 OFFLOAD_MARKER = "[offloaded "
 PREVIEW_CHARS = 2000
 LIVE_OFFLOAD_CHARS = 12_000
-_SUMMARY_MAX_TOKENS = 900
+# 分小节的纪要比一段话长；给足额度，避免刚好在小节中间被 finish_reason=length 截断。
+_SUMMARY_MAX_TOKENS = 1400
 _BLOB_CHAR_CAP = 24000
 _INLINE_TOOL_CAP = 600
 
-_SUMMARY_SYSTEM = """你在压缩一个 agent 的历史对话，供它后续回合继续使用。
+_SUMMARY_SYSTEM = """你在压缩一个 agent 的历史对话。你的纪要会顶替这段原文，成为它后续回合
+唯一看得见的版本：原文不再回来，你漏掉的事实等于被删掉。
 
-保留：任务约束、已确认的结论、文件名与路径、接口签名、测试结果、
-失败原因、仍未解决的问题。
-丢弃：寒暄、重复的试探、已被推翻的中间猜想。
-不要编造任何未在原文出现的事实。工具的完整输出已另存到磁盘，
-需要时可以 grep {dump_hint}。
+输入是拍平的对话。[user] 是 harness 或用户下达的指令，[assistant] 是它的回答，
+[调用] 是它发出的工具调用与参数，[xxx 结果] 是工具返回（过长的只留了头部，
+全文已落盘到 {dump_hint}）。越靠后的回合越重要，写得越细。
 
-输出一段紧凑的中文纪要，不要分点堆砌套话。"""
+先求全、再求简：宁可多留一条事实，也不要为了句子通顺把事实揉掉。
+标识符一律照抄——文件路径、函数与接口签名、字段名、命令、报错原文、数字指标，
+一个字符都不要改写或翻译。不要编造原文没有的东西，没被验证过的结论写明「未验证」。
+SPEC.md 与 NOTES.md 由 harness 另行注入，不要复述它们。
+
+按下列小节输出，没有内容的小节整节省略，不要写「无」：
+
+### 硬约束
+指令里明确要求或禁止的事情：固定的名字、格式、交付物、不许碰的东西。原话照抄。
+
+### 已完成
+已落地的产物：路径 + 里面是什么 + 验收或测试的结论。
+
+### 失败与修复
+踩过的错、报错原文、怎么修好的；以及被否决的做法和否决理由。
+这一节防的是重复踩坑，不要省。
+
+### 未决
+没做完、没验证、或仍然存疑的问题。
+
+### 当前进度
+紧挨着这次压缩之前正在做的事。
+
+整份不超过 800 字。只写事实，不要转述它的心理活动，不要客套和总结陈词。"""
 
 
 @dataclass
@@ -250,7 +274,7 @@ async def _summarize(
     dump_hint: str,
     apply_forget: bool,
 ) -> tuple[str, str | None]:
-    """用 Flash 把旧回合收成一段纪要。成功返回 (正文, None)；异常或空响应返回 ("", 错误串)。"""
+    """用 Flash 把旧回合收成一份分节纪要。成功返回 (正文, None)；异常或空响应返回 ("", 错误串)。"""
     system = _SUMMARY_SYSTEM.format(dump_hint=dump_hint)
     if apply_forget:
         directive = forget_directive(notes)
@@ -258,11 +282,12 @@ async def _summarize(
             system = system + "\n\n" + directive
 
     try:
+        blob = _render_for_summary(turns)
         result = await llm.chat(
             model=settings.flash_model,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": _render_for_summary(turns)},
+                {"role": "user", "content": blob},
             ],
             max_tokens=_SUMMARY_MAX_TOKENS,
         )

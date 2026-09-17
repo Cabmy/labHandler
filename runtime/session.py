@@ -121,8 +121,26 @@ class LabSession:
         title = self.last_result.get("question") or "未命名任务"
         summary = self.last_result.get("summary") or ""
         ttype = "other"
+        if not cards:
+            return {
+                "task_id": None,
+                "card_ids": [],
+                "indexed": 0,
+                "failed": 0,
+                "errors": [],
+                "skipped": "no_cards",
+            }
         try:
             archive = get_task_archive()
+            if not archive.has_new_cards(cards):
+                return {
+                    "task_id": None,
+                    "card_ids": [],
+                    "indexed": 0,
+                    "failed": 0,
+                    "errors": [],
+                    "skipped": "no_cards",
+                }
             task_id = archive.create_task(title, ttype, summary[:4000])
             card_ids = archive.create_cards(task_id, cards, title, ttype)
             result: dict[str, Any] = {

@@ -2,8 +2,21 @@
 
 from typing import Any
 
-from runtime.context.notes import MEMORY_ENTRY_MAX
+from runtime.context.notes import NOTES_ENTRY_MAX
 from runtime.lab.spec import MAX_ASSIGNMENTS
+
+# 短句用 notes_append；长文用 notes_write，NOTES.md 只留文件名指针。
+NOTES_WRITE = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string", "description": "文件名，如 ttl.md。NOTES.md 只留这一条指针"},
+        "content": {"type": "string", "description": "较长的必须记住的正文。短句请用 notes_append"},
+    },
+}
+FORGET_APPEND = {
+    "type": "string",
+    "description": "无关噪声（已放弃的路径、死胡同探测）。下次 compact 时 Flash 会从摘要里去掉。热卡片请用 memory_forget。",
+}
 
 # Flash brief 只含本步实际改动与碰到的错误，长度上限 BRIEF_MAX。
 BRIEF_MAX = 600
@@ -74,6 +87,13 @@ SPEC_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "description": "少量有意义的 Flash 产品块（一题/一文件/一函数），不是阅读/设计/测试/打磨清单。一道题一条即可",
         },
+        "forget_append": FORGET_APPEND,
+        "notes_append": {
+            "type": "string",
+            "maxLength": NOTES_ENTRY_MAX,
+            "description": "新增一条不超过 80 字符的不变量。空则不写。",
+        },
+        "notes_write": NOTES_WRITE,
     },
     "additionalProperties": True,
 }
@@ -139,6 +159,13 @@ DISPATCH_SCHEMA: dict[str, Any] = {
             "items": ASSIGNMENT_SCHEMA,
             "description": f"本步派出的 Flash，最多 {MAX_ASSIGNMENTS} 个。Flash 侧全部完成时给空数组",
         },
+        "forget_append": FORGET_APPEND,
+        "notes_append": {
+            "type": "string",
+            "maxLength": NOTES_ENTRY_MAX,
+            "description": "新增一条不超过 80 字符的不变量。空则不写。",
+        },
+        "notes_write": NOTES_WRITE,
     },
     "additionalProperties": True,
 }
@@ -193,17 +220,17 @@ JUDGE_SCHEMA: dict[str, Any] = {
             "enum": ["continue", "revise_spec", "takeover", "finish"],
         },
         "evidence": {"type": "string", "minLength": 4},
-        "memory_append": {
+        "notes_append": {
             "type": "string",
-            "maxLength": MEMORY_ENTRY_MAX,
+            "maxLength": NOTES_ENTRY_MAX,
             "description": "新增一条不超过 80 字符的不变量。空则不写。禁止贴实现细节或复述 SPEC.md。",
         },
-        "memory_remove": {
+        "notes_remove": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "删除 MEMORY.md 中正文等于或包含该字符串的条目。过时了就删，不要只追加。",
+            "description": "删除 NOTES.md 中正文等于或包含该字符串的条目。过时了就删，不要只追加。",
         },
-        "memory_replace": {
+        "notes_replace": {
             "type": "array",
             "items": {
                 "type": "object",
@@ -212,27 +239,32 @@ JUDGE_SCHEMA: dict[str, Any] = {
                     "old": {"type": "string", "description": "要改的那条：全文或能唯一定位的子串"},
                     "new": {
                         "type": "string",
-                        "maxLength": MEMORY_ENTRY_MAX,
+                        "maxLength": NOTES_ENTRY_MAX,
                         "description": "改写后的短不变量；空字符串表示删除",
                     },
                 },
             },
             "description": "改已有条目。事实变了就改，不要另起一行让旧事实继续常驻。",
         },
-        "forget_append": {
-            "type": "string",
-            "description": "已确认与任务无关的杂乱上下文描述。压缩总结时会被刻意忽略。",
-        },
+        "notes_write": NOTES_WRITE,
+        "forget_append": FORGET_APPEND,
         "rule_verdicts": {
             "type": "array",
-            "description": "对本 lab 已裁定适用的每条 /remember 规则给出对照结论。finish 时必须全部 satisfied。",
+            "description": "对本 lab 已裁定适用的每条 /remember 规则给出对照结论。按用户消息里的编号对齐。finish 时必须全部 satisfied。",
             "items": {
                 "type": "object",
-                "required": ["rule", "satisfied", "note"],
+                "required": ["index", "satisfied", "note"],
                 "properties": {
-                    "rule": {"type": "string"},
+                    "index": {
+                        "type": "integer",
+                        "description": "用户消息里印在该规则前面的编号。身份靠它对齐，不要靠抄规则原文",
+                    },
                     "satisfied": {"type": "boolean"},
                     "note": {"type": "string"},
+                    "rule": {
+                        "type": "string",
+                        "description": "可选，仅作可读标注；抄错不影响对齐",
+                    },
                 },
             },
         },

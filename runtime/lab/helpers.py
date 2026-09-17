@@ -1,5 +1,6 @@
 """LabRunner 用的纯函数：payload 抽取、续跑切分、门禁取最差。"""
 
+from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
@@ -79,21 +80,29 @@ def render_progress(progress: list[tuple[str, str]]) -> str:
     return "\n".join(lines)[-_PROGRESS_CAP:] or "（还没有完成任何步骤）"
 
 
-def worst_gate(a: AcceptResult, b: AcceptResult) -> AcceptResult:
-    order = {PASS: 1, NO_HARD_CRITERIA: 2, TEST_INVALID: 3, FAIL: 4}
-    return b if order.get(b.state, 0) > order.get(a.state, 0) else a
+# 四态由好到坏。no_hard_criteria 排在 pass 之后：没有硬指标不等于通过。
+_GATE_RANK = {PASS: 1, NO_HARD_CRITERIA: 2, TEST_INVALID: 3, FAIL: 4}
+
+
+def worst_gate(results: Iterable[AcceptResult]) -> AcceptResult:
+    """一组门禁里最差的那一个，原样返回（保住它的 passed/failed/log）。
+
+    只有空输入才是 no_hard_criteria——那是「这里没有门禁」。它不能当折叠初值：
+    它比 pass 差，pass 永远替换不掉它，整组全过也会被报成无硬指标。
+    """
+    worst: AcceptResult | None = None
+    for result in results:
+        if worst is None or _GATE_RANK.get(result.state, 0) > _GATE_RANK.get(worst.state, 0):
+            worst = result
+    return worst if worst is not None else AcceptResult(state=NO_HARD_CRITERIA)
 
 
 def step_gate(results: list[tuple[RuntimeTask, dict[str, Any]]]) -> AcceptResult:
-    """整步的门禁结论：有 fail 取 fail，全无硬指标取 no_hard_criteria。"""
-    states = [
-        str((brief.get("tests") or {}).get("state") or NO_HARD_CRITERIA)
+    """整步的门禁结论。与 run 级同一套序，避免两处各自定义「整体门禁」。"""
+    return worst_gate(
+        AcceptResult(state=str((brief.get("tests") or {}).get("state") or NO_HARD_CRITERIA))
         for _, brief in results
-    ]
-    for priority in (FAIL, TEST_INVALID, PASS):
-        if priority in states:
-            return AcceptResult(state=priority)
-    return AcceptResult(state=NO_HARD_CRITERIA)
+    )
 
 
 def resume_spec(tree: TaskTree) -> ProjectSpec | None:

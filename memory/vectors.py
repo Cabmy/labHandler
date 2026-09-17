@@ -7,6 +7,7 @@ content_sha256 + embedding_model 供对账：与当前正文或当前模型不�
 
 import hashlib
 import os
+import sqlite3
 import struct
 from pathlib import Path
 

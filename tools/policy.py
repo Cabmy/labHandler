@@ -74,7 +74,7 @@ class SecurityPolicy:
         re.compile(_BOUNDARY + r"~/"),                   # ~/path 家目录展开
         re.compile(_BOUNDARY + r"~($|[\s'\")])"),        # 独立 ~ token
     ]
-    # LLM 不可见的控制面文件。SPEC.md / MEMORY.md / 卸盘正文不在此列。
+    # LLM 不可见的控制面文件。SPEC.md / NOTES.md / 卸盘正文不在此列。
     CONTROL_FILES = frozenset({
         "STATE.json",
         "EFFECTS.json",

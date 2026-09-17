@@ -1,7 +1,16 @@
 """上下文槽位装配。纯函数：同样的输入永远得到同样的 messages。
 
-槽位顺序按「越稳定越靠前」排，利于上游 prompt cache：
-system → memory → user → spec → history → retrieved → events
+槽位顺序按「一拍之内还会不会变」排，不变的靠前，利于上游 prompt cache：
+system → notes → user → spec → history → cards → retrieved → events
+
+notes：本 lab NOTES.md（短句或长文指针）。只在阶段交卷时被改写，而那一刻 system
+       本来就换了新的阶段 prompt，缓存反正要断，所以放前面不额外付费。
+cards：SPEC 预取的跨 lab 卡片正文，仅 Pro。Pro 随时可以 memory_forget 掉一张，
+       一拍之内就会变，所以必须排在 history 之后，否则每忘一张就作废整条历史的缓存。
+       forget 同时把卡从归档里淘汰，下一 lab 检索不到。
+       排在 SPEC 与历史之后还有第二个好处：本次作业的要求先入场，旧 lab 的经验后到，
+       两者冲突时模型更容易按前者走。
+retrieved：本 loop 里 memory_search/grep/read、notes_read、load_skill 的追加结果，不进 history。
 
 user 槽只承载「本轮之前没有任何对话」的那一段开场指令；为空时整条消息不出现。
 跨阶段连续对话的指令由调用方直接写进 history，这样它才排在既有往来之后，
@@ -44,7 +53,8 @@ def assemble(
     project_spec: str,
     history: list[dict[str, Any]],
     retrieved: str,
-    memory: str,
+    notes: str,
+    cards: str = "",
     events: list[dict[str, str]],
     working: str,
     tool_schemas: list[dict[str, Any]] | None = None,
@@ -52,8 +62,8 @@ def assemble(
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
     ]
-    if memory:
-        messages.append({"role": "user", "content": memory})
+    if notes:
+        messages.append({"role": "user", "content": notes})
     if user_input:
         messages.append({"role": "user", "content": user_input})
     if project_spec:
@@ -61,6 +71,8 @@ def assemble(
 
     messages.extend(strip_private(m) for m in history)
 
+    if cards:
+        messages.append({"role": "user", "content": cards})
     if retrieved:
         messages.append({"role": "user", "content": f"## Retrieved knowledge\n{retrieved}"})
 

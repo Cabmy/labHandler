@@ -9,6 +9,7 @@ from runtime.loop.registry import Handler, ToolContext, ToolRegistry, ToolSpec, 
 
 def build_base_specs() -> list[ToolSpec]:
     from memory.retrieve import memory_grep, memory_read, memory_search
+    from runtime.context.notes import forget_card, read_long_note
     from runtime.lab.accept import write_acceptance_file
     from runtime.loop.schema import (
         ACCEPT_FILE_SCHEMA,
@@ -117,6 +118,22 @@ def build_base_specs() -> list[ToolSpec]:
     async def h_mem_read(args: dict[str, Any], ctx: ToolContext) -> str:
         return await asyncio.to_thread(memory_read, args["path"], ctx.settings)
 
+    async def h_notes_read(args: dict[str, Any], ctx: ToolContext) -> str:
+        return await asyncio.to_thread(read_long_note, ctx.session_dir, args["path"])
+
+    async def h_mem_forget(args: dict[str, Any], ctx: ToolContext) -> str:
+        from memory.retrieve import retire_cards_matching
+
+        card = str(args.get("card") or "").strip()
+        if not card:
+            return "[ERROR/Validation] need a card filename or a topic substring"
+        n = await asyncio.to_thread(forget_card, ctx.session_dir, card)
+        retired = await asyncio.to_thread(retire_cards_matching, card, ctx.settings)
+        msg = f"dropped {n} card(s) from the next turn; recorded in FORGET.md"
+        if retired:
+            msg += f"; retired {retired} from the archive"
+        return msg
+
     async def h_profile(args: dict[str, Any], ctx: ToolContext) -> str:
         return json.dumps(await asyncio.to_thread(read_profile), ensure_ascii=False)
 
@@ -185,7 +202,7 @@ def build_base_specs() -> list[ToolSpec]:
         ),
         ToolSpec(
             "memory_search",
-            "Vector-search archived knowledge cards.",
+            "Vector-search archived cards; returns filename+type pointers, not bodies. memory_read to open.",
             _fields("query", query="string", k="integer"),
             readonly,
             h_mem_search,
@@ -199,10 +216,27 @@ def build_base_specs() -> list[ToolSpec]:
         ),
         ToolSpec(
             "memory_read",
-            "Read one card, session note, or tool_results dump.",
+            "Read one archived card (4.md) or a tool_results dump.",
             _fields("path", path="string"),
             readonly,
             h_mem_read,
+        ),
+        ToolSpec(
+            "notes_read",
+            "Read a long note written by notes_write (filename in NOTES.md, e.g. ttl.md).",
+            _fields("path", path="string"),
+            pro,
+            h_notes_read,
+        ),
+        ToolSpec(
+            "memory_forget",
+            "Retire a card that is false, outdated, or contradicted by this homework: gone from "
+            "the next turn, dropped from the archive so later labs will not retrieve it. "
+            "card = its filename or a unique substring of its body. Do not use this merely "
+            "because a still-true card is off-topic for this assignment.",
+            _fields("card", card="string"),
+            pro,
+            h_mem_forget,
         ),
         ToolSpec(
             LOAD_SKILL,

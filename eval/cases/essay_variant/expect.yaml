@@ -1,0 +1,19 @@
+pair: essay
+role: measure
+question: 按工作区题目写一篇议论文，只交指定的 markdown 作文。
+deliverables:
+  - essay.md
+remember:
+  screenshot: false
+  blockquote: false
+  filename: false
+cards_expected:
+  - 议论作文 essay.md
+  - 全文模板 重派
+card_assertions:
+  # essay 的小节/字数/「无外部文献」都写在题面里、由 gate 校验，冷热都会做到，
+  # 不能拿来证明卡片起了作用。2.md 的处方是「Flash 连续 logic_exhausted 时按同一
+  # id 重派并给出全文模板」——它的效果就是少派几轮：热跑 2 次，冷跑 6 次。
+  - match:
+      contains: 全文模板 重派
+    check: dispatch_waves <= 2

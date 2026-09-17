@@ -22,8 +22,10 @@
   阶段指令追加在对话末尾；Flash 每份任务书新开上下文
 - **上下文管理**：最近数轮保留原文，更早的由 Flash 摘要一次，tool 正文卸到磁盘；
   压缩后立即重新装配再发请求
-- **双 notes**：`MEMORY.md` 常驻上下文、压缩吃不掉，Judge 可追加/改写/删除条目；
-  `FORGET.md` 让摘要刻意跳过噪声，压缩完成即清空
+- **NOTES 与卡片**：`NOTES.md` 常驻 notes 槽、压缩吃不掉，Judge 可追加/改写/删除；长笔记
+  `notes_write` 落盘，NOTES.md 只留指针，`notes_read` 再打开。SPEC 预取的归档卡片进独立
+  cards 槽（排在历史之后，本次作业的要求先入场）；Pro 调 `memory_forget` 下一拍即消失，
+  并记进 `FORGET.md` 让下次摘要也不回流。`forget_append` 只标历史噪声，压完即清空。
 - **幂等续跑**：副作用账本记录产物指纹，产物完好的任务直接跳过
 - **两层安全边界**：host 白名单 + 路径守护 + 审计；重量操作走 MCP Docker 沙箱
 - **可观测**：Langfuse + 本地 JSONL，span 树覆盖 run / spec / dispatch / step / task / turn /

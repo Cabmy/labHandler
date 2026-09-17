@@ -51,6 +51,8 @@ def classify(exc: BaseException | None, *, text: str = "") -> ErrorClass:
     if exc is not None:
         name = type(exc).__name__
         qual = f"{type(exc).__module__}.{name}"
+        if name in {"AuthenticationError"}:
+            return ErrorClass.AUTH
         if name in _TRANSIENT_TYPES or qual.endswith("TimeoutError"):
             return ErrorClass.TRANSIENT
         if name in {"PermissionError"}:

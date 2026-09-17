@@ -14,6 +14,7 @@ class Decision:
     kind: str  # continue | retry_tool | nudge | force_brief | stop
     delay: float = 0.0
     text: str = ""
+    # 短枚举，供 EV_DECISION 归因。continue 也必须有：ok / logic / transient / ...
     reason: str = ""
 
     @property
@@ -46,19 +47,24 @@ def decide(
         return Decision(kind="force_brief", reason="step_budget")
 
     if stagnation is StagnationSignal.REPEAT:
-        return Decision(kind="nudge", text=NUDGE_TEXT)
+        return Decision(kind="nudge", text=NUDGE_TEXT, reason="repeat")
 
     if error_class is ErrorClass.TRANSIENT:
         if snap.transient_count >= settings.transient_retry_max:
             return Decision(
                 kind="nudge",
                 text="Transient retries exhausted. Switch tools or change approach. Do not mark spec_invalid.",
+                reason="transient_exhausted",
             )
-        return Decision(kind="retry_tool", delay=delay_for(snap.transient_count))
+        return Decision(
+            kind="retry_tool",
+            delay=delay_for(snap.transient_count),
+            reason="transient",
+        )
 
     if error_class is ErrorClass.LOGIC:
         if snap.consecutive_logic >= settings.consecutive_logic_failure_max:
             return Decision(kind="stop", reason="logic_exhausted")
-        return Decision(kind="continue")
+        return Decision(kind="continue", reason="logic")
 
-    return Decision(kind="continue")
+    return Decision(kind="continue", reason="ok")

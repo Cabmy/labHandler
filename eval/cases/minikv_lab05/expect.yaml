@@ -1,0 +1,12 @@
+pair: minikv
+role: accumulate
+question: 按工作区实验指导书完成 MiniKV 实验：实现指定模块并撰写八节实验报告。
+deliverables:
+  - minikv.py
+  - 实验报告.md
+remember:
+  screenshot: true
+  blockquote: true
+  filename: false
+cards_expected: []
+card_assertions: []

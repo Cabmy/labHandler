@@ -572,6 +572,10 @@
         logTool(d.name, (d.args || '').slice(0, 80));
         if (d.result) logLine('toolret', '└ ' + d.result.slice(0, 140));
       });
+      es.addEventListener('cards', (e) => {
+        const d = JSON.parse(e.data);
+        logLine('toolret', 'prefetched cards ' + (d.n || 0));
+      });
       es.addEventListener('node_done', (e) => {
         const d = JSON.parse(e.data);
         const bits = (d.log || []).map(en =>

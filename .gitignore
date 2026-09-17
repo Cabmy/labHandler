@@ -25,6 +25,7 @@ tests/
 docs/
 tmp/
 benchmark/
+eval/runs/
 
 # IDE
 .vscode/

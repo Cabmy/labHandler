@@ -51,6 +51,21 @@ def _is_running() -> bool:
     return _current_task is not None and not _current_task.done()
 
 
+@app.on_event("startup")
+async def _warm_memory_index() -> None:
+    """进程起来时对齐卡片文件与向量表。换 EMBEDDING_MODEL 后必须走这里才会重建。失败不挡服务。"""
+
+    async def _run() -> None:
+        try:
+            from memory.retrieve import reconcile_index
+
+            await reconcile_index(_session.llm, _session.settings)
+        except Exception:
+            pass
+
+    asyncio.create_task(_run())
+
+
 @app.on_event("shutdown")
 async def _shutdown() -> None:
     """进程退出前把 span 刷出去，否则最后一段 trace 会丢在缓冲里。"""
@@ -380,13 +395,15 @@ async def done() -> dict[str, Any]:
         title = (_session.last_result or {}).get("question") or "未命名任务"
         summary = (_session.last_result or {}).get("summary") or ""
         archive = get_task_archive()
-        task_id = archive.create_task(title, "other", summary[:4000])
-        card_ids = archive.create_cards(task_id, cards, title, "other")
-        if card_ids:
-            archive_extra = await index_card_ids(card_ids, _session.llm, _session.settings)
-            archive_extra["task_id"] = task_id
-            archive_extra["card_ids"] = card_ids
-            _session.last_result["knowledge_cards"] = []  # 已入档，清空以免 _session.done 二次归档
+        if archive.has_new_cards(cards):
+            task_id = archive.create_task(title, "other", summary[:4000])
+            card_ids = archive.create_cards(task_id, cards, title, "other")
+            if card_ids:
+                archive_extra = await index_card_ids(card_ids, _session.llm, _session.settings)
+                archive_extra["task_id"] = task_id
+                archive_extra["card_ids"] = card_ids
+        if _session.last_result:
+            _session.last_result["knowledge_cards"] = []  # 已处理，清空以免 _session.done 再建空 task
     result = await asyncio.to_thread(_session.done, lambda m: None)
     if archive_extra:
         result["archive"] = {**(result.get("archive") or {}), **archive_extra}

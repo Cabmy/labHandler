@@ -1,4 +1,4 @@
-"""本 lab 适用的 /remember 条文。REMEMBER.json 与 SPEC/MEMORY 分开。
+"""本 lab 适用的 /remember 条文。REMEMBER.json 与 SPEC/NOTES 分开。
 
 remember_judge 只裁定 applies；未点名的条目默认不适用。
 步骤 Judge 的 rule_verdicts 必须盖住适用列表，否则不能 finish。
@@ -57,11 +57,14 @@ def save_applied(session_dir: Path, rules: list[str]) -> None:
 
 
 def rules_satisfied(applied: list[str], verdict: dict[str, Any]) -> bool:
+    """步骤 Judge 必须盖住 applied 里的每一条。对齐靠 index，与 applied_from_payload 同一套。"""
     if not applied:
         return True
-    ok = {
-        str(row.get("rule") or "").strip()
-        for row in (verdict.get("rule_verdicts") or [])
-        if isinstance(row, dict) and row.get("satisfied")
-    }
+    ok: set[str] = set()
+    for row in verdict.get("rule_verdicts") or []:
+        if not isinstance(row, dict) or not row.get("satisfied"):
+            continue
+        text = _resolve(applied, row)
+        if text:
+            ok.add(text)
     return all(rule in ok for rule in applied)

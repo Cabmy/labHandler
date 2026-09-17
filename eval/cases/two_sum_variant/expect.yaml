@@ -1,0 +1,23 @@
+pair: two_sum
+role: measure
+question: 完成工作区中的有序两数之和编程作业。只交指定的 Python 源文件。
+deliverables:
+  - two_sum_sorted.py
+remember:
+  screenshot: false
+  blockquote: false
+  filename: true
+# needle 按词组 AND 匹配，对卡片改写鲁棒（卡片每次 accumulate 重新生成，
+# 死字符串必然失配）。
+cards_expected:
+  - 只派 一个里程碑
+  - 不要把测试派给 Flash
+card_assertions:
+  # 冷热都只写 1 个里程碑，所以 milestones_len 没有判别力，不用它。
+  # 有判别力的是「派了几次才做完」：热跑 2 次派发，冷跑 5 次。
+  - match:
+      contains: 只派 一个里程碑
+    check: dispatch_waves <= 2
+  - match:
+      contains: 不要把测试派给 Flash
+    check: no_flash_writes_tests

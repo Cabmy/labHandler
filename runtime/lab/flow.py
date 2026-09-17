@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Any
 
 from memory.profile import load_profile
-from runtime.context.notes import append_forget, apply_memory
+from memory.retrieve import prefetch_cards, reconcile_index
+from runtime.context.notes import (
+    append_forget,
+    apply_notes,
+    load_cards,
+    write_cards,
+    write_long_note,
+)
 from runtime.lab.accept import AcceptResult, FAIL, NO_HARD_CRITERIA, TEST_INVALID, missing_gate
 from runtime.lab.helpers import (
     halt_of,
@@ -123,7 +130,7 @@ class LabState:
         rules = self.runner._applied_rules or []
         if not rules:
             return "（本 lab 没有适用的 /remember 规则）"
-        return "\n".join(f"- {r}" for r in rules)
+        return "\n".join(f"{i}. {r}" for i, r in enumerate(rules))
 
     async def drive_pro(self, kind: TaskKind, user: str, label: str) -> dict[str, Any]:
         """跑一拍 Pro：并入同一条 transcript，submit 写回 Task 树。"""
@@ -181,6 +188,16 @@ class LabState:
             kept = result.history if phase.carry_prose else _strip_prose(result.history)
             self.pro_history[:] = drop_dangling_tool_calls(kept)
 
+        payload = _submit_payload(result.submit)
+        append_forget(self.session_dir, str(payload.get("forget_append") or ""))
+        apply_notes(
+            self.session_dir,
+            replace=payload.get("notes_replace"),
+            remove=payload.get("notes_remove"),
+            append=str(payload.get("notes_append") or ""),
+        )
+        write_long_note(self.session_dir, payload.get("notes_write"))
+
         if result.submit:
             child.transit(TaskStatus.COMPLETED)
             child.brief = result.submit
@@ -200,6 +217,14 @@ def _strip_prose(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for m in history
         if not (m.get("role") == "assistant" and not m.get("tool_calls"))
     ]
+
+
+def _submit_payload(submit: dict[str, Any] | None) -> dict[str, Any]:
+    """submit_brief 是裸 payload；其余是 {name, payload}。"""
+    if not submit:
+        return {}
+    inner = submit.get("payload") if submit.get("name") else submit
+    return inner if isinstance(inner, dict) else {}
 
 
 async def run_lab(
@@ -238,6 +263,10 @@ async def _begin(
     save_tree(session_dir, tree)
 
     reset_sandbox_failure_counter()
+    try:
+        await reconcile_index(runner.llm, runner.settings)
+    except Exception:
+        pass
     ledger = EffectLedger.load(session_dir, runner.settings.workspace_dir)
     catalog = read_text(session_dir, CATALOG_FILE) or await ingest(runner.settings, session_dir)
     return LabState(
@@ -319,6 +348,12 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
     )
     if st.halt:
         return None
+
+    cards = load_cards(st.session_dir)
+    if cards is None:
+        cards = await prefetch_cards(st.question, st.runner.llm, settings=st.runner.settings)
+        write_cards(st.session_dir, cards)
+    await st.emit({"kind": "cards", "n": len(cards)})
 
     project = resume_spec(st.tree) if st.resume else None
     if project is not None:
@@ -508,9 +543,9 @@ async def _one_step(
 
     briefs: list[dict[str, Any]] = []
     spec_invalid = False
-    last_gate = AcceptResult(state=NO_HARD_CRITERIA)
+    step_gates: list[AcceptResult] = []
     if assignments:
-        briefs, spec_invalid, last_gate, step_halt = await run_step(
+        briefs, spec_invalid, wave_gate, step_halt = await run_step(
             st.runner,
             assignments,
             question=st.question,
@@ -525,6 +560,7 @@ async def _one_step(
         if step_halt:
             st.halt = step_halt
             return "break", gate_nudge, revisions
+        step_gates.append(wave_gate)
         for a, brief in zip(assignments, briefs):
             state = str((brief.get("tests") or {}).get("state") or "")
             if state:
@@ -532,7 +568,8 @@ async def _one_step(
     if replay:
         extra, extra_gate = await _replay_gates(st, replay)
         briefs = briefs + extra
-        last_gate = worst_gate(last_gate, extra_gate)
+        step_gates.append(extra_gate)
+    last_gate = worst_gate(step_gates)
     st.run_gate = last_gate
 
     decision = await _judge(st, dispatch, briefs, last_gate)
@@ -554,11 +591,11 @@ async def _replay_gates(
     st: LabState, replay: list
 ) -> tuple[list[dict[str, Any]], AcceptResult]:
     """同一产品本 run 已派过 Flash，且门禁是 test_invalid：只重跑 pytest。"""
-    last = AcceptResult(state=NO_HARD_CRITERIA)
+    gates: list[AcceptResult] = []
     briefs: list[dict[str, Any]] = []
     for a in replay:
         gate = await evaluate_gate(st.runner, st.session_dir, a.gate_id)
-        last = worst_gate(last, gate)
+        gates.append(gate)
         st.record_gate(a.gate_id, gate.state)
         brief = {
             "assignment_id": a.id,
@@ -582,17 +619,23 @@ async def _replay_gates(
                 "gate": gate.state,
             }
         )
-    return briefs, last
+    return briefs, worst_gate(gates)
 
 
 def _summary_gate(st: LabState) -> AcceptResult:
     """整次 lab 的门禁：各 assignment 最差态。没有记录则用最近一步。"""
     if not st.gates:
         return st.run_gate
-    acc = AcceptResult(state=NO_HARD_CRITERIA)
-    for state in st.gates.values():
-        acc = worst_gate(acc, AcceptResult(state=state))
-    return acc
+    return worst_gate(AcceptResult(state=state) for state in st.gates.values())
+
+
+def _gate_line(st: LabState) -> str:
+    """整体门禁 + 逐个 assignment 的明细，让收尾那一拍能自己对账。"""
+    overall = _summary_gate(st).state
+    if not st.gates:
+        return overall
+    detail = ", ".join(f"{gid}={state}" for gid, state in sorted(st.gates.items()))
+    return f"{overall}（{detail}）"
 
 
 async def _judge(
@@ -607,7 +650,8 @@ async def _judge(
         f"Briefs:\n{json.dumps(briefs, ensure_ascii=False)[:_BRIEFS_CAP]}\n"
         f"## Applicable /remember rules\n{st.remember_block()}\n"
         "If the gate is no_hard_criteria you MUST say so in evidence and give a semantic rationale. "
-        "Fill rule_verdicts for every applicable /remember rule. finish only when all are satisfied."
+        "Fill rule_verdicts for every applicable /remember rule, identified by the index above. "
+        "Do not retype the rule text as the identifier. finish only when all are satisfied."
     )
     if last_gate.state == TEST_INVALID and st.gate_unrunnable():
         judge_user += (
@@ -637,12 +681,12 @@ async def _judge(
     verdict = payload_of(judge_submit, SUBMIT_JUDGE)
     decision = str(verdict.get("decision") or "continue")
     if last_gate.state == TEST_INVALID and dispatch.assignments and not st.gate_unrunnable():
-        refreshed = AcceptResult(state=NO_HARD_CRITERIA)
+        refreshed: list[AcceptResult] = []
         for a in dispatch.assignments:
             gate = await evaluate_gate(st.runner, st.session_dir, a.gate_id)
             st.record_gate(a.gate_id, gate.state)
-            refreshed = worst_gate(refreshed, gate)
-        last_gate = refreshed
+            refreshed.append(gate)
+        last_gate = worst_gate(refreshed)
         st.run_gate = last_gate
     if decision == "finish" and not rules_satisfied(st.runner._applied_rules or [], verdict):
         decision = "continue"
@@ -653,14 +697,6 @@ async def _judge(
         decision = "continue"
     if decision == "takeover" and last_gate.state == TEST_INVALID:
         decision = "continue"
-
-    apply_memory(
-        st.session_dir,
-        replace=verdict.get("memory_replace"),
-        remove=verdict.get("memory_remove"),
-        append=str(verdict.get("memory_append") or ""),
-    )
-    append_forget(st.session_dir, str(verdict.get("forget_append") or ""))
 
     st.runner._trace_event(
         S.EV_DECISION,
@@ -752,8 +788,10 @@ async def summarize(st: LabState) -> dict[str, Any]:
             f"and the artifacts below.\n\n"
             f"User request: {st.question}\n\n## SPEC.md\n{read_text(st.session_dir, SPEC_FILE)}\n\n"
             f"## 完成情况\n{render_progress(st.progress)}\n\n"
-            f"Gate: {_summary_gate(st).state}\n"
-            "Call submit_summary. If the gate was no_hard_criteria, say so in user_summary."
+            f"Gate: {_gate_line(st)}\n"
+            "Call submit_summary. Report that gate state as-is; it is the harness result, "
+            "and the per-assignment breakdown above is what it was computed from. "
+            "If it says no_hard_criteria, say so in user_summary."
         )
     await st.emit({"kind": "node_start", "node": "summary"})
     payload = payload_of(

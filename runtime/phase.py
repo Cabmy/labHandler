@@ -41,6 +41,7 @@ FLASH = "flash"
 # 只读 Pro 阶段默认看不见 pro 权限工具；skill 读取经 extra 点名放行。
 # Flash 不加载 skill；submit_halt 经 extra 点名放行。
 _SKILL_READ = frozenset({LOAD_SKILL, LOAD_SKILL_REFERENCE})
+_PRO_SESSION = frozenset({"memory_forget", "notes_read"})
 # 除 SUMMARY 外均可短路：规划时可能看不出来，做到一半才发现缺用户才能给的信息。
 _HALT = frozenset({SUBMIT_HALT})
 
@@ -95,7 +96,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_SPEC,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        extra_tools=_SKILL_READ | _HALT,
+        extra_tools=_SKILL_READ | _PRO_SESSION | _HALT,
         shares_thread=True,
     ),
     TaskKind.REMEMBER_JUDGE: PhaseSpec(
@@ -117,7 +118,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_DISPATCH,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        extra_tools=_SKILL_READ | {WRITE_ACCEPTANCE} | _HALT,
+        extra_tools=_SKILL_READ | _PRO_SESSION | {WRITE_ACCEPTANCE} | _HALT,
         shares_thread=True,
     ),
     TaskKind.JUDGE: PhaseSpec(
@@ -126,7 +127,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_JUDGE,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        extra_tools=_SKILL_READ | {WRITE_ACCEPTANCE} | _HALT,
+        extra_tools=_SKILL_READ | _PRO_SESSION | {WRITE_ACCEPTANCE} | _HALT,
         shares_thread=True,
     ),
     TaskKind.TAKEOVER: PhaseSpec(
@@ -143,7 +144,7 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         submit_tool=SUBMIT_SUMMARY,
         permission=Permission.PRO,
         visible=Permission.READONLY,
-        extra_tools=_SKILL_READ,
+        extra_tools=_SKILL_READ | _PRO_SESSION,
         shares_thread=True,
     ),
     TaskKind.WORKER: PhaseSpec(

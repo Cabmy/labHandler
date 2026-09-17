@@ -1,0 +1,18 @@
+# 评测专用画像。不写入 profile/me.yaml。
+# style_rules 顺序即 remember_judge 的 index：0 screenshot / 1 blockquote / 2 filename
+identity:
+  name: 张鑫
+  student_id: 202112342
+
+preferences:
+  language: zh-CN
+  writing_style:
+    formality: medium
+    avg_sentence_len: 25
+  coding_style:
+    type_hints: true
+    docstring: short
+  style_rules:
+    - 实验报告里的截图统一写成「（此处建议附 XX 截图）」占位，不要编造已经拍摄的截图。
+    - 引用实验指导书原文时用 markdown 引用块（行首 >），不要改写成自己的话却不标注。
+    - 编程题源文件按题目命名（如 two_sum.py），禁止 solution.py / main.py。

@@ -70,24 +70,61 @@ class TaskArchive:
             conn.commit()
             return cursor.lastrowid or 0
 
+    def _parse_card(self, card: dict) -> tuple[str, str, str] | None:
+        """合法卡片 → (card_type, content, content_hash)；否则 None。"""
+        card_type = str(card.get("type", "")).strip()
+        content = str(card.get("content", "")).strip()
+        if card_type not in VALID_CARD_TYPES or not content:
+            return None
+        return card_type, content, hashlib.sha256(content.encode()).hexdigest()[:16]
+
+    def _active_duplicate(self, conn: sqlite3.Connection, card_type: str, content_hash: str) -> bool:
+        row = conn.execute(
+            """
+            SELECT 1 FROM archive_cards
+            WHERE card_type = ? AND content_hash = ? AND retired_at IS NULL
+            LIMIT 1
+            """,
+            (card_type, content_hash),
+        ).fetchone()
+        return row is not None
+
+    def has_new_cards(self, knowledge_cards: list[dict]) -> bool:
+        """是否存在尚未入库的活跃卡（跨 task 同 hash 视为已有）。"""
+        seen: set[tuple[str, str]] = set()
+        with connect(self.db_path) as conn:
+            for card in knowledge_cards:
+                parsed = self._parse_card(card)
+                if parsed is None:
+                    continue
+                card_type, _content, content_hash = parsed
+                key = (card_type, content_hash)
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not self._active_duplicate(conn, card_type, content_hash):
+                    return True
+        return False
+
     def create_cards(
         self, task_id: int, knowledge_cards: list[dict], task_title: str, task_type: str
     ) -> list[int]:
         """写入 archive_cards，返回实际插入的 card_id。
 
         不入库：card_type 不在白名单、content 为空、
-        同 task 内 (card_type, content_hash) 已存在（UNIQUE，吞 IntegrityError）。
+        任意活跃卡已有同一 (card_type, content_hash)（跨 task 也不再收）、
+        同 task 内 UNIQUE 冲突（吞 IntegrityError）。
         search_text 由 task_type / card_type / task_title / content 拼成。
         """
         inserted_ids: list[int] = []
         with connect(self.db_path) as conn:
             for card in knowledge_cards:
-                card_type = str(card.get("type", "")).strip()
-                content = str(card.get("content", "")).strip()
-                if card_type not in VALID_CARD_TYPES or not content:
+                parsed = self._parse_card(card)
+                if parsed is None:
                     continue
-
-                content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
+                card_type, content, content_hash = parsed
+                if self._active_duplicate(conn, card_type, content_hash):
+                    continue
                 search_text = (
                     f"任务类型: {task_type}\n"
                     f"卡片类型: {card_type}\n"

@@ -18,7 +18,7 @@ from config.runtime import RuntimeSettings
 from runtime.context.assemble import AgentContext, assemble, validate_message_sequence
 from runtime.context.budget import TokenBudget
 from runtime.context.compact import DumpScope, compact_history
-from runtime.context.notes import load_notes, memory_block
+from runtime.context.notes import load_notes
 from runtime.loop.control import decide
 from runtime.errors import ErrorClass
 from runtime.llm import LLMGateway
@@ -38,6 +38,7 @@ _RETRIEVAL_TOOLS = {
     "memory_search",
     "memory_grep",
     "memory_read",
+    "notes_read",
     LOAD_SKILL,
     LOAD_SKILL_REFERENCE,
 }
@@ -191,7 +192,8 @@ async def run_loop(
                 project_spec=project_spec,
                 history=history,
                 retrieved=retrieved,
-                memory=memory_block(notes),
+                notes=notes.notes_block,
+                cards=notes.cards_block if spec.name == PRO else "",
                 events=task.events,
                 working=working,
                 tool_schemas=openai_tools,

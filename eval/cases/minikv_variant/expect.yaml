@@ -1,0 +1,25 @@
+pair: minikv
+role: measure
+question: 按工作区实验指导书完成 MiniKV-TTL 实验：实现带过期时间的模块并撰写八节实验报告。
+deliverables:
+  - minikv.py
+  - 实验报告.md
+remember:
+  screenshot: true
+  blockquote: true
+  filename: false
+cards_expected:
+  - 八节 实验目的
+  - 截图 （此处建议附
+card_assertions:
+  # 原来这里是 spec.milestones_len >= 1，恒真——任何非空 SPEC 都过，等于没测。
+  # 报告的八节/截图/引用块由 /remember 规则和 gate 保证，冷热完全一致，也没有
+  # 判别力。真正的差别在派发轮数：热跑 3 轮，冷跑 4 轮，所以阈值取 3。
+  - match:
+      contains: 八节 实验目的
+    check: dispatch_waves <= 3
+  # 4.md 讲的是「门禁里的 import 要放进测试函数内，否则收集期 ModuleNotFoundError
+  # 会被记成 test_invalid」。这条卡直接对应内部门禁能否跑起来。
+  - match:
+      contains: 收集期 ModuleNotFoundError
+    check: gate_ran

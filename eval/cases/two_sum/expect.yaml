@@ -1,0 +1,11 @@
+pair: two_sum
+role: accumulate
+question: 完成工作区中的两数之和编程作业。只交指定的 Python 源文件。
+deliverables:
+  - two_sum.py
+remember:
+  screenshot: false
+  blockquote: false
+  filename: true
+cards_expected: []
+card_assertions: []

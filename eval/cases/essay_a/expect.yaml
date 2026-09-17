@@ -1,0 +1,11 @@
+pair: essay
+role: accumulate
+question: 按工作区题目写一篇议论文，只交指定的 markdown 作文。
+deliverables:
+  - essay.md
+remember:
+  screenshot: false
+  blockquote: false
+  filename: false
+cards_expected: []
+card_assertions: []

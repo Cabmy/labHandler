@@ -23,7 +23,7 @@ class TaskKind(str, Enum):
     WORKER = "worker"      # Flash 执行一份任务书
     TAKEOVER = "takeover"  # Flash 做不动时 Pro 接手本步实现
     JUDGE = "judge"
-    REMEMBER_JUDGE = "remember_judge"  # 裁定 /remember 是否适用于本 lab，不写 SPEC/MEMORY
+    REMEMBER_JUDGE = "remember_judge"  # 裁定 /remember 是否适用于本 lab，不写 SPEC/NOTES
     SUMMARY = "summary"
 
 
