@@ -32,7 +32,7 @@ SUBMIT_HALT = "submit_halt"
 SUBMIT_DREAM = "submit_dream"
 SUBMIT_SKILL_EDIT = "submit_skill_edit"
 
-# 结构化出口：无副作用，能否调用由 for_role 的工具表决定。
+# 结构化出口：无副作用，能否执行由 bind 的 allow 决定；广告表可以更宽。
 # write_acceptance 写文件，不在此集合，必须走 check_write。
 SCHEMA_TOOLS = {
     SUBMIT_SPEC,
@@ -98,15 +98,6 @@ SPEC_SCHEMA: dict[str, Any] = {
     "additionalProperties": True,
 }
 
-MIN_SPEC_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "required": ["goal"],
-    "properties": {
-        "goal": {"type": "string"},
-        "milestones": {"type": "array", "items": {"type": "string"}},
-    },
-}
-
 ASSIGNMENT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["id", "domain", "goal", "testable"],
@@ -170,22 +161,6 @@ DISPATCH_SCHEMA: dict[str, Any] = {
     "additionalProperties": True,
 }
 
-MIN_DISPATCH_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "required": ["assignments"],
-    "properties": {
-        "step_goal": {"type": "string"},
-        "assignments": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "required": ["id", "goal"],
-                "properties": {"id": {"type": "string"}, "goal": {"type": "string"}},
-            },
-        },
-    },
-}
-
 BRIEF_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["outcome", "brief"],
@@ -200,15 +175,6 @@ BRIEF_SCHEMA: dict[str, Any] = {
         "changed_files": {"type": "array", "items": {"type": "string"}},
     },
     "additionalProperties": True,
-}
-
-MIN_BRIEF_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "required": ["outcome", "brief"],
-    "properties": {
-        "outcome": {"type": "string"},
-        "brief": {"type": "string"},
-    },
 }
 
 JUDGE_SCHEMA: dict[str, Any] = {
@@ -413,38 +379,6 @@ _FULL = {
     SUBMIT_HALT: HALT_SCHEMA,
     SUBMIT_DREAM: DREAM_SCHEMA,
     SUBMIT_SKILL_EDIT: SKILL_EDIT_SCHEMA,
-}
-
-_MIN = {
-    SUBMIT_SPEC: MIN_SPEC_SCHEMA,
-    SUBMIT_DISPATCH: MIN_DISPATCH_SCHEMA,
-    SUBMIT_BRIEF: MIN_BRIEF_SCHEMA,
-    SUBMIT_JUDGE: {
-        "type": "object",
-        "required": ["decision", "evidence"],
-        "properties": {
-            "decision": {"type": "string"},
-            "evidence": {"type": "string"},
-        },
-    },
-    SUBMIT_SUMMARY: {
-        "type": "object",
-        "required": ["user_summary"],
-        "properties": {"user_summary": {"type": "string"}},
-    },
-    SUBMIT_REMEMBER: {
-        "type": "object",
-        "required": ["verdicts"],
-        "properties": {"verdicts": {"type": "array"}},
-    },
-    SUBMIT_HALT: {
-        "type": "object",
-        "required": ["reason", "need_from_user"],
-        "properties": {
-            "reason": {"type": "string"},
-            "need_from_user": {"type": "string"},
-        },
-    },
 }
 
 

@@ -15,7 +15,6 @@ from runtime.loop.schema import (
     SUBMIT_REMEMBER,
     SUBMIT_SPEC,
     _FULL,
-    _MIN,
 )
 
 def openai_tool(name: str, description: str, schema: dict[str, Any]) -> dict[str, Any]:
@@ -143,8 +142,8 @@ def check_args(schema: dict[str, Any], args: dict[str, Any]) -> str:
     return ""
 
 
-def validate_payload(name: str, payload: dict[str, Any], *, degraded: bool = False) -> str:
-    schema = (_MIN if degraded else _FULL).get(name)
+def validate_payload(name: str, payload: dict[str, Any]) -> str:
+    schema = _FULL.get(name)
     if schema is None:
         return f"unknown schema tool: {name}"
     try:
@@ -159,11 +158,11 @@ def validate_payload(name: str, payload: dict[str, Any], *, degraded: bool = Fal
         brief = str(payload.get("brief") or "").strip()
         if brief in {"已完成", "done", "ok", "做不了"}:
             return "brief is too generic; say what you changed and any errors you hit"
-    if name == SUBMIT_SPEC and not degraded:
+    if name == SUBMIT_SPEC:
         return _validate_spec(payload)
-    if name == SUBMIT_DISPATCH and not degraded:
+    if name == SUBMIT_DISPATCH:
         return _validate_dispatch(payload)
-    if name == SUBMIT_REMEMBER and not degraded:
+    if name == SUBMIT_REMEMBER:
         return _validate_remember(payload)
     return ""
 

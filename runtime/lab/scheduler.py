@@ -1,7 +1,8 @@
 """执行一步里的 Flash worker：1 个串行可写，多个只读并行。
 
-任一 worker 的 outcome=spec_invalid 时取消尚未完成的兄弟，并给它们合成
-failed brief。并发上限为 settings.max_parallel_readonly_workers。
+任一 worker 的 outcome=spec_invalid / halt，或 sandbox_unreachable 时取消
+尚未完成的兄弟，并给它们合成 failed brief。并发上限为
+settings.max_parallel_readonly_workers。
 """
 
 import asyncio
@@ -13,6 +14,12 @@ from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer
 from runtime.loop.parse import synthetic_brief
 from runtime.task import Permission, RuntimeTask, TaskStatus
+
+
+def _cancels_wave(brief: dict[str, Any]) -> bool:
+    return brief.get("outcome") in {"spec_invalid", "halt"} or bool(
+        brief.get("sandbox_unreachable")
+    )
 
 
 def permission_for_wave(n: int) -> Permission:
@@ -57,10 +64,7 @@ async def run_wave(
     try:
         while pending:
             _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            if any(
-                (results.get(w.task_id) or {}).get("outcome") in {"spec_invalid", "halt"}
-                for w in workers
-            ):
+            if any(_cancels_wave(results.get(w.task_id) or {}) for w in workers):
                 for t in pending:
                     t.cancel()
                 break
@@ -88,7 +92,7 @@ async def run_wave(
         if brief is None:
             brief = synthetic_brief(
                 outcome="failed",
-                brief="Sibling workers were cancelled after spec_invalid or halt.",
+                brief="Sibling workers were cancelled after spec_invalid, halt, or sandbox_unreachable.",
             )
             if w.status is TaskStatus.RUNNING:
                 try:

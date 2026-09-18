@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
-from runtime.lab.accept import AcceptResult, NO_HARD_CRITERIA, PASS, sanity_and_run
+from runtime.lab.accept import AcceptResult, NO_HARD_CRITERIA, PASS, TEST_INVALID, sanity_and_run
 from runtime.lab.helpers import halt_of, step_gate
 from runtime.lab.persist import (
     EffectLedger,
@@ -22,6 +22,7 @@ from runtime.loop.parse import synthetic_brief
 from runtime.loop.schema import SUBMIT_HALT
 from runtime.observe import spans as S
 from runtime.task import RuntimeTask, TaskKind, TaskStatus, TaskTree
+from tools.sandbox_tools import is_sandbox_unreachable
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
@@ -206,6 +207,12 @@ async def run_worker(
             brief = result.brief or synthetic_brief(
                 outcome="failed", brief=result.reason or "no brief"
             )
+            if result.reason == "sandbox_unreachable":
+                brief["sandbox_unreachable"] = True
+                brief["outcome"] = "failed"
+            if result.reason == "validation_takeover":
+                brief["takeover"] = True
+                brief["outcome"] = "failed"
             halted = halt_of(result.submit)
             if halted:
                 payload = {
@@ -254,7 +261,16 @@ async def run_worker(
         brief["changed_files"] = brief.get("changed_files") or changed_files_from_audit(
             runner.settings.workspace_dir, since=audit_mark
         )
-        gate = await run_gate(runner, session_dir, assignment.gate_id)
+        if brief.get("sandbox_unreachable"):
+            gate = AcceptResult(
+                state=TEST_INVALID,
+                exit_code=-1,
+                log=str(brief.get("brief") or "sandbox unreachable"),
+            )
+        else:
+            gate = await run_gate(runner, session_dir, assignment.gate_id)
+            if is_sandbox_unreachable(gate.log):
+                brief["sandbox_unreachable"] = True
         brief["tests"] = gate.as_tests()
         worker.brief = brief
 

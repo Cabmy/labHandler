@@ -1,35 +1,30 @@
 """上下文槽位装配。纯函数：同样的输入永远得到同样的 messages。
 
 槽位顺序按「一拍之内还会不会变」排，不变的靠前，利于上游 prompt cache：
-system → notes → user → spec → history → cards → retrieved → events
+system → user → history → state → cards → retrieved → events
 
-notes：本 lab NOTES.md（短句或长文指针）。只在阶段交卷时被改写，而那一刻 system
-       本来就换了新的阶段 prompt，缓存反正要断，所以放前面不额外付费。
-cards：SPEC 预取的跨 lab 卡片正文，仅 Pro。Pro 随时可以 memory_forget 掉一张，
-       一拍之内就会变，所以必须排在 history 之后，否则每忘一张就作废整条历史的缓存。
-       forget 同时把卡从归档里淘汰，下一 lab 检索不到。
-       排在 SPEC 与历史之后还有第二个好处：本次作业的要求先入场，旧 lab 的经验后到，
-       两者冲突时模型更容易按前者走。
+system：只读主线跨阶段固定（PRO_SYSTEM）。独立 agent 用自己的完整 prompt。
+user：独立 agent 的开场任务；共享线程为空——初始任务已经是 history 的第一条。
+history：append-only。共享线程里含初始任务、phase_control、state_update、工具轨迹。
+state：本拍最新 NOTES.md / SPEC.md 快照。放在 history 之后，变动只作废后缀缓存。
+cards：SPEC 预取的跨 lab 卡片正文，仅 Pro。memory_forget 一拍之内就会变，必须
+       排在 history 之后。本次作业要求先入场，旧 lab 经验后到。
 retrieved：本 loop 里 memory_search/grep/read、notes_read、load_skill 的追加结果，不进 history。
 
-user 槽只承载「本轮之前没有任何对话」的那一段开场指令；为空时整条消息不出现。
-跨阶段连续对话的指令由调用方直接写进 history，这样它才排在既有往来之后，
-而不是被 user 槽顶到全部历史之前。
-
 history 是工具消息的唯一载体，其中已经包含成对的 assistant(tool_calls) +
-tool 响应。装配层没有第二个 tool 槽位：任何旁路注入都会让同一批结果出现
-两次，其中一份还会落在 user 消息之后变成协议非法的孤儿消息。
+tool 响应。装配层没有第二个 tool 槽位。
 
 input_tokens = 消息估计 + 本轮 tool schema 估计，与 TokenBudget 用同一套计数。
 发出的消息不含 harness 私有字段（如 pinned）。
 """
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from runtime.context.budget import count_messages, count_tool_schemas
 
-# harness 内部标记，不属于 OpenAI 消息结构；发出去会被严格网关拒绝
 _PRIVATE_KEYS = frozenset({"pinned"})
 
 
@@ -37,6 +32,8 @@ _PRIVATE_KEYS = frozenset({"pinned"})
 class AgentContext:
     messages: list[dict[str, Any]]
     input_tokens: int
+    system_hash: str = ""
+    tools_hash: str = ""
 
 
 def strip_private(message: dict[str, Any]) -> dict[str, Any]:
@@ -46,46 +43,65 @@ def strip_private(message: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in message.items() if k not in _PRIVATE_KEYS}
 
 
+def prompt_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def _tools_hash(tool_schemas: list[dict[str, Any]] | None) -> str:
+    if not tool_schemas:
+        return prompt_hash("")
+    return prompt_hash(json.dumps(tool_schemas, ensure_ascii=False, sort_keys=True))
+
+
+def live_state_block(*, notes: str = "", spec: str = "") -> str:
+    """history 之后的动态快照：当前 NOTES.md 与 SPEC.md。空则不装配。"""
+    parts: list[str] = []
+    if notes:
+        parts.append(notes)
+    if spec:
+        parts.append(f"## SPEC.md\n{spec}")
+    return "\n\n".join(parts)
+
+
 def assemble(
     *,
     system: str,
     user_input: str,
-    project_spec: str,
     history: list[dict[str, Any]],
     retrieved: str,
-    notes: str,
     cards: str = "",
+    state: str = "",
     events: list[dict[str, str]],
-    working: str,
     tool_schemas: list[dict[str, Any]] | None = None,
 ) -> AgentContext:
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system},
     ]
-    if notes:
-        messages.append({"role": "user", "content": notes})
     if user_input:
         messages.append({"role": "user", "content": user_input})
-    if project_spec:
-        messages.append({"role": "user", "content": f"## SPEC.md\n{project_spec}"})
 
     messages.extend(strip_private(m) for m in history)
 
+    if state:
+        messages.append({"role": "user", "content": state})
     if cards:
         messages.append({"role": "user", "content": cards})
     if retrieved:
         messages.append({"role": "user", "content": f"## Retrieved knowledge\n{retrieved}"})
 
     event_lines = [e.get("text", "") for e in events if e.get("text")]
-    if working:
-        event_lines.append(working)
     if event_lines:
         messages.append(
             {"role": "user", "content": "## Execution events\n" + "\n".join(event_lines)}
         )
 
     tokens = count_messages(messages) + count_tool_schemas(tool_schemas)
-    return AgentContext(messages=messages, input_tokens=tokens)
+    return AgentContext(
+        messages=messages,
+        input_tokens=tokens,
+        system_hash=prompt_hash(system),
+        tools_hash=_tools_hash(tool_schemas),
+    )
 
 
 def validate_message_sequence(messages: list[dict[str, Any]]) -> list[str]:

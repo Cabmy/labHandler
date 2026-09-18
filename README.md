@@ -22,7 +22,7 @@
   阶段指令追加在对话末尾；Flash 每份任务书新开上下文
 - **上下文管理**：最近数轮保留原文，更早的由 Flash 摘要一次，tool 正文卸到磁盘；
   压缩后立即重新装配再发请求
-- **NOTES 与卡片**：`NOTES.md` 常驻 notes 槽、压缩吃不掉，Judge 可追加/改写/删除；长笔记
+- **NOTES 与卡片**：NOTES.md 变更以 state_update 追加，当前全文放在 history 之后的 state 槽；Judge 可追加/改写/删除；长笔记
   `notes_write` 落盘，NOTES.md 只留指针，`notes_read` 再打开。SPEC 预取的归档卡片进独立
   cards 槽（排在历史之后，本次作业的要求先入场）；Pro 调 `memory_forget` 下一拍即消失，
   并记进 `FORGET.md` 让下次摘要也不回流。`forget_append` 只标历史噪声，压完即清空。

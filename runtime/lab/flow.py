@@ -4,18 +4,21 @@ LabRunner 只负责入口、取消和 AgentSpec。本模块拿一份 LabState �
 避免 runner.py 再堆成一条 400 行过程。
 """
 
+import hashlib
 import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from config.prompts import render_state_update
 from memory.profile import load_profile
 from memory.retrieve import prefetch_cards, reconcile_index
 from runtime.context.notes import (
     append_forget,
     apply_notes,
     load_cards,
+    load_notes,
     write_cards,
     write_long_note,
 )
@@ -33,7 +36,9 @@ from runtime.lab.persist import (
     EffectLedger,
     CATALOG_FILE,
     SPEC_FILE,
+    load_checkpoint,
     read_text,
+    save_checkpoint,
     save_tree,
     write_text,
 )
@@ -56,9 +61,9 @@ from runtime.loop.schema import (
     SUBMIT_SUMMARY,
 )
 from runtime.observe import spans as S
-from runtime.phase import phase_of
+from runtime.phase import phase_control_message, phase_of
 from runtime.task import RuntimeTask, TaskKind, TaskStatus, TaskTree
-from tools.sandbox_tools import reset_sandbox_failure_counter
+from tools.sandbox_tools import is_sandbox_unreachable, reset_sandbox_failure_counter
 from tools.skill_tool import SkillBind
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
@@ -92,10 +97,13 @@ class LabState:
     broken_gates: set[str] = field(default_factory=set)
     pro_history: list[dict[str, Any]] = field(default_factory=list)
     halt: dict[str, Any] | None = None
+    sandbox_down: str = ""
     run_gate: AcceptResult = field(
         default_factory=lambda: AcceptResult(state=NO_HARD_CRITERIA)
     )
-    spec_user: str = ""
+    dispatch_step: int = 0
+    stage: str = "remember"
+    resume_announced: bool = False
 
     def record_gate(self, gate_id: str, state: str) -> None:
         """记下某个 assignment 的门禁结论；test_invalid 累计到上限就标为跑不起来。"""
@@ -120,6 +128,23 @@ class LabState:
     async def emit_halt(self, halt: dict[str, Any]) -> None:
         await self.runner._emit_halt(self.on_event, halt)
 
+    async def mark_sandbox_down(self, reason: str = "") -> None:
+        """本场 lab 因沙箱不可达收工；HTTP 服务继续跑。"""
+        if self.sandbox_down:
+            return
+        self.sandbox_down = (
+            reason.strip()
+            or "Sandbox unreachable after 3 consecutive MCP failures."
+        )
+        await self.emit(
+            {
+                "kind": "error",
+                "detail": f"沙箱不可达，本场 lab 结束：{self.sandbox_down[:800]}",
+            }
+        )
+        self.stage = "summary"
+        self.persist()
+
     def take_halt(self, submit: dict[str, Any] | None) -> dict[str, Any] | None:
         found = halt_of(submit)
         if found:
@@ -132,13 +157,97 @@ class LabState:
             return "（本 lab 没有适用的 /remember 规则）"
         return "\n".join(f"{i}. {r}" for i, r in enumerate(rules))
 
+    def persist(self) -> None:
+        """把 Pro 对话和阶段进度写到 CHECKPOINT.json，并刷新任务树。"""
+        save_checkpoint(
+            self.session_dir,
+            {
+                "v": 1,
+                "question": self.question,
+                "pro_history": drop_dangling_tool_calls(list(self.pro_history)),
+                "progress": [list(row) for row in self.progress],
+                "executed_ids": sorted(self.executed_ids),
+                "gates": dict(self.gates),
+                "gate_tries": dict(self.gate_tries),
+                "broken_gates": sorted(self.broken_gates),
+                "run_gate": {
+                    "state": self.run_gate.state,
+                    "passed": self.run_gate.passed,
+                    "failed": self.run_gate.failed,
+                    "exit_code": self.run_gate.exit_code,
+                    "log": self.run_gate.log,
+                },
+                "halt": self.halt,
+                "sandbox_down": self.sandbox_down,
+                "skill": getattr(self.runner._skill, "name", None),
+                "dispatch_step": self.dispatch_step,
+                "stage": self.stage,
+            },
+        )
+        save_tree(self.session_dir, self.tree)
+
+    def restore(self, payload: dict[str, Any]) -> None:
+        history = payload.get("pro_history")
+        if isinstance(history, list):
+            self.pro_history = drop_dangling_tool_calls(
+                [m for m in history if isinstance(m, dict)]
+            )
+        progress = payload.get("progress")
+        if isinstance(progress, list):
+            self.progress = [
+                (str(row[0]), str(row[1]))
+                for row in progress
+                if isinstance(row, (list, tuple)) and len(row) >= 2
+            ]
+        ids = payload.get("executed_ids")
+        if isinstance(ids, list):
+            self.executed_ids = {str(x) for x in ids if x}
+        gates = payload.get("gates")
+        if isinstance(gates, dict):
+            self.gates = {str(k): str(v) for k, v in gates.items()}
+        tries = payload.get("gate_tries")
+        if isinstance(tries, dict):
+            self.gate_tries = {str(k): int(v) for k, v in tries.items()}
+        broken = payload.get("broken_gates")
+        if isinstance(broken, list):
+            self.broken_gates = {str(x) for x in broken}
+        gate = payload.get("run_gate")
+        if isinstance(gate, dict) and gate.get("state"):
+            self.run_gate = AcceptResult(
+                state=str(gate.get("state") or NO_HARD_CRITERIA),
+                passed=int(gate.get("passed") or 0),
+                failed=int(gate.get("failed") or 0),
+                exit_code=int(gate.get("exit_code") or 0),
+                log=str(gate.get("log") or ""),
+            )
+        halt = payload.get("halt")
+        if isinstance(halt, dict) and str(halt.get("reason") or "").strip():
+            self.halt = halt
+        self.sandbox_down = str(payload.get("sandbox_down") or "")
+        self.dispatch_step = int(payload.get("dispatch_step") or 0)
+        stage = str(payload.get("stage") or "")
+        if stage in {"remember", "spec", "advance", "summary"}:
+            self.stage = stage
+        skill = str(payload.get("skill") or "").strip()
+        if skill:
+            self.runner._skill.name = skill
+
     async def drive_pro(self, kind: TaskKind, user: str, label: str) -> dict[str, Any]:
-        """跑一拍 Pro：并入同一条 transcript，submit 写回 Task 树。"""
+        """跑一拍 Pro。只读主线并入同一条 transcript，并在尾部追加 phase_control。"""
         runner = self.runner
         phase = phase_of(kind)
         permission = phase.node_permission()
-        carry = phase.shares_thread
-        incoming = self.pro_history + [{"role": "user", "content": user}] if carry else []
+        if phase.shares_thread:
+            _seed_pro_thread(self)
+            incoming = [*self.pro_history, phase_control_message(kind)]
+            if user:
+                incoming.append({"role": "user", "content": user})
+            user_input = ""
+            project_spec = read_text(self.session_dir, SPEC_FILE)
+        else:
+            incoming = []
+            user_input = user
+            project_spec = ""
         child = self.tree.add_child(
             self.root.task_id,
             kind=kind,
@@ -171,8 +280,8 @@ class LabState:
                 llm=runner.llm,
                 registry=runner.registry,
                 session_dir=self.session_dir,
-                user_input="" if carry else user,
-                project_spec=read_text(self.session_dir, SPEC_FILE),
+                user_input=user_input,
+                project_spec=project_spec,
                 history=incoming,
                 on_event=self.on_event,
                 tracer=runner.tracer,
@@ -182,14 +291,17 @@ class LabState:
             if span_cm is not None:
                 span_cm.__exit__(None, None, None)
 
-        if carry:
+        if phase.shares_thread:
             # 存回去的 transcript 必须配平：末尾若留着没有 tool 响应的
             # assistant，下一阶段追加的指令会被 drop_dangling_tool_calls 一并截掉。
-            kept = result.history if phase.carry_prose else _strip_prose(result.history)
-            self.pro_history[:] = drop_dangling_tool_calls(kept)
+            self.pro_history[:] = drop_dangling_tool_calls(result.history)
+
+        if result.reason == "sandbox_unreachable":
+            await self.mark_sandbox_down(str((result.brief or {}).get("brief") or ""))
 
         payload = _submit_payload(result.submit)
         append_forget(self.session_dir, str(payload.get("forget_append") or ""))
+        notes_touched = _notes_touched(payload)
         apply_notes(
             self.session_dir,
             replace=payload.get("notes_replace"),
@@ -197,6 +309,8 @@ class LabState:
             append=str(payload.get("notes_append") or ""),
         )
         write_long_note(self.session_dir, payload.get("notes_write"))
+        if phase.shares_thread and notes_touched:
+            _append_state(self, "notes_changed", _notes_snapshot(self.session_dir))
 
         if result.submit:
             child.transit(TaskStatus.COMPLETED)
@@ -206,17 +320,45 @@ class LabState:
                 child.transit(TaskStatus.FAILED)
             except ValueError:
                 pass
-        save_tree(self.session_dir, self.tree)
+        self.persist()
         return result.submit or {}
 
 
-def _strip_prose(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """丢掉没有 tool_calls 的 assistant 轮。没有 tool 响应依赖它，删了不会破配对。"""
-    return [
-        m
-        for m in history
-        if not (m.get("role") == "assistant" and not m.get("tool_calls"))
+def _seed_pro_thread(st: LabState) -> None:
+    """只读主线的固定开场：用户任务 + catalog + 已裁定的 /remember。只写一次。"""
+    if st.pro_history:
+        return
+    st.pro_history = [
+        {
+            "role": "user",
+            "content": (
+                f"User request:\n{st.question}\n\n{st.catalog}\n\n"
+                f"## Applicable /remember rules\n{st.remember_block()}"
+            ),
+        }
     ]
+
+
+def _append_state(st: LabState, kind: str, body: str) -> None:
+    st.pro_history.append({"role": "user", "content": render_state_update(kind, body)})
+
+
+def _notes_touched(payload: dict[str, Any]) -> bool:
+    return any(
+        payload.get(k)
+        for k in ("notes_append", "notes_remove", "notes_replace", "notes_write")
+    )
+
+
+def _notes_snapshot(session_dir: Path) -> str:
+    notes = load_notes(session_dir)
+    return notes.notes.strip() or "(empty)"
+
+
+def _spec_state_body(text: str) -> str:
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    head = "\n".join(text.strip().splitlines()[:4])
+    return f"SPEC version: sha256:{digest}\n{head}"
 
 
 def _submit_payload(submit: dict[str, Any] | None) -> dict[str, Any]:
@@ -237,13 +379,14 @@ async def run_lab(
     resume: bool,
 ) -> dict[str, Any]:
     st = await _begin(runner, question, session_dir, tree, on_event, resume)
-    await remember(st)
-    failed = await write_spec(st)
-    if failed:
-        return failed
-    cancelled = await advance(st)
-    if cancelled:
-        return cancelled
+    if st.stage != "summary":
+        await remember(st)
+        failed = await write_spec(st)
+        if failed:
+            return failed
+        paused = await advance(st)
+        if paused:
+            return paused
     return await summarize(st)
 
 
@@ -258,7 +401,12 @@ async def _begin(
     runner._applied_rules = None
     runner._skill = SkillBind()
     root = tree.get(tree.root_id)
-    if root.status is TaskStatus.PENDING:
+    ckpt = load_checkpoint(session_dir) if resume else None
+    if resume and ckpt and str(ckpt.get("question") or "").strip():
+        question = str(ckpt["question"])
+    if resume and root.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
+        root.transit(TaskStatus.RUNNING)
+    elif root.status is TaskStatus.PENDING:
         root.transit(TaskStatus.RUNNING)
     save_tree(session_dir, tree)
 
@@ -269,7 +417,7 @@ async def _begin(
         pass
     ledger = EffectLedger.load(session_dir, runner.settings.workspace_dir)
     catalog = read_text(session_dir, CATALOG_FILE) or await ingest(runner.settings, session_dir)
-    return LabState(
+    st = LabState(
         runner=runner,
         question=question,
         session_dir=session_dir,
@@ -280,6 +428,16 @@ async def _begin(
         ledger=ledger,
         catalog=catalog,
     )
+    if resume and ckpt:
+        st.restore(ckpt)
+        await st.emit(
+            {
+                "kind": "resume_skip",
+                "assignments": sorted(st.executed_ids),
+                "history_turns": len(st.pro_history),
+            }
+        )
+    return st
 
 
 async def remember(st: LabState) -> None:
@@ -317,6 +475,8 @@ async def remember(st: LabState) -> None:
             {"kind": "node_done", "node": "remember_judge", "log": [{"halted": True}]}
         )
         await st.emit_halt(found)
+        st.stage = "summary"
+        st.persist()
         return
     st.runner._applied_rules = applied_from_payload(
         catalog, payload_of(submit, SUBMIT_REMEMBER)
@@ -329,24 +489,13 @@ async def remember(st: LabState) -> None:
             "log": [{"applicable": len(st.runner._applied_rules)}],
         }
     )
+    st.stage = "spec"
+    st.persist()
 
 
 async def write_spec(st: LabState) -> dict[str, Any] | None:
-    """写出 SPEC.md。失败返回 spec_failed；halt 则留下 st.halt，继续走 Summary。"""
-    st.spec_user = (
-        f"User request:\n{st.question}\n\n{st.catalog}\n"
-        "Remember-Judge already ran in this conversation. Call submit_spec now; do not ask "
-        "the user. Files not in the catalog do not exist yet — they are Flash deliverables, "
-        "not a reason to stall. FileNotFound is expected. "
-        "milestones = a few meaningful Flash product units (a function, a problem, a file), "
-        "not a checklist of reading/design/tests/polish. One function homework = one milestone. "
-        "Put reading notes in overview; put how you will write the gate in "
-        "acceptance_strategy — those are not milestones. "
-        "Encode only applicable /remember rules from the profile. "
-        "applies=false omits that rule; it does not skip SPEC and does not make the homework a report. "
-        "submit_halt only if a required fact is missing and only the user can supply it."
-    )
-    if st.halt:
+    """写出 SPEC.md。失败返回 spec_failed；halt / 沙箱不可达则落到 Summary。"""
+    if st.halt or st.sandbox_down:
         return None
 
     cards = load_cards(st.session_dir)
@@ -356,17 +505,29 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
     await st.emit({"kind": "cards", "n": len(cards)})
 
     project = resume_spec(st.tree) if st.resume else None
-    if project is not None:
+    if st.resume and project is not None:
         await st.emit({"kind": "node_done", "node": "spec", "log": [{"resumed": True}]})
-        write_text(st.session_dir, SPEC_FILE, project.render())
+        rendered = project.render()
+        write_text(st.session_dir, SPEC_FILE, rendered)
+        _seed_pro_thread(st)
+        _append_state(st, "spec_created", _spec_state_body(rendered))
         await _mark_resumable(st)
+        if st.stage == "remember":
+            st.stage = "advance"
+        st.persist()
         return None
 
     await st.emit({"kind": "node_start", "node": "spec"})
-    submit = await st.drive_pro(TaskKind.SPEC, st.spec_user, "spec")
+    submit = await st.drive_pro(TaskKind.SPEC, "", "spec")
     found = st.take_halt(submit)
     if found:
         await st.emit_halt(found)
+        st.stage = "summary"
+        st.persist()
+        return None
+    if st.sandbox_down:
+        st.stage = "summary"
+        st.persist()
         return None
 
     project = ProjectSpec.from_payload(payload_of(submit, SUBMIT_SPEC))
@@ -376,7 +537,7 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
             st.root.transit(TaskStatus.FAILED)
         except ValueError:
             pass
-        save_tree(st.session_dir, st.tree)
+        st.persist()
         return {
             "verdict": "spec_failed",
             "summary": "",
@@ -387,38 +548,49 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
         {"kind": "node_done", "node": "spec", "log": [{"milestones": len(project.milestones)}]}
     )
     write_text(st.session_dir, SPEC_FILE, project.render())
+    _append_state(st, "spec_created", _spec_state_body(project.render()))
     await _mark_resumable(st)
+    st.stage = "advance"
+    st.persist()
     return None
 
 
 async def _mark_resumable(st: LabState) -> None:
-    if not st.resume or st.halt:
+    if not st.resume or st.halt or st.sandbox_down:
         return
     st.resumable = {aid for aid in st.ledger.entries if st.ledger.satisfied(aid)}
+    have = {aid for aid, _ in st.progress}
     for aid in sorted(st.resumable):
+        if aid in have:
+            continue
         st.progress.append((aid, "（续跑：产物已存在且未被改动，跳过重跑）"))
     if st.resumable:
         await st.emit({"kind": "resume_skip", "assignments": sorted(st.resumable)})
 
 
 async def advance(st: LabState) -> dict[str, Any] | None:
-    """逐步派发。cancelled 提前返回；halt / 收工则落到 Summary。"""
-    if st.halt:
+    """逐步派发。用户停止则暂停（root 仍 RUNNING）；halt / 沙箱不可达 / 收工则落到 Summary。"""
+    if st.halt or st.sandbox_down or st.stage == "summary":
         return None
 
-    step = 0
+    step = st.dispatch_step
     revisions = 0
     gate_nudge = ""
-    while step < _MAX_STEPS and not st.halt:
+    while step < _MAX_STEPS and not st.halt and not st.sandbox_down:
         if st.runner._cancelled():
-            st.root.transit(TaskStatus.CANCELLED)
-            save_tree(st.session_dir, st.tree)
-            return {"verdict": "cancelled", "summary": "", "question": st.question}
+            st.stage = "advance"
+            st.dispatch_step = step
+            st.persist()
+            return {"verdict": "paused", "summary": "", "question": st.question}
 
         step += 1
         signal, gate_nudge, revisions = await _one_step(st, step, gate_nudge, revisions)
+        st.dispatch_step = step
         if signal == "break":
+            st.stage = "summary"
+            st.persist()
             break
+        st.persist()
     return None
 
 
@@ -427,12 +599,18 @@ async def _one_step(
 ) -> tuple[str, str, int]:
     """跑一步：dispatch → workers → judge。返回 (break|continue, 下一步 nudge, revisions)。"""
     dispatch_user = (
-        f"User request: {st.question}\n\n"
-        f"## SPEC.md\n{read_text(st.session_dir, SPEC_FILE)}\n\n"
         f"## 已完成的步骤\n{render_progress(st.progress)}\n\n"
         f"这是第 {step} 步（最多 {_MAX_STEPS} 步）。决定接下来这一步做什么，调用 submit_dispatch。"
         "只派这一步给 Flash 的活；Flash 侧全部做完时给空的 assignments。"
     )
+    if st.resume and not st.resume_announced:
+        st.resume_announced = True
+        dispatch_user += (
+            "\n\n## Resume\n"
+            "The previous process stopped. This conversation is the same thread. "
+            "Continue from here. Do not rewrite SPEC. Do not re-do assignments whose "
+            "artifacts still match."
+        )
     if gate_nudge:
         dispatch_user += f"\n\n## Harness rejected last dispatch\n{gate_nudge}"
         gate_nudge = ""
@@ -464,6 +642,8 @@ async def _one_step(
     found = st.take_halt(submit)
     if found:
         await st.emit_halt(found)
+        return "break", gate_nudge, revisions
+    if st.sandbox_down:
         return "break", gate_nudge, revisions
     if not submit or submit.get("name") != SUBMIT_DISPATCH:
         await st.emit(
@@ -565,24 +745,43 @@ async def _one_step(
             state = str((brief.get("tests") or {}).get("state") or "")
             if state:
                 st.record_gate(a.gate_id, state)
+        if any(b.get("sandbox_unreachable") for b in briefs):
+            reason = next(
+                (str(b.get("brief") or "") for b in briefs if b.get("sandbox_unreachable")),
+                "",
+            )
+            await st.mark_sandbox_down(reason)
+            return "break", gate_nudge, revisions
+        st.persist()
+        if any(b.get("takeover") for b in briefs):
+            await _takeover(
+                st, dispatch, briefs, assignments or replay, step, reason="validation_exhausted"
+            )
+            if st.halt or st.sandbox_down:
+                return "break", gate_nudge, revisions
+            return "continue", gate_nudge, revisions
     if replay:
         extra, extra_gate = await _replay_gates(st, replay)
         briefs = briefs + extra
         step_gates.append(extra_gate)
+        if st.sandbox_down:
+            return "break", gate_nudge, revisions
     last_gate = worst_gate(step_gates)
     st.run_gate = last_gate
 
     decision = await _judge(st, dispatch, briefs, last_gate)
-    if st.halt:
+    if st.halt or st.sandbox_down:
         return "break", gate_nudge, revisions
     if decision == "finish":
         return "break", gate_nudge, revisions
     if decision == "takeover":
-        await _takeover(st, dispatch, briefs, assignments or replay, step)
+        await _takeover(st, dispatch, briefs, assignments or replay, step, reason="judge")
+        if st.halt or st.sandbox_down:
+            return "break", gate_nudge, revisions
         return "continue", gate_nudge, revisions
     if decision == "revise_spec" or spec_invalid:
         revisions = await _revise_spec(st, briefs, revisions)
-        if st.halt or revisions < 0:
+        if st.halt or st.sandbox_down or revisions < 0:
             return "break", gate_nudge, max(revisions, 0)
     return "continue", gate_nudge, revisions
 
@@ -619,6 +818,9 @@ async def _replay_gates(
                 "gate": gate.state,
             }
         )
+        if is_sandbox_unreachable(gate.log):
+            await st.mark_sandbox_down(gate.log)
+            break
     return briefs, worst_gate(gates)
 
 
@@ -645,13 +847,13 @@ async def _judge(
     last_gate: AcceptResult,
 ) -> str:
     judge_user = (
-        f"User request: {st.question}\nStep goal: {dispatch.step_goal}\n"
+        f"Step goal: {dispatch.step_goal}\n"
         f"Gate: {last_gate.state}\n"
         f"Briefs:\n{json.dumps(briefs, ensure_ascii=False)[:_BRIEFS_CAP]}\n"
-        f"## Applicable /remember rules\n{st.remember_block()}\n"
-        "If the gate is no_hard_criteria you MUST say so in evidence and give a semantic rationale. "
-        "Fill rule_verdicts for every applicable /remember rule, identified by the index above. "
-        "Do not retype the rule text as the identifier. finish only when all are satisfied."
+        "Fill rule_verdicts for every applicable /remember rule, identified by the index "
+        "in the initial user task. Do not retype the rule text as the identifier. "
+        "finish only when all are satisfied. "
+        "If the gate is no_hard_criteria you MUST say so in evidence and give a semantic rationale."
     )
     if last_gate.state == TEST_INVALID and st.gate_unrunnable():
         judge_user += (
@@ -678,6 +880,8 @@ async def _judge(
     if found:
         await st.emit_halt(found)
         return "halt"
+    if st.sandbox_down:
+        return "halt"
     verdict = payload_of(judge_submit, SUBMIT_JUDGE)
     decision = str(verdict.get("decision") or "continue")
     if last_gate.state == TEST_INVALID and dispatch.assignments and not st.gate_unrunnable():
@@ -686,6 +890,9 @@ async def _judge(
             gate = await evaluate_gate(st.runner, st.session_dir, a.gate_id)
             st.record_gate(a.gate_id, gate.state)
             refreshed.append(gate)
+            if is_sandbox_unreachable(gate.log):
+                await st.mark_sandbox_down(gate.log)
+                return "halt"
         last_gate = worst_gate(refreshed)
         st.run_gate = last_gate
     if decision == "finish" and not rules_satisfied(st.runner._applied_rules or [], verdict):
@@ -716,25 +923,39 @@ async def _takeover(
     briefs: list[dict[str, Any]],
     assignments: list,
     step: int,
+    *,
+    reason: str = "judge",
 ) -> None:
     st.runner._trace_event(S.EV_HANDOFF, **{S.ATTR_FROM: "flash", S.ATTR_TO: "pro"})
-    await st.emit({"kind": "pro_takeover", "reason": "judge"})
+    await st.emit({"kind": "pro_takeover", "reason": reason})
+    cause = (
+        "Flash exhausted schema validation; finish the step yourself."
+        if reason == "validation_exhausted"
+        else "Take over this step yourself."
+    )
     take = await st.drive_pro(
         TaskKind.TAKEOVER,
-        f"Take over this step yourself.\nUser: {st.question}\n"
-        f"Step goal: {dispatch.step_goal}\n"
-        f"Briefs: {json.dumps(briefs, ensure_ascii=False)[:8000]}",
+        (
+            f"{cause}\n"
+            f"Step goal: {dispatch.step_goal}\n"
+            f"Briefs: {json.dumps(briefs, ensure_ascii=False)[:8000]}"
+        ),
         "takeover",
     )
     found = st.take_halt(take)
     if found:
         await st.emit_halt(found)
         return
+    if st.sandbox_down:
+        return
     payload = payload_of(take, SUBMIT_BRIEF)
     if payload.get("brief"):
         st.progress.append((f"step{step}-pro", str(payload["brief"])))
         for a in assignments:
             last_gate = await evaluate_gate(st.runner, st.session_dir, a.gate_id)
+            if is_sandbox_unreachable(last_gate.log):
+                await st.mark_sandbox_down(last_gate.log)
+                break
             if not last_gate.is_pass:
                 break
     else:
@@ -755,8 +976,7 @@ async def _revise_spec(
     revisions += 1
     redo = await st.drive_pro(
         TaskKind.SPEC,
-        st.spec_user
-        + "\n\nThe current SPEC.md was rejected. Revise it given these briefs:\n"
+        "The current SPEC.md was rejected. Revise it given these briefs:\n"
         + json.dumps(briefs, ensure_ascii=False)[:8000],
         "revise_spec",
     )
@@ -764,8 +984,12 @@ async def _revise_spec(
     if found:
         await st.emit_halt(found)
         return revisions
+    if st.sandbox_down:
+        return revisions
     project = ProjectSpec.from_payload(payload_of(redo, SUBMIT_SPEC))
-    write_text(st.session_dir, SPEC_FILE, project.render())
+    rendered = project.render()
+    write_text(st.session_dir, SPEC_FILE, rendered)
+    _append_state(st, "spec_created", _spec_state_body(rendered))
     return revisions
 
 
@@ -774,19 +998,26 @@ async def summarize(st: LabState) -> dict[str, Any]:
         summary_user = (
             "The lab halted. A required fact is missing and only the user can provide it. "
             "Do not invent completed homework.\n\n"
-            f"User request: {st.question}\n\n"
             f"## Why it halted\n{st.halt.get('reason')}\n\n"
             f"## Need from the user\n{st.halt.get('need_from_user')}\n\n"
-            f"## SPEC.md so far\n{read_text(st.session_dir, SPEC_FILE) or '（尚未写出 SPEC.md）'}\n\n"
             f"## 完成情况\n{render_progress(st.progress)}\n\n"
             "Call submit_summary. user_summary must explain the situation and what the user "
             "should put in the workspace, in the user's language."
         )
+    elif st.sandbox_down:
+        summary_user = (
+            "The lab stopped because the AIO Sandbox MCP endpoint is unreachable. "
+            "Do not invent completed homework. Do not claim tests passed. "
+            "The HTTP service is still running; the user can retry after the container is up.\n\n"
+            f"## Why it stopped\n{st.sandbox_down}\n\n"
+            f"## 完成情况\n{render_progress(st.progress)}\n\n"
+            "Call submit_summary. user_summary must say the sandbox was unreachable "
+            "and the lab ended without further Flash or Judge work, in the user's language."
+        )
     else:
         summary_user = (
-            f"The lab is complete. You are still Pro — write the wrap-up from this conversation "
-            f"and the artifacts below.\n\n"
-            f"User request: {st.question}\n\n## SPEC.md\n{read_text(st.session_dir, SPEC_FILE)}\n\n"
+            "The lab is complete. Write the wrap-up from this conversation "
+            "and the live SPEC.md / NOTES.md snapshots.\n\n"
             f"## 完成情况\n{render_progress(st.progress)}\n\n"
             f"Gate: {_gate_line(st)}\n"
             "Call submit_summary. Report that gate state as-is; it is the harness result, "
@@ -812,7 +1043,13 @@ async def summarize(st: LabState) -> dict[str, Any]:
         pass
     save_tree(st.session_dir, st.tree)
     return {
-        "verdict": "need_user" if st.halt else _summary_gate(st).state,
+        "verdict": (
+            "need_user"
+            if st.halt
+            else "sandbox_unreachable"
+            if st.sandbox_down
+            else _summary_gate(st).state
+        ),
         "summary": summary_text,
         "knowledge_cards": list(payload.get("knowledge_cards") or []),
         "question": st.question,

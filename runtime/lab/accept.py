@@ -13,7 +13,7 @@ from pathlib import Path
 
 from config.runtime import RuntimeSettings
 from tools.policy import get_policy
-from tools.sandbox_tools import sandbox_workspace_path, sandbox_run
+from tools.sandbox_tools import is_sandbox_unreachable, sandbox_workspace_path, sandbox_run
 
 PASS = "pass"
 FAIL = "fail"
@@ -196,7 +196,6 @@ async def sanity_and_run(
 
 
 _INFRA_MARKERS = (
-    "[sandbox_unreachable]",
     "[timeout",
     "internalerror>",      # pytest 自身崩溃，不是被测代码的问题
     "no such file or directory",
@@ -206,5 +205,7 @@ _INFRA_MARKERS = (
 
 def _is_infra_failure(log: str) -> bool:
     """区分「测试判定失败」和「门禁根本没跑起来」。"""
+    if is_sandbox_unreachable(log):
+        return True
     lowered = log.lower()
     return any(marker in lowered for marker in _INFRA_MARKERS)

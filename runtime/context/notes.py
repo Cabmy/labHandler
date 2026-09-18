@@ -1,6 +1,8 @@
-"""会话内 Pro 能主动写的三份文件，都落在 session 目录，每轮由 assemble 重新注入。
+"""会话内 Pro 能主动写的三份文件，都落在 session 目录。
 
-NOTES.md  —— Pro 运行时写的不变量，进 notes 槽。短句 ≤80 字，或指向 notes/*.md 的指针。
+NOTES.md  —— Pro 运行时写的不变量。短句 ≤80 字，或指向 notes/*.md 的指针。
+             变更后以 <state_update type="notes_changed"> 追加进 Pro history；
+             当前全文放在 assemble 的 state 槽（history 之后）。
 CARDS.md  —— SPEC 预取的跨 lab 知识卡片正文，进 cards 槽（仅 Pro），与 NOTES 无关。
              本模块是这份文件格式的唯一出处：memory.retrieve 只给单张卡片的文本，
              卡片之间用 --- 分隔由这里拼、这里拆。文件存在（哪怕是空的）即表示已预取。

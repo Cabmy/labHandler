@@ -49,8 +49,8 @@ _LEGAL = {
         TaskStatus.CANCELLED,
     },
     TaskStatus.COMPLETED: set(),
-    TaskStatus.FAILED: set(),
-    TaskStatus.CANCELLED: set(),
+    TaskStatus.FAILED: {TaskStatus.RUNNING},
+    TaskStatus.CANCELLED: {TaskStatus.RUNNING},
 }
 
 

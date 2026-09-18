@@ -18,7 +18,7 @@ from runtime.loop import AgentSpec
 from runtime.loop.tools import ToolRegistry, build_registry
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer
-from runtime.phase import PRO, phase_of
+from runtime.phase import PRO, phase_of, system_for
 from runtime.task import Permission, TaskKind, TaskTree
 from tools.skill_tool import LOAD_SKILL, SkillBind
 
@@ -79,13 +79,15 @@ class LabRunner:
         include_rules = self._applied_rules is not None
         system = inject_for_agent(
             phase.agent,
-            phase.system,
+            system_for(kind),
             rules=self._applied_rules or [],
             include_rules=include_rules,
         )
         # 目录只给能 load_skill 的拍。Remember-Judge 看不见 skill，避免用目录反推规则。
         if phase.agent == PRO and (
-            LOAD_SKILL in phase.extra_tools or phase.visible is None
+            LOAD_SKILL in (phase.allow_tools or frozenset())
+            or LOAD_SKILL in phase.extra_tools
+            or phase.visible is None
         ):
             catalog = skill_catalog_block()
             if catalog:
@@ -99,8 +101,11 @@ class LabRunner:
             visible_role=phase.visible_role(permission),
             extra_tools=phase.extra_tools,
             allow_tools=phase.allow_tools,
+            advertise_tools=phase.advertise_tools,
             tool_choice=phase.tool_choice,
             tool_extras={"skill": self._skill} if phase.agent == PRO else {},
+            shares_thread=phase.shares_thread,
+            phase=kind.value,
         )
 
     async def run(

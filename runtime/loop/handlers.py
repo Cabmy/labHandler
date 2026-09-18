@@ -1,4 +1,4 @@
-"""工具表广告与 handler。可见性边界在 ToolRegistry.for_role。"""
+"""工具表广告与 handler。可见性与执行允许集在 ToolRegistry.bind。"""
 
 import asyncio
 import json

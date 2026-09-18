@@ -2,9 +2,9 @@
 
 宿主机路径经 sandbox_workspace_path 映射到容器 /workspace；越界抛 ValueError。
 call_sandbox 把 MCP 返回值收成文本：同一工具连续失败满 3 次记
-[SANDBOX_UNREACHABLE]，其余记 [tool_error]。sandbox_execute_code 若只收到
-ack（stdout/stderr/exit_code 皆 null）会附加改走 sandbox_execute_bash 的提示。
-list_sandbox_tool_names 在 MCP 不可达时返回空列表。
+[SANDBOX_UNREACHABLE]，其余记 [tool_error]。上层据此结束本场 lab（不停服务）。
+sandbox_execute_code 若只收到 ack（stdout/stderr/exit_code 皆 null）会附加改走
+sandbox_execute_bash 的提示。list_sandbox_tool_names 在 MCP 不可达时返回空列表。
 """
 
 import asyncio
@@ -17,8 +17,13 @@ from mcp_client import call_mcp_tool, list_mcp_tools
 
 _SANDBOX_WORKSPACE = "/workspace"
 _SANDBOX_MAX_FAILURES = 3
+SANDBOX_UNREACHABLE_MARK = "[SANDBOX_UNREACHABLE]"
 _sandbox_failures: dict[str, int] = {}
 _PATH_KW = {"path", "file_path"}
+
+
+def is_sandbox_unreachable(text: str) -> bool:
+    return SANDBOX_UNREACHABLE_MARK.lower() in (text or "").lower()
 
 
 def sandbox_workspace_path(path: Path | str) -> str:
@@ -99,7 +104,7 @@ async def call_sandbox(tool_name: str, **kwargs: Any) -> str:
         count = _sandbox_failures[tool_name]
         if count >= _SANDBOX_MAX_FAILURES:
             return (
-                f"[SANDBOX_UNREACHABLE] sandbox tool {tool_name} failed {count} times in a row"
+                f"{SANDBOX_UNREACHABLE_MARK} sandbox tool {tool_name} failed {count} times in a row"
                 f" ({type(e).__name__}: {e}); the sandbox may be unavailable"
             )
         return f"[tool_error] {type(e).__name__}: {e}"
@@ -148,7 +153,7 @@ async def sandbox_run(command: str, *, timeout: float) -> tuple[int, str]:
     except asyncio.TimeoutError:
         return -1, f"[TIMEOUT after {timeout}s] {command}"
 
-    if "[SANDBOX_UNREACHABLE]" in raw:
+    if is_sandbox_unreachable(raw):
         return -1, raw
     if raw.startswith("[tool_error]"):
         return -1, raw

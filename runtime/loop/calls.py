@@ -51,6 +51,7 @@ class CallResult:
     submit_name: str | None = None
     submit_payload: dict[str, Any] | None = None
     ran: bool = False
+    exhausted: bool = False
 
 
 def waves(parallel: Sequence[bool]) -> list[tuple[int, int]]:
@@ -146,6 +147,28 @@ async def run_calls(
     return out
 
 
+def _mark_exhausted(
+    result: CallResult,
+    name: str,
+    validation_streak: dict[str, int],
+    settings: RuntimeSettings,
+) -> CallResult:
+    """同一 submit 连续校验失败达到上限时打标，由 loop 按角色分流（Flash 接管 / Pro 提示 halt）。"""
+    if validation_streak.get(name, 0) < settings.validation_retry_max:
+        return result
+    return CallResult(
+        result.name,
+        result.call_id,
+        result.args,
+        result.text,
+        result.error,
+        submit_name=result.submit_name,
+        submit_payload=result.submit_payload,
+        ran=result.ran,
+        exhausted=True,
+    )
+
+
 async def _one(
     tc: dict[str, Any],
     *,
@@ -167,6 +190,8 @@ async def _one(
         result = CallResult(
             name, call_id, None, VALIDATION_TOOL_RESULT.format(err=perr), ErrorClass.VALIDATION
         )
+        if name in _SUBMIT:
+            result = _mark_exhausted(result, name, validation_streak, settings)
     elif name in _SUBMIT:
         allowed = name == submit_tool or (
             name == SUBMIT_HALT and SUBMIT_HALT in registry.names()
@@ -177,18 +202,21 @@ async def _one(
                 call_id,
                 parsed,
                 VALIDATION_TOOL_RESULT.format(
-                    err=f"{name} is not the exit for this stage; call {submit_tool}"
+                    err=(
+                        f"{name} is unavailable during {node}. "
+                        f"The active exit tool is {submit_tool}"
+                    )
                 ),
                 ErrorClass.VALIDATION,
             )
         else:
-            degraded = validation_streak.get(name, 0) >= settings.validation_retry_max
-            err = validate_payload(name, parsed, degraded=degraded)
+            err = validate_payload(name, parsed)
             if err:
                 validation_streak[name] = validation_streak.get(name, 0) + 1
                 result = CallResult(
                     name, call_id, parsed, VALIDATION_TOOL_RESULT.format(err=err), ErrorClass.VALIDATION
                 )
+                result = _mark_exhausted(result, name, validation_streak, settings)
             else:
                 validation_streak[name] = 0
                 result = CallResult(

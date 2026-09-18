@@ -132,6 +132,7 @@ class LLMGateway:
                     S.ATTR_TOKENS_IN: result.usage.get("input_tokens", 0),
                     S.ATTR_TOKENS_OUT: result.usage.get("output_tokens", 0),
                     S.ATTR_TOKENS_REASONING: result.usage.get("reasoning_tokens", 0),
+                    S.ATTR_TOKENS_CACHED: result.usage.get("cached_tokens", 0),
                     S.ATTR_FINISH_REASON: result.finish_reason,
                     S.ATTR_ERROR_CLASS: result.error_class.value,
                 }
@@ -197,11 +198,19 @@ class LLMGateway:
             async for chunk in stream:
                 if getattr(chunk, "usage", None):
                     u = chunk.usage
-                    details = getattr(u, "completion_tokens_details", None)
+                    prompt_details = getattr(u, "prompt_tokens_details", None) or getattr(
+                        u, "input_tokens_details", None
+                    )
+                    completion_details = getattr(u, "completion_tokens_details", None)
+                    cached = int(getattr(prompt_details, "cached_tokens", 0) or 0)
+                    cached = cached or int(getattr(u, "cache_read_input_tokens", 0) or 0)
                     usage = {
                         "input_tokens": int(getattr(u, "prompt_tokens", 0) or 0),
                         "output_tokens": int(getattr(u, "completion_tokens", 0) or 0),
-                        "reasoning_tokens": int(getattr(details, "reasoning_tokens", 0) or 0),
+                        "reasoning_tokens": int(
+                            getattr(completion_details, "reasoning_tokens", 0) or 0
+                        ),
+                        "cached_tokens": cached,
                     }
                 if not chunk.choices:
                     continue

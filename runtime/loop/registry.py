@@ -1,10 +1,9 @@
-"""Tool registry：可见工具表、执行、以及归一化后的 ToolOutcome。
+"""Tool registry：广告工具表、执行允许集、以及归一化后的 ToolOutcome。
 
-for_role 产出的收窄 registry 同时是可见性边界和执行边界：不在表里的名字调不动，
-模型从 history 里翻出别处的工具名照抄也会被挡下。收窄依据由 runtime.phase 给，
-本模块不认识阶段。普通工具的 schema 只用于广告字段和缺参提示，额外字段放行；
-submit_* 的结构化约束在 loop 里由 validate_payload 执行。error_class 从正文前缀
-或异常类型得出。
+bind 把「模型看见的名字」和「真正能执行的名字」拆开：只读主线广告表跨阶段固定，
+执行仍按当前 phase 的 allow 拒绝。独立 agent 广告与执行同一份。本模块不认识阶段，
+名字集合由 runtime.phase 给。普通工具的 schema 只用于广告字段和缺参提示，额外
+字段放行；submit_* 的结构化约束在 loop 里由 validate_payload 执行。
 """
 
 import asyncio
@@ -20,6 +19,7 @@ from runtime.observe.tracer import Tracer
 from runtime.loop.parse import check_args, openai_tool
 from runtime.loop.schema import SCHEMA_TOOLS
 from tools.policy import get_auditor
+from tools.sandbox_tools import is_sandbox_unreachable
 
 Handler = Callable[[dict[str, Any], "ToolContext"], Awaitable[str]]
 
@@ -67,23 +67,44 @@ def _advertise(schema: dict[str, Any]) -> dict[str, Any]:
 
 
 class ToolRegistry:
-    def __init__(self, specs: list[ToolSpec]) -> None:
+    def __init__(
+        self,
+        specs: list[ToolSpec],
+        *,
+        advertised: list[ToolSpec] | None = None,
+        phase: str = "",
+        submit_tool: str = "",
+    ) -> None:
         self._specs = {s.name: s for s in specs}
+        self._advertised = advertised if advertised is not None else list(specs)
+        self._advertised_names = {s.name for s in self._advertised}
+        self._phase = phase
+        self._submit_tool = submit_tool
 
-    def for_role(
+    def bind(
         self,
         role: str,
+        *,
         submit_tool: str,
         extra: frozenset[str] = frozenset(),
         allow: frozenset[str] | None = None,
+        advertise: tuple[str, ...] | frozenset[str] | None = None,
+        phase: str = "",
     ) -> "ToolRegistry":
-        """本拍实际可见的工具：role 允许的，加 extra 点名的，加主出口 submit_tool。
+        """绑定本拍的广告表与执行允许集。
 
-        extra 可以点名第二个 SCHEMA_TOOLS 出口（submit_halt）。allow 非空则再交集。
-        role / extra / allow 由 runtime.phase 决定，本模块不认识阶段。收窄后的这份
-        registry 同时用于 execute，所以不在表里的名字调不动。
+        advertise 非空：openai 工具表按该顺序输出；execute 只跑 allow
+        （缺省为 advertise 全集）。advertise 为空：按 role + extra + submit_tool
+        收窄，广告与执行同一份（独立 agent）。
         """
         named = extra | {submit_tool}
+        if advertise is not None:
+            adv = [self._specs[n] for n in advertise if n in self._specs]
+            allow_set = allow if allow is not None else frozenset(s.name for s in adv)
+            exec_specs = [s for s in adv if s.name in allow_set]
+            return ToolRegistry(
+                exec_specs, advertised=adv, phase=phase, submit_tool=submit_tool
+            )
         specs = [
             s
             for s in self._specs.values()
@@ -93,7 +114,7 @@ class ToolRegistry:
         if allow is not None:
             keep = allow | named
             specs = [s for s in specs if s.name in keep]
-        return ToolRegistry(specs)
+        return ToolRegistry(specs, phase=phase, submit_tool=submit_tool)
 
     def openai_tools(self) -> list[dict[str, Any]]:
         return [
@@ -102,11 +123,25 @@ class ToolRegistry:
                 s.description,
                 s.input_schema if s.name in SCHEMA_TOOLS else _advertise(s.input_schema),
             )
-            for s in self._specs.values()
+            for s in self._advertised
         ]
 
     def names(self) -> set[str]:
         return set(self._specs)
+
+    def unavailable_message(self, name: str) -> str:
+        phase = self._phase or "this stage"
+        exit_tool = self._submit_tool
+        if name in self._advertised_names and exit_tool:
+            return (
+                f"[ERROR/Validation] {name} is unavailable during {phase}. "
+                f"The active exit tool is {exit_tool}."
+            )
+        available = ", ".join(sorted(self._specs))
+        return (
+            f"[ERROR/Validation] tool {name} is not available at this stage; "
+            f"available: {available}"
+        )
 
     def parallelizable(self, name: str) -> bool:
         """无副作用、且不是结构化出口的工具才可与相邻只读调用并行。"""
@@ -152,12 +187,7 @@ class ToolRegistry:
     ) -> ToolOutcome:
         spec = self._specs.get(name)
         if spec is None:
-            # 本阶段工具表里没有。列出可用名字，避免模型照着 history 里的旧工具反复重试。
-            return ToolOutcome(
-                f"[ERROR/Validation] tool {name} is not available at this stage; "
-                f"available: {', '.join(sorted(self._specs))}",
-                ErrorClass.VALIDATION,
-            )
+            return ToolOutcome(self.unavailable_message(name), ErrorClass.VALIDATION)
         if ctx.role not in spec.permissions and name not in SCHEMA_TOOLS:
             get_auditor().record(name, {}, f"denied:role={ctx.role}")
             if tracer is not None:
@@ -193,7 +223,7 @@ class ToolRegistry:
             get_auditor().record(name, args, f"error:{type(e).__name__}")
             return ToolOutcome(f"[ERROR/{type(e).__name__}] {e}", classify(e))
 
-        if "[SANDBOX_UNREACHABLE]" in text:
+        if is_sandbox_unreachable(text):
             return ToolOutcome(text, ErrorClass.FATAL)
         if text.startswith("[ERROR/PermissionError]"):
             return ToolOutcome(text, ErrorClass.PERMISSION)

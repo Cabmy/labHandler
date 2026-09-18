@@ -4,7 +4,8 @@
 的单位。拆开会产出协议非法的孤儿 tool 消息。
 
 卸盘按 DumpScope（agent × task_id）分目录，Pro 与各 Flash 互不混放。
-notes 槽与 cards 槽不在 history 里、不经摘要——assemble 每轮从文件重新注入。
+NOTES.md 与 SPEC.md 的最新快照在 assemble 的 state 槽（history 之后），不经摘要。
+变更事件以 <state_update> 追加在 history 里；纪要保留最新版本的要点，不要整份复述。
 FORGET.md 只在 Pro 压缩时作为排除指令并清空；Flash 压缩不碰它。被遗忘的卡片此前已经
 从 cards 槽消失，这里只负责让它不要从旧对话经摘要回流。
 是否该压、阈值、usage 校准归 TokenBudget；本模块只切回合、落盘 tool 正文、写纪要。
@@ -41,7 +42,8 @@ _SUMMARY_SYSTEM = """你在压缩一个 agent 的历史对话。你的纪要会�
 先求全、再求简：宁可多留一条事实，也不要为了句子通顺把事实揉掉。
 标识符一律照抄——文件路径、函数与接口签名、字段名、命令、报错原文、数字指标，
 一个字符都不要改写或翻译。不要编造原文没有的东西，没被验证过的结论写明「未验证」。
-SPEC.md 与 NOTES.md 由 harness 另行注入，不要复述它们。
+SPEC.md 与 NOTES.md 的最新全文由 harness 放在 history 之后；纪要只留最新要点，不要整份复述。
+<phase_control> 与 <state_update> 是宿主消息：记下最新 phase 和最新 state_update 类型即可。
 
 按下列小节输出，没有内容的小节整节省略，不要写「无」：
 

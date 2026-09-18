@@ -1,6 +1,7 @@
 """lab 生命周期：一次会话对应一个 thread_id、一棵 Task 树、一个会话目录。
 
-新任务永远新开会话。续跑只通过 attach_resume 显式挂上未完成的树。
+新任务永远新开会话。续跑只通过 attach_resume 显式挂上未完成的树，
+并恢复 CHECKPOINT.json 里的 Pro 对话与阶段进度。
 done() 归档知识卡、把 workspace 挪进 .trash、重建沙箱，并换一棵空 runner。
 """
 

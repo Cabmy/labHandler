@@ -197,7 +197,7 @@ def get_settings() -> RuntimeSettings:
         task_wall_time_s=_env_float("TASK_WALL_TIME_S", 900.0, minimum=10.0),
         tool_timeout_s=_env_float("TOOL_TIMEOUT_S", 120.0, minimum=1.0),
         transient_retry_max=_env_int("TRANSIENT_RETRY_MAX", 3, minimum=1),
-        validation_retry_max=_env_int("VALIDATION_RETRY_MAX", 3, minimum=1),
+        validation_retry_max=_env_int("VALIDATION_RETRY_MAX", 5, minimum=1),
         llm_breaker_max=_env_int("LLM_BREAKER_MAX", 6, minimum=1),
         stagnation_repeat_threshold=_env_int("STAGNATION_REPEAT_THRESHOLD", 3, minimum=2),
         stagnation_grace_steps=_env_int("STAGNATION_GRACE_STEPS", 2, minimum=0),

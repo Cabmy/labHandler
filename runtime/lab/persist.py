@@ -2,6 +2,7 @@
 
 所有写入走 atomic_write_text（tmp + fsync + rename），崩在半路不会留下
 截断的文件。副作用账本让恢复具备幂等性：已经产出且内容未变的节点不重跑。
+CHECKPOINT.json 另存 Pro 对话和阶段进度，退出后续跑接回同一条 transcript。
 """
 
 import hashlib
@@ -15,6 +16,7 @@ from runtime.task import TaskTree, TaskStatus
 
 STATE_FILE = "STATE.json"
 LEDGER_FILE = "EFFECTS.json"
+CHECKPOINT_FILE = "CHECKPOINT.json"
 SPEC_FILE = "SPEC.md"
 CATALOG_FILE = "CATALOG.md"
 
@@ -73,6 +75,16 @@ def read_json(sdir: Path, name: str) -> Any | None:
 
 def save_tree(sdir: Path, tree: TaskTree) -> None:
     write_json(sdir, STATE_FILE, tree.to_dict())
+
+
+def save_checkpoint(sdir: Path, payload: dict[str, Any]) -> None:
+    """Pro 对话 + 阶段进度。与 STATE.json 分开，避免把长 transcript 塞进任务树。"""
+    write_json(sdir, CHECKPOINT_FILE, payload)
+
+
+def load_checkpoint(sdir: Path) -> dict[str, Any] | None:
+    raw = read_json(sdir, CHECKPOINT_FILE)
+    return raw if isinstance(raw, dict) else None
 
 
 def load_tree(sdir: Path) -> TaskTree | None:
@@ -173,6 +185,11 @@ def latest_incomplete(workspace: Path) -> tuple[str, TaskTree] | None:
             continue
         root_task = tree.get(tree.root_id)
         if root_task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
+            return d.name, tree
+        # 用户停止或 SPEC 失败：有 checkpoint 就能接着跑，终态树也能挂回去。
+        if root_task.status in {TaskStatus.CANCELLED, TaskStatus.FAILED} and (
+            d / CHECKPOINT_FILE
+        ).is_file():
             return d.name, tree
         if any(n.status is TaskStatus.RUNNING for n in tree.nodes.values()):
             return d.name, tree

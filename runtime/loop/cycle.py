@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from config.runtime import RuntimeSettings
-from runtime.context.assemble import AgentContext, assemble, validate_message_sequence
+from runtime.context.assemble import AgentContext, assemble, live_state_block, validate_message_sequence
 from runtime.context.budget import TokenBudget
 from runtime.context.compact import DumpScope, compact_history
 from runtime.context.notes import load_notes
@@ -24,14 +24,15 @@ from runtime.errors import ErrorClass
 from runtime.llm import LLMGateway
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer
-from runtime.phase import PRO
+from runtime.phase import FLASH, PRO
 from runtime.loop.retry import sleep_delay
 from runtime.loop.calls import run_calls
 from runtime.loop.parse import coerce_brief, synthetic_brief, tool_choice_required
-from runtime.loop.schema import SUBMIT_BRIEF
+from runtime.loop.schema import SUBMIT_BRIEF, SUBMIT_HALT
 from runtime.loop.stagnation import NUDGE_TEXT, StagnationSignal, StagnationTracker
 from runtime.task import Permission, RuntimeTask, TaskStatus
 from runtime.loop.registry import ToolContext, ToolRegistry
+from tools.sandbox_tools import is_sandbox_unreachable
 from tools.skill_tool import LOAD_SKILL, LOAD_SKILL_REFERENCE
 
 _RETRIEVAL_TOOLS = {
@@ -43,6 +44,14 @@ _RETRIEVAL_TOOLS = {
     LOAD_SKILL_REFERENCE,
 }
 _RETRIEVED_CAP = 6000
+
+# Pro 连败后的熔断提示：写明原因，要求它自己调 submit_halt，不代交。
+_HALT_NUDGE = (
+    "CIRCUIT BREAK: {tool} failed schema validation {n} consecutive times "
+    "in the {agent} phase. Do not retry {tool}. Call submit_halt now. "
+    "Write reason exactly: {reason} "
+    "need_from_user must say what the user should provide so this stage can continue."
+)
 
 # 一轮里多个工具调用时，取最严重的那个错误类别记账。
 # 只留最后一个会让「先失败后成功」的一轮被记成全绿，熔断器永远攒不够计数。
@@ -78,7 +87,7 @@ class AgentSpec:
     """一拍 agent 的全部参数，由 runtime.phase 解析好后传进来。
 
     permission 是节点权限（ctx.role，决定写检查放不放行）；visible_role、
-    extra_tools、allow_tools 只管工具表里出现哪些名字，由阶段定义给出。
+    extra_tools、allow_tools、advertise_tools 管工具表，由阶段定义给出。
     tool_extras 原样进 ToolContext（例如全程共用的 SkillBind）。
     """
 
@@ -90,8 +99,16 @@ class AgentSpec:
     visible_role: str
     extra_tools: frozenset[str] = frozenset()
     allow_tools: frozenset[str] | None = None
+    advertise_tools: tuple[str, ...] | None = None
     tool_choice: str = "auto"
     tool_extras: dict[str, Any] = field(default_factory=dict)
+    shares_thread: bool = False
+    phase: str = ""
+
+    def halt_allowed(self) -> bool:
+        if self.allow_tools is not None:
+            return SUBMIT_HALT in self.allow_tools
+        return SUBMIT_HALT in self.extra_tools
 
 
 @dataclass
@@ -143,11 +160,13 @@ async def run_loop(
     clock: Callable[[], float] = time.time,
 ) -> LoopResult:
     role = spec.permission.value
-    tools_reg = registry.for_role(
+    tools_reg = registry.bind(
         spec.visible_role,
         submit_tool=spec.submit_tool,
         extra=spec.extra_tools,
         allow=spec.allow_tools,
+        advertise=spec.advertise_tools,
+        phase=spec.phase,
     )
     openai_tools = tools_reg.openai_tools()
     tracker = StagnationTracker(
@@ -157,6 +176,7 @@ async def run_loop(
     history = list(history or [])
     retrieved = ""
     force_brief = False
+    force_halt = False
     last_error = ErrorClass.OK
     last_stag = StagnationSignal.NONE
     validation_streak: dict[str, int] = {}
@@ -183,19 +203,19 @@ async def run_loop(
         nonlocal history
         history = drop_dangling_tool_calls(history)
         notes = load_notes(session_dir)
-        working = ""
 
         def build() -> AgentContext:
             return assemble(
                 system=spec.system,
                 user_input=user_input,
-                project_spec=project_spec,
                 history=history,
                 retrieved=retrieved,
-                notes=notes.notes_block,
                 cards=notes.cards_block if spec.name == PRO else "",
+                state=live_state_block(
+                    notes=notes.notes_block if spec.shares_thread else "",
+                    spec=project_spec if spec.shares_thread else "",
+                ),
                 events=task.events,
-                working=working,
                 tool_schemas=openai_tools,
             )
 
@@ -226,7 +246,7 @@ async def run_loop(
         return ctx
 
     async def one_turn() -> LoopResult | None:
-        nonlocal force_brief, last_error, last_stag, history, retrieved
+        nonlocal force_brief, force_halt, last_error, last_stag, history, retrieved
 
         span_cm = (
             tracer.span(
@@ -246,15 +266,23 @@ async def run_loop(
         try:
             ctx = await build_context()
             if turn_span is not None:
-                turn_span.set(**{S.ATTR_TOKENS_IN: ctx.input_tokens})
+                turn_span.set(
+                    **{
+                        S.ATTR_TOKENS_IN: ctx.input_tokens,
+                        S.ATTR_SYSTEM_HASH: ctx.system_hash,
+                        S.ATTR_TOOLS_HASH: ctx.tools_hash,
+                    }
+                )
 
             problems = validate_message_sequence(ctx.messages)
             if problems:
                 trace_event(S.EV_DECISION, reason="protocol_violation", detail="; ".join(problems))
 
-            choice: Any = (
-                tool_choice_required(spec.submit_tool) if force_brief else spec.tool_choice
-            )
+            choice: Any = spec.tool_choice
+            if force_halt and spec.halt_allowed():
+                choice = tool_choice_required(SUBMIT_HALT)
+            elif force_brief:
+                choice = tool_choice_required(spec.submit_tool)
 
             async def on_delta(text: str, reasoning: bool) -> None:
                 await emit("content", node=spec.name, text=text, reasoning=reasoning)
@@ -268,6 +296,12 @@ async def run_loop(
             )
             last_error = result.error_class
             tokens.observe(ctx.input_tokens, result.usage)
+            if turn_span is not None:
+                turn_span.set(
+                    **{
+                        S.ATTR_TOKENS_CACHED: int(result.usage.get("cached_tokens") or 0),
+                    }
+                )
 
             if result.error_class is ErrorClass.AUTH:
                 task.record(result.error_class, StagnationSignal.NONE, result.usage)
@@ -378,6 +412,56 @@ async def run_loop(
             history.extend(tool_messages)
             last_error, last_stag = turn_error, turn_stag
             task.record(last_error, last_stag, result.usage)
+
+            down = next((o for o in outcomes if is_sandbox_unreachable(o.text)), None)
+            if down is not None:
+                trace_event(
+                    S.EV_DECISION,
+                    **{S.ATTR_DECISION: "stop", S.ATTR_REASON: "sandbox_unreachable"},
+                )
+                return done(
+                    synthetic_brief(outcome="failed", brief=down.text),
+                    None,
+                    "sandbox_unreachable",
+                )
+
+            exhausted = next((o for o in outcomes if o.exhausted), None)
+            if exhausted is not None:
+                n = settings.validation_retry_max
+                reason = (
+                    f"Circuit break: {exhausted.name} failed schema validation "
+                    f"{n} consecutive times in the {spec.name} phase."
+                )
+                trace_event(
+                    S.EV_DECISION,
+                    **{S.ATTR_DECISION: "validation_exhausted", S.ATTR_TOOL: exhausted.name},
+                )
+                if spec.name == FLASH:
+                    return done(
+                        synthetic_brief(outcome="failed", brief=reason),
+                        None,
+                        "validation_takeover",
+                    )
+                if spec.halt_allowed():
+                    force_halt = True
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": _HALT_NUDGE.format(
+                                tool=exhausted.name,
+                                n=n,
+                                agent=spec.name,
+                                reason=reason,
+                            ),
+                            "pinned": True,
+                        }
+                    )
+                    return None
+                return done(
+                    synthetic_brief(outcome="failed", brief=reason),
+                    None,
+                    "validation_exhausted",
+                )
 
             if submit_payload is not None:
                 if turn_span is not None:
