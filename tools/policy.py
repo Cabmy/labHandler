@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from config.runtime import get_settings
+from tools.workspace_utils import is_excluded_path
 
 # PermissionError 后给 LLM 的提示（fs_tools 用于 ReAct 自纠正）
 PERM_HINT = (
@@ -46,6 +47,15 @@ def _extract_cmd_names(cmd: str) -> list[str]:
     return names
 
 
+def is_under_workspace(path: str | Path, root: str | Path) -> bool:
+    """判断 path 是否在 root 之下（resolve 后比较）。"""
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 class SecurityPolicy:
     """host 端工具安全策略：路径边界 + 命令白名单 + 逃逸正则。"""
 
@@ -68,9 +78,13 @@ class SecurityPolicy:
     # 带引号的绝对路径和 .. 穿越都能绕过。
     _BOUNDARY = r"(^|[\s'\"=(])"
     ESCAPE_PATTERNS = [
-        re.compile(_BOUNDARY + r"\.\.([/\\\s'\")]|$)"),  # 独立 .. token / 路径穿越（含引号、括号内）
-        re.compile(_BOUNDARY + r"/[a-zA-Z]"),            # / 前缀绝对路径（cat /etc/x、open('/etc/x')）
-        re.compile(r"(?<![\w.])/(?:etc|usr|var|root|proc|sys|bin|sbin|boot|dev|lib|opt|home)(?:/|\b)"),  # 系统绝对路径（任意前缀如 +/etc；foo/etc 这类相对子目录不受影响）
+        # 独立 .. token / 路径穿越（含引号、括号内）
+        re.compile(_BOUNDARY + r"\.\.([/\\\s'\")]|$)"),
+        # / 前缀绝对路径（cat /etc/x、open('/etc/x')）
+        re.compile(_BOUNDARY + r"/[a-zA-Z]"),
+        # 系统绝对路径（任意前缀如 +/etc；foo/etc 这类相对子目录不受影响）
+        re.compile(
+            r"(?<![\w.])/(?:etc|usr|var|root|proc|sys|bin|sbin|boot|dev|lib|opt|home)(?:/|\b)"),
         re.compile(_BOUNDARY + r"~/"),                   # ~/path 家目录展开
         re.compile(_BOUNDARY + r"~($|[\s'\")])"),        # 独立 ~ token
     ]
@@ -90,7 +104,8 @@ class SecurityPolicy:
         """解析输入路径并验证其在 workspace_dir 内；越界抛 PermissionError。"""
         if not isinstance(p, str) or not p:
             raise PermissionError(f"Illegal path: {p!r}")
-        candidate = (self.workspace_dir / p) if not Path(p).is_absolute() else Path(p)
+        candidate = (self.workspace_dir /
+                     p) if not Path(p).is_absolute() else Path(p)
         resolved = candidate.resolve()
         try:
             resolved.relative_to(self.workspace_dir)
@@ -112,14 +127,14 @@ class SecurityPolicy:
         """读路径：Flash 不能进点目录（.labhandler/scripts 除外）。控制面文件谁都不能用工具读。"""
         resolved = self.safe_path(p)
         if self.is_control_file(resolved):
-            raise PermissionError(f"harness control file is not readable by agents: {p!r}")
-        parts = resolved.relative_to(self.workspace_dir).parts
-        hidden = any(part.startswith(".") or part == "__pycache__" for part in parts)
-        if not hidden:
+            raise PermissionError(
+                f"harness control file is not readable by agents: {p!r}")
+        rel = resolved.relative_to(self.workspace_dir)
+        if not is_excluded_path(rel):
             return resolved
         if role == "pro":
             return resolved
-        if ".labhandler" in parts and "scripts" in parts:
+        if ".labhandler" in rel.parts and "scripts" in rel.parts:
             return resolved
         raise PermissionError(
             f"dot-directories are Pro/harness-only; role={role!r} cannot read {p!r}"
@@ -160,11 +175,7 @@ class SecurityPolicy:
 
     def contains(self, path: Path) -> bool:
         """路径是否落在 workspace 内。用于过滤 glob 结果，不抛异常。"""
-        try:
-            path.resolve().relative_to(self.workspace_dir)
-        except (ValueError, OSError):
-            return False
-        return True
+        return is_under_workspace(path, self.workspace_dir)
 
     def check_command(self, cmd: str) -> None:
         """host_bash cmd 字符串白名单预检 + 路径逃逸巡查；抛 PermissionError。"""

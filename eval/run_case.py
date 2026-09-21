@@ -4,14 +4,12 @@
 不调用 LabSession.done()（会把 workspace 推进 .trash）。A 的卡片由本脚本
 create_cards + await index_card_ids 写入 pair 卡池。
 """
-from __future__ import annotations
 
 import argparse
 import asyncio
 import json
 import os
 import shutil
-import sys
 import time
 import traceback
 from pathlib import Path
@@ -19,13 +17,15 @@ from typing import Any
 
 import yaml
 
-REPO = Path(__file__).resolve().parent.parent
-if str(REPO) not in sys.path:
-    sys.path.insert(0, str(REPO))
+from eval import (
+    CASES_DIR,
+    RULE_IDS,
+    copy_gate_to_workspace,
+    pytest_in_sandbox,
+    reset_all_singletons,
+)
 
-CASES_DIR = Path(__file__).resolve().parent / "cases"
 PROFILE_PATH = Path(__file__).resolve().parent / "profile.yaml"
-RULE_IDS = ("screenshot", "blockquote", "filename")
 PAIRS: list[tuple[str, str]] = [
     ("two_sum", "two_sum_variant"),
     ("minikv_lab05", "minikv_variant"),
@@ -41,18 +41,6 @@ def load_expect(case: str) -> dict[str, Any]:
     return data
 
 
-def reset_singletons() -> None:
-    from config.runtime import get_settings
-
-    get_settings.cache_clear()
-    import memory.archive as archive_mod
-    import tools.policy as policy_mod
-
-    archive_mod._default_archive = None
-    policy_mod._policy = None
-    policy_mod._auditor = None
-
-
 def apply_env(*, workspace: Path, cards_dir: Path, memory_db: Path) -> None:
     workspace.mkdir(parents=True, exist_ok=True)
     cards_dir.mkdir(parents=True, exist_ok=True)
@@ -61,7 +49,7 @@ def apply_env(*, workspace: Path, cards_dir: Path, memory_db: Path) -> None:
     os.environ["CARDS_DIR"] = str(cards_dir.resolve())
     os.environ["MEMORY_DB_PATH"] = str(memory_db.resolve())
     os.environ["PROFILE_PATH"] = str(PROFILE_PATH.resolve())
-    reset_singletons()
+    reset_all_singletons()
 
 
 def seed_workspace(case: str, workspace: Path) -> None:
@@ -157,25 +145,14 @@ def remember_gold(expect: dict[str, Any]) -> dict[str, bool]:
 
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(data, ensure_ascii=False,
+                    indent=2) + "\n", encoding="utf-8")
 
 
 async def run_external_gate(workspace: Path, case: str, timeout: float) -> dict[str, Any]:
-    from tools.sandbox_tools import sandbox_run
-
-    dest = workspace / "_eval_gate"
-    if dest.exists():
-        shutil.rmtree(dest)
-    shutil.copytree(CASES_DIR / case / "gate", dest)
-    code, log = await sandbox_run(
-        "cd /workspace && PYTHONPATH=/workspace python -m pytest -q _eval_gate",
-        timeout=timeout,
-    )
-    return {
-        "exit_code": int(code),
-        "passed": code == 0,
-        "log": (log or "")[-4000:],
-    }
+    """复制 gate 到 workspace 并在沙箱跑 pytest。"""
+    dest = copy_gate_to_workspace(case, workspace)
+    return await pytest_in_sandbox(dest, timeout)
 
 
 async def archive_knowledge(session: Any, result: dict[str, Any]) -> dict[str, Any]:
@@ -314,7 +291,8 @@ async def run_one(
         try:
             archive_result = await archive_knowledge(session, lab_result)
         except Exception as exc:
-            archive_result = {"error": f"{type(exc).__name__}: {exc}", "card_ids": []}
+            archive_result = {
+                "error": f"{type(exc).__name__}: {exc}", "card_ids": []}
 
     traces_src = settings.traces_path
     traces_dst = run_dir / "traces.jsonl"
@@ -378,7 +356,8 @@ async def run_all(out_root: Path) -> list[dict[str, Any]]:
     for accumulate, variant in PAIRS:
         expect = load_expect(accumulate)
         pair = str(expect.get("pair") or accumulate)
-        print(f"\n===== pair {pair}: {accumulate} accumulate =====", flush=True)
+        print(
+            f"\n===== pair {pair}: {accumulate} accumulate =====", flush=True)
         results.append(
             await run_one(
                 case=accumulate,
@@ -408,13 +387,15 @@ async def run_all(out_root: Path) -> list[dict[str, Any]]:
                 archive=False,
             )
         )
-    write_json(out_root / "manifest.json", {"runs": [r["run_id"] for r in results]})
+    write_json(out_root / "manifest.json",
+               {"runs": [r["run_id"] for r in results]})
     return results
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="labHandler eval runner")
-    parser.add_argument("--all", action="store_true", help="跑 3 对 × (A + warm + cold)")
+    parser.add_argument("--all", action="store_true",
+                        help="跑 3 对 × (A + warm + cold)")
     parser.add_argument("--case", help="单个 case 目录名")
     parser.add_argument(
         "--memory",

@@ -187,8 +187,10 @@ def apply_notes(
     for item in replace or []:
         if not isinstance(item, dict):
             continue
-        replace_notes(sdir, str(item.get("old") or ""), str(item.get("new") or ""))
-    needles = remove if isinstance(remove, list) else ([remove] if remove else [])
+        replace_notes(sdir, str(item.get("old") or ""),
+                      str(item.get("new") or ""))
+    needles = remove if isinstance(
+        remove, list) else ([remove] if remove else [])
     remove_notes(sdir, [str(x) for x in needles])
     append_notes(sdir, append)
 

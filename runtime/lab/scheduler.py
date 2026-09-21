@@ -38,7 +38,20 @@ async def run_wave(
         return []
     if len(workers) == 1:
         w = workers[0]
-        return [(w, await runner(w))]
+        try:
+            brief = await runner(w)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if tracer is not None:
+                tracer.event(
+                    S.EV_STEP_ERROR,
+                    **{S.ATTR_TASK_ID: w.task_id, S.ATTR_REASON: f"{type(e).__name__}: {e}"},
+                )
+            brief = synthetic_brief(
+                outcome="failed", brief=f"{type(e).__name__}: {e}"
+            )
+        return [(w, brief)]
 
     sem = asyncio.Semaphore(settings.max_parallel_readonly_workers)
     results: dict[str, dict[str, Any]] = {}

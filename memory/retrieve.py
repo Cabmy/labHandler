@@ -18,7 +18,8 @@ from typing import Any
 from config.runtime import RuntimeSettings, get_settings
 from memory.archive import get_task_archive
 from memory.vectors import VectorIndex, content_sha256
-from tools.policy import get_policy
+from tools.policy import get_policy, is_under_workspace
+from tools.workspace_utils import READ_CHAR_CAP, grep_in_roots
 
 PREFETCH_K = 3
 PREFETCH_MIN_SCORE = 0.25
@@ -90,7 +91,7 @@ def parse_card_body(text: str) -> str:
     end = text.find("\n---\n", 3)
     if end < 0:
         return text
-    return text[end + 5 :].strip()
+    return text[end + 5:].strip()
 
 
 async def embed_card_file(path: Path, llm, settings: RuntimeSettings | None = None) -> None:
@@ -268,7 +269,8 @@ async def prefetch_cards(
         hits = await search_cards(query, _SEARCH_K_CAP, llm, settings)
     except Exception:
         return []
-    hits = [(p, score, body) for p, score, body in hits if score >= PREFETCH_MIN_SCORE]
+    hits = [(p, score, body)
+            for p, score, body in hits if score >= PREFETCH_MIN_SCORE]
     if not hits:
         return []
     return [f"{p.name} score={score:.3f}\n{body}" for p, score, body in _unique(hits, k)]
@@ -283,14 +285,10 @@ def memory_grep(
 ) -> str:
     """在 cards_dir 以及 extra_roots（缺省为 workspace/.labhandler）下按正则扫文件。
 
-    非法正则：[ERROR/Validation]。命中达 limit 后截断并标注。
-    无命中 "(no matches)"。读失败的文件跳过。
+    委托给公共 grep_in_roots。非法正则返回 [ERROR/Validation]；
+    命中达 limit 后截断；无命中返回 "(no matches)"。
     """
     s = settings or get_settings()
-    try:
-        rx = re.compile(pattern)
-    except re.error as e:
-        return f"[ERROR/Validation] invalid regex: {e}"
     roots = [_cards_dir(s)]
     if extra_roots is not None:
         roots.extend(extra_roots)
@@ -298,23 +296,11 @@ def memory_grep(
         ws = s.workspace_dir / ".labhandler"
         if ws.is_dir():
             roots.append(ws)
-    hits: list[str] = []
-    for root in roots:
-        if not root.exists():
-            continue
-        for p in root.rglob("*"):
-            if not p.is_file() or get_policy().is_control_file(p):
-                continue
-            try:
-                text = p.read_text(encoding="utf-8", errors="replace")
-            except Exception:
-                continue
-            for i, line in enumerate(text.splitlines(), 1):
-                if rx.search(line):
-                    hits.append(f"{p}:{i}:{line[:200]}")
-                    if len(hits) >= limit:
-                        return "\n".join(hits) + f"\n[truncated limit={limit}]"
-    return "\n".join(hits) if hits else "(no matches)"
+
+    def _skip(p: Path) -> bool:
+        return get_policy().is_control_file(p)
+
+    return grep_in_roots(pattern, roots, limit, file_filter=_skip)
 
 
 def memory_read(
@@ -334,30 +320,19 @@ def memory_read(
     if not candidate.is_absolute():
         for base in bases:
             p = (base / path).resolve()
-            try:
-                p.relative_to(base.resolve())
-            except ValueError:
+            if not is_under_workspace(p, base):
                 continue
             if p.is_file():
                 if get_policy().is_control_file(p):
                     return f"[ERROR/PermissionError] harness control file is not readable: {path}"
-                return p.read_text(encoding="utf-8", errors="replace")[:80_000]
+                return p.read_text(encoding="utf-8", errors="replace")[:READ_CHAR_CAP]
         return f"[ERROR/FileNotFoundError] {path}"
     resolved = candidate.resolve()
     allowed = [b.resolve() for b in bases]
-    if not any(_is_under(resolved, a) for a in allowed):
+    if not any(is_under_workspace(resolved, a) for a in allowed):
         return f"[ERROR/PermissionError] path not allowed: {path}"
     if not resolved.is_file():
         return f"[ERROR/FileNotFoundError] {path}"
     if get_policy().is_control_file(resolved):
         return f"[ERROR/PermissionError] harness control file is not readable: {path}"
-    return resolved.read_text(encoding="utf-8", errors="replace")[:80_000]
-
-
-def _is_under(path: Path, root: Path) -> bool:
-    """path 是否位于 root 之下（含 root 自身）。"""
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
+    return resolved.read_text(encoding="utf-8", errors="replace")[:READ_CHAR_CAP]

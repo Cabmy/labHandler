@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """聚合 eval/runs/<ts>/*/result.json 与 traces.jsonl，写出 docs 下的表。"""
-from __future__ import annotations
 
 import argparse
 import json
@@ -10,15 +9,17 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-REPO = Path(__file__).resolve().parent.parent
-RULE_IDS = ("screenshot", "blockquote", "filename")
+from eval import REPO, RULE_IDS
+
 INTERNAL_STATES = ("pass", "fail", "no_hard_criteria", "test_invalid")
 JUDGE_DECISIONS = ("continue", "finish", "takeover", "revise_spec", "stop")
 MAX_STEPS = 12
-FLASH_TEST = re.compile(r"test_[A-Za-z0-9_]+\.py|写.{0,8}测试|write.{0,16}test", re.I)
+FLASH_TEST = re.compile(
+    r"test_[A-Za-z0-9_]+\.py|写.{0,8}测试|write.{0,16}test", re.I)
 SCREENSHOT = re.compile(r"（此处建议附.+截图）")
 WORD_TOKEN = re.compile(r"[\u4e00-\u9fff]|[A-Za-z0-9]")
-NCR_HINTS = ("no_hard_criteria", "无硬指标", "没有硬指标", "无硬编码", "未写门禁", "没有门禁", "未写出验收")
+NCR_HINTS = ("no_hard_criteria", "无硬指标", "没有硬指标",
+             "无硬编码", "未写门禁", "没有门禁", "未写出验收")
 INV_HINTS = ("test_invalid", "无法执行", "未能执行", "不能执行", "没跑起来", "未能在沙箱")
 
 # 外部门禁「没跑起来」的标志。pytest 判定失败时 exit_code 是 1 且 log 里有用例名；
@@ -110,7 +111,8 @@ def eval_check(check: str, row: dict[str, Any]) -> bool:
         }[op]
     if text == "no_flash_writes_tests":
         for a in row.get("assignments") or []:
-            arts = " ".join(str(x) for x in (a.get("expected_artifacts") or []))
+            arts = " ".join(str(x)
+                            for x in (a.get("expected_artifacts") or []))
             blob = f"{a.get('goal', '')} {a.get('spec', '')} {arts}"
             if FLASH_TEST.search(blob):
                 return False
@@ -231,8 +233,10 @@ def memory_effect(rows: list[dict[str, Any]]) -> dict[str, Any]:
         cold = sides.get("cold")
         warm_out = gate_outcome(warm) if warm else None
         cold_out = gate_outcome(cold) if cold else None
-        m_warm = int(warm_out == "pass") if warm_out and warm_out != "infra" else None
-        m_cold = int(cold_out == "pass") if cold_out and cold_out != "infra" else None
+        m_warm = int(
+            warm_out == "pass") if warm_out and warm_out != "infra" else None
+        m_cold = int(
+            cold_out == "pass") if cold_out and cold_out != "infra" else None
         delta = None
         if m_warm is not None and m_cold is not None:
             delta = m_warm - m_cold
@@ -357,7 +361,8 @@ def exec_rule(rid: str, row: dict[str, Any]) -> bool | None:
             return False
         banned = (ws / "solution.py").is_file() or (ws / "main.py").is_file()
         deliverables = [str(d) for d in (row.get("deliverables") or [])]
-        present = all((ws / d).is_file() for d in deliverables) if deliverables else False
+        present = all((ws / d).is_file()
+                      for d in deliverables) if deliverables else False
         return present and not banned
     return None
 
@@ -517,7 +522,8 @@ def efficiency(rows: list[dict[str, Any]]) -> dict[str, Any]:
     decisions = Counter()
     for p in per:
         decisions.update(p.get("decisions") or {})
-    ratios = [p["compact_ratio_mean"] for p in per if p.get("compact_ratio_mean") is not None]
+    ratios = [p["compact_ratio_mean"]
+              for p in per if p.get("compact_ratio_mean") is not None]
     sources = Counter(p.get("tokens_in_source") for p in per)
     return {
         "per_run": per,
@@ -571,7 +577,8 @@ def render_md(agg: dict[str, Any]) -> str:
     ]
     for state in INTERNAL_STATES:
         cell = h["matrix"][state]
-        lines.append(f"| {state} | {cell['pass']} | {cell['fail']} | {cell['infra']} |")
+        lines.append(
+            f"| {state} | {cell['pass']} | {cell['fail']} | {cell['infra']} |")
     lines += [
         "",
         f"- 计分 run 数（排除 infra）：{h['scored_n']}/{h['n']}",
@@ -644,7 +651,8 @@ def render_md(agg: dict[str, Any]) -> str:
             cold_ok = c.get("cold_passed")
             cs = "n/a" if cold_ok is None else ("yes" if cold_ok else "no")
             ds = "yes" if c.get("discriminates") else "no"
-            lines.append(f"| {p['pair']} | {c.get('check')} | {got} | {ps} | {cs} | {ds} |")
+            lines.append(
+                f"| {p['pair']} | {c.get('check')} | {got} | {ps} | {cs} | {ds} |")
     lines += ["", "## 3. /remember（3 规则 × counted case）", ""]
     lines += [
         f"- confusion：TP={r['tp']} FP={r['fp']} TN={r['tn']} FN={r['fn']}",
@@ -657,7 +665,8 @@ def render_md(agg: dict[str, Any]) -> str:
         "|---|---|---|---|---|---|",
     ]
     for c in r["cells"]:
-        exe = "—" if c["executed"] is None else ("yes" if c["executed"] else "no")
+        exe = "—" if c["executed"] is None else (
+            "yes" if c["executed"] else "no")
         lines.append(
             f"| {c['run_id']} | {c['rule']} | {c['gold']} | {c['pred']} | {c['label']} | {exe} |"
         )
@@ -718,9 +727,11 @@ def aggregate(runs_dir: Path) -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="labHandler eval reporter")
-    parser.add_argument("--runs", required=True, help="eval/runs/<timestamp> 目录")
+    parser.add_argument("--runs", required=True,
+                        help="eval/runs/<timestamp> 目录")
     parser.add_argument("--out", default=str(REPO / "docs" / "eval_report.md"))
-    parser.add_argument("--json", default=str(REPO / "docs" / "eval_results.json"))
+    parser.add_argument("--json", default=str(REPO /
+                        "docs" / "eval_results.json"))
     args = parser.parse_args()
     runs_dir = Path(args.runs).resolve()
     agg = aggregate(runs_dir)
@@ -730,7 +741,8 @@ def main() -> None:
     out_json.parent.mkdir(parents=True, exist_ok=True)
     slim = {k: v for k, v in agg.items() if k != "all_runs"}
     slim["run_ids"] = [r.get("run_id") for r in agg["all_runs"]]
-    out_json.write_text(json.dumps(slim, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    out_json.write_text(json.dumps(slim, ensure_ascii=False,
+                        indent=2) + "\n", encoding="utf-8")
     out_md.write_text(render_md(agg), encoding="utf-8")
     print(f"wrote {out_md}")
     print(f"wrote {out_json}")

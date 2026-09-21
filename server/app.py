@@ -16,19 +16,18 @@ from sse_starlette.sse import EventSourceResponse
 from config.runtime import get_settings
 from runtime.lab.persist import latest_incomplete
 from runtime.session import LabSession
+from tools.policy import is_under_workspace
 from tools.workspace_utils import iter_workspace_files
 
-WORKSPACE_DIR: Path = get_settings().workspace_dir
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
+
+def _ws() -> Path:
+    """工作区路径，每次从 settings 获取。"""
+    return get_settings().workspace_dir
+
+
 app = FastAPI(title="labHandler", docs_url=None, redoc_url=None)
-
-
-@app.on_event("shutdown")
-async def _shutdown_llm() -> None:
-    close = getattr(_session.llm, "aclose", None)
-    if close is not None:
-        await close()
 
 
 @app.middleware("http")
@@ -68,32 +67,33 @@ async def _warm_memory_index() -> None:
 
 @app.on_event("shutdown")
 async def _shutdown() -> None:
-    """进程退出前把 span 刷出去，否则最后一段 trace 会丢在缓冲里。"""
+    """进程退出前刷出 span、关闭 LLM client，否则最后一段 trace 会丢在缓冲里。"""
     _session.request_stop()
     _session.tracer.shutdown()
     await _session.llm.aclose()
 
 
 def _safe_workspace_path(name: str) -> Path:
+    """解析并校验路径是否在 workspace 内；非法或越界抛 HTTPException(400)。"""
+    ws = _ws()
     rel = Path(name)
     if not name or rel.is_absolute() or any(
         not part or part.startswith(".") for part in rel.parts
     ):
         raise HTTPException(status_code=400, detail=f"非法文件名：{name!r}")
-    resolved = (WORKSPACE_DIR / rel).resolve()
-    try:
-        resolved.relative_to(WORKSPACE_DIR)
-    except ValueError:
+    resolved = (ws / rel).resolve()
+    if not is_under_workspace(resolved, ws):
         raise HTTPException(status_code=400, detail=f"越界路径：{name!r}")
     return resolved
 
 
 def _list_workspace_files() -> list[dict[str, Any]]:
+    ws = _ws()
     out: list[dict[str, Any]] = []
-    if not WORKSPACE_DIR.exists():
+    if not ws.exists():
         return out
-    for p in iter_workspace_files(WORKSPACE_DIR):
-        out.append({"name": str(p.relative_to(WORKSPACE_DIR)), "size": p.stat().st_size})
+    for p in iter_workspace_files(ws):
+        out.append({"name": str(p.relative_to(ws)), "size": p.stat().st_size})
     return sorted(out, key=lambda x: x["name"])
 
 
@@ -106,7 +106,8 @@ async def list_files() -> list[dict[str, Any]]:
 async def upload_files(files: list[UploadFile]) -> dict[str, Any]:
     if _is_running():
         raise HTTPException(status_code=409, detail="任务运行中，暂不能修改 workspace")
-    WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+    ws = _ws()
+    ws.mkdir(parents=True, exist_ok=True)
     saved: list[str] = []
     for f in files:
         target = _safe_workspace_path(f.filename or "")
@@ -131,7 +132,7 @@ async def delete_file(name: str) -> dict[str, Any]:
     resolved = _safe_workspace_path(name)
     if not resolved.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
-    bucket = WORKSPACE_DIR.parent / ".trash" / time.strftime("%Y%m%d_%H%M%S")
+    bucket = _ws().parent / ".trash" / time.strftime("%Y%m%d_%H%M%S")
     bucket.mkdir(parents=True, exist_ok=True)
     shutil.move(str(resolved), str(bucket / resolved.name))
     return {"deleted": resolved.name, "trashed_to": str(bucket)}
@@ -200,7 +201,7 @@ async def resume_lab(req: ResumeRequest) -> dict[str, Any]:
     async with _task_lock:
         if _is_running():
             raise HTTPException(status_code=409, detail="已有任务在运行")
-        peek = await asyncio.to_thread(latest_incomplete, WORKSPACE_DIR)
+        peek = await asyncio.to_thread(latest_incomplete, _ws())
         if not peek:
             raise HTTPException(status_code=404, detail="没有未完成的 lab")
         tid, tree = peek
@@ -253,7 +254,7 @@ async def get_state() -> dict[str, Any]:
 
 @app.get("/api/summary")
 async def get_summary() -> JSONResponse:
-    sp = WORKSPACE_DIR / "SUMMARY.md"
+    sp = _ws() / "SUMMARY.md"
     text = sp.read_text(encoding="utf-8") if sp.exists() else ""
     return JSONResponse({"summary": text})
 
@@ -403,7 +404,8 @@ async def done() -> dict[str, Any]:
                 archive_extra["task_id"] = task_id
                 archive_extra["card_ids"] = card_ids
         if _session.last_result:
-            _session.last_result["knowledge_cards"] = []  # 已处理，清空以免 _session.done 再建空 task
+            # 已处理，清空以免 _session.done 再建空 task
+            _session.last_result["knowledge_cards"] = []
     result = await asyncio.to_thread(_session.done, lambda m: None)
     if archive_extra:
         result["archive"] = {**(result.get("archive") or {}), **archive_extra}

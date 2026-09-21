@@ -5,13 +5,13 @@ task_archive 一行一次 lab；archive_cards 挂在其上。
 card_type 仅 lesson / strategy / pattern。retired_at 非空视为淘汰，读接口一律排除。
 """
 
-import hashlib
 import os
 import sqlite3
 from typing import Any
 
 from config.runtime import get_settings
 from memory.db import connect
+from memory.vectors import content_sha256
 
 # card_type 仅允许这三项；其余在 create_cards 中丢弃。
 VALID_CARD_TYPES = frozenset({"lesson", "strategy", "pattern"})
@@ -76,7 +76,7 @@ class TaskArchive:
         content = str(card.get("content", "")).strip()
         if card_type not in VALID_CARD_TYPES or not content:
             return None
-        return card_type, content, hashlib.sha256(content.encode()).hexdigest()[:16]
+        return card_type, content, content_sha256(content)[:16]
 
     def _active_duplicate(self, conn: sqlite3.Connection, card_type: str, content_hash: str) -> bool:
         row = conn.execute(
@@ -184,14 +184,28 @@ class TaskArchive:
 
     # --- 读接口 -------------------------------------------------------
 
-    def get_cards_for_indexing(self) -> list[dict[str, Any]]:
-        """全部未淘汰卡片 + 父任务字段，按 card_id 升序。供建索引。"""
+    def _active_cards(self, extra_columns: tuple[str, ...] = ()) -> list[dict[str, Any]]:
+        """全部未淘汰卡片 + 父任务字段，按 card_id 升序。
+
+        extra_columns 允许调用方在基础列之上追加额外列（如 vector_error、search_text）。
+        """
+        # 基础列：card_id / card_type / content / task_id + 父任务字段
+        base_cols = [
+            "c.id as card_id",
+            "c.card_type",
+            "c.content",
+            "c.task_id",
+            "t.task_title",
+            "t.task_type",
+        ]
+        cols = ", ".join(base_cols)
+        if extra_columns:
+            cols += ", " + ", ".join(extra_columns)
         with connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute(
-                """
-                SELECT c.id as card_id, c.card_type, c.content, c.search_text, c.vector_error,
-                       t.id as task_id, t.task_title, t.task_type
+                f"""
+                SELECT {cols}
                 FROM archive_cards c
                 JOIN task_archive t ON c.task_id = t.id
                 WHERE c.retired_at IS NULL
@@ -199,6 +213,10 @@ class TaskArchive:
                 """
             )
             return [dict(row) for row in cursor.fetchall()]
+
+    def get_cards_for_indexing(self) -> list[dict[str, Any]]:
+        """全部未淘汰卡片 + 父任务字段 + search_text + vector_error，供建索引。"""
+        return self._active_cards(extra_columns=("c.search_text", "c.vector_error"))
 
     def get_cards_by_ids(self, card_ids: list[int]) -> list[dict[str, Any]]:
         """按 card_id 取未淘汰卡片及父任务。返回顺序与入参中仍存在的 id 一致。"""
@@ -217,24 +235,13 @@ class TaskArchive:
                 """,
                 card_ids,
             )
-            rows_by_id = {row["card_id"]: dict(row) for row in cursor.fetchall()}
+            rows_by_id = {row["card_id"]: dict(
+                row) for row in cursor.fetchall()}
             return [rows_by_id[rid] for rid in card_ids if rid in rows_by_id]
 
     def get_all_active_cards(self) -> list[dict[str, Any]]:
         """全部未淘汰卡片（card_id / 分组键 / content），按 card_id 升序。/dream 输入。"""
-        with connect(self.db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.execute(
-                """
-                SELECT c.id as card_id, c.card_type, c.content, c.task_id,
-                       t.task_title, t.task_type
-                FROM archive_cards c
-                JOIN task_archive t ON c.task_id = t.id
-                WHERE c.retired_at IS NULL
-                ORDER BY c.id
-                """
-            )
-            return [dict(row) for row in cursor.fetchall()]
+        return self._active_cards()
 
 
 # 进程内唯一 TaskArchive，绑定 settings.memory_db_path。

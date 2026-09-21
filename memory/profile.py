@@ -56,11 +56,6 @@ def load_profile() -> dict[str, Any]:
         return {}
 
 
-def get_profile() -> dict[str, Any]:
-    """当前 profile dict，语义同 load_profile。"""
-    return load_profile()
-
-
 def update_field(dotted_path: str, value: Any) -> dict[str, Any]:
     """覆盖点号路径上已有字段，原子写回，返回写后的整份 dict。
 
@@ -72,7 +67,8 @@ def update_field(dotted_path: str, value: Any) -> dict[str, Any]:
     cur = data
     for p in parts[:-1]:
         if not isinstance(cur, dict) or p not in cur:
-            raise KeyError(f"Path does not exist: {dotted_path} (broken at {p})")
+            raise KeyError(
+                f"Path does not exist: {dotted_path} (broken at {p})")
         cur = cur[p]
     if not isinstance(cur, dict):
         raise KeyError(f"Path is not a dict: {dotted_path}")
@@ -139,13 +135,15 @@ def inject_for_agent(
             )
         cs = prefs.get("coding_style") or {}
         if cs:
-            th = "requires type hints" if cs.get("type_hints") else "type hints optional"
+            th = "requires type hints" if cs.get(
+                "type_hints") else "type hints optional"
             ds = cs.get("docstring", "short")
             lines.append(f"- Coding style: {th}; docstring={ds}")
 
     if include_rules and rules is None:
         rules = prefs.get("style_rules") or []
-    chosen = [str(r).strip() for r in (rules or []) if str(r).strip()] if include_rules else []
+    chosen = [str(r).strip() for r in (rules or [])
+              if str(r).strip()] if include_rules else []
     if include_rules:
         lines.append("")
         lines.append("## User long-term rules applicable to this lab")

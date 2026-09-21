@@ -26,7 +26,7 @@ from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer
 from runtime.phase import FLASH, PRO
 from runtime.loop.retry import sleep_delay
-from runtime.loop.calls import run_calls
+from runtime.loop.calls import SUBMIT_TOOLS, run_calls
 from runtime.loop.parse import coerce_brief, synthetic_brief, tool_choice_required
 from runtime.loop.schema import SUBMIT_BRIEF, SUBMIT_HALT
 from runtime.loop.stagnation import NUDGE_TEXT, StagnationSignal, StagnationTracker
@@ -51,6 +51,14 @@ _HALT_NUDGE = (
     "in the {agent} phase. Do not retry {tool}. Call submit_halt now. "
     "Write reason exactly: {reason} "
     "need_from_user must say what the user should provide so this stage can continue."
+)
+
+# 普通工具连续校验失败后的提示：这不是死路，出口 submit 仍可用，要求换写法或换工具，别放弃任务。
+_TOOL_NUDGE = (
+    "{tool} rejected its arguments {n} consecutive times. Do not call {tool} again with the "
+    "same argument shape. Re-read the schema hint in its last error and fix the argument types "
+    "(a string field is one string, not an array or object), or use a different tool. "
+    "Do not give up on the task."
 )
 
 # 一轮里多个工具调用时，取最严重的那个错误类别记账。
@@ -135,10 +143,11 @@ def drop_dangling_tool_calls(history: list[dict[str, Any]]) -> list[dict[str, An
         return history
     answered = {
         str(m.get("tool_call_id") or "")
-        for m in history[last_owner + 1 :]
+        for m in history[last_owner + 1:]
         if m.get("role") == "tool"
     }
-    expected = {str(tc.get("id") or "") for tc in history[last_owner]["tool_calls"]}
+    expected = {str(tc.get("id") or "")
+                for tc in history[last_owner]["tool_calls"]}
     if expected <= answered:
         return history
     return history[:last_owner]
@@ -181,7 +190,8 @@ async def run_loop(
     last_stag = StagnationSignal.NONE
     validation_streak: dict[str, int] = {}
     tokens = TokenBudget.from_settings(settings)
-    dump = DumpScope(session_dir=session_dir, agent=spec.name, task_id=task.task_id)
+    dump = DumpScope(session_dir=session_dir,
+                     agent=spec.name, task_id=task.task_id)
 
     def done(
         brief: dict[str, Any] | None,
@@ -276,7 +286,8 @@ async def run_loop(
 
             problems = validate_message_sequence(ctx.messages)
             if problems:
-                trace_event(S.EV_DECISION, reason="protocol_violation", detail="; ".join(problems))
+                trace_event(S.EV_DECISION, reason="protocol_violation",
+                            detail="; ".join(problems))
 
             choice: Any = spec.tool_choice
             if force_halt and spec.halt_allowed():
@@ -304,14 +315,17 @@ async def run_loop(
                 )
 
             if result.error_class is ErrorClass.AUTH:
-                task.record(result.error_class, StagnationSignal.NONE, result.usage)
+                task.record(result.error_class,
+                            StagnationSignal.NONE, result.usage)
                 return done(None, None, "auth")
             if result.error_class is ErrorClass.TRANSIENT:
-                task.record(result.error_class, StagnationSignal.NONE, result.usage)
+                task.record(result.error_class,
+                            StagnationSignal.NONE, result.usage)
                 return None
             if result.error_class is not ErrorClass.OK and not result.tool_calls:
                 # 网关报错却被记成 OK 时，会空转把 step_budget 耗尽（SPEC 长时间不动）。
-                task.record(result.error_class, StagnationSignal.NONE, result.usage)
+                task.record(result.error_class,
+                            StagnationSignal.NONE, result.usage)
                 return None
             if result.truncated:
                 # finish_reason=length：content / tool_calls 可能是半截。events 注入截断提示。
@@ -323,7 +337,8 @@ async def run_loop(
             if not result.tool_calls:
                 task.record(ErrorClass.OK, StagnationSignal.NONE, result.usage)
                 if result.content:
-                    history.append({"role": "assistant", "content": result.content})
+                    history.append(
+                        {"role": "assistant", "content": result.content})
                     task.events.append(
                         {
                             "text": (
@@ -413,7 +428,8 @@ async def run_loop(
             last_error, last_stag = turn_error, turn_stag
             task.record(last_error, last_stag, result.usage)
 
-            down = next((o for o in outcomes if is_sandbox_unreachable(o.text)), None)
+            down = next(
+                (o for o in outcomes if is_sandbox_unreachable(o.text)), None)
             if down is not None:
                 trace_event(
                     S.EV_DECISION,
@@ -428,13 +444,25 @@ async def run_loop(
             exhausted = next((o for o in outcomes if o.exhausted), None)
             if exhausted is not None:
                 n = settings.validation_retry_max
-                reason = (
-                    f"Circuit break: {exhausted.name} failed schema validation "
-                    f"{n} consecutive times in the {spec.name} phase."
-                )
                 trace_event(
                     S.EV_DECISION,
                     **{S.ATTR_DECISION: "validation_exhausted", S.ATTR_TOOL: exhausted.name},
+                )
+                if exhausted.name not in SUBMIT_TOOLS:
+                    # 普通工具连续校验失败不是死路，出口 submit 仍可用。钉一条提示让它换写法，
+                    # 并清零该工具的连续计数（否则下一拍会每轮重复触发 nudge），继续本 loop。
+                    validation_streak.pop(exhausted.name, None)
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": _TOOL_NUDGE.format(tool=exhausted.name, n=n),
+                            "pinned": True,
+                        }
+                    )
+                    return None
+                reason = (
+                    f"Circuit break: {exhausted.name} failed schema validation "
+                    f"{n} consecutive times in the {spec.name} phase."
                 )
                 if spec.name == FLASH:
                     return done(
@@ -530,13 +558,15 @@ async def run_loop(
 
             if decision.kind == "stop":
                 return done(
-                    synthetic_brief(outcome="failed", brief=f"stopped: {decision.reason}"),
+                    synthetic_brief(outcome="failed",
+                                    brief=f"stopped: {decision.reason}"),
                     None,
                     decision.reason,
                 )
     except asyncio.TimeoutError:
         return done(
-            synthetic_brief(outcome="failed", brief="wall-clock deadline reached"),
+            synthetic_brief(outcome="failed",
+                            brief="wall-clock deadline reached"),
             None,
             "deadline",
         )

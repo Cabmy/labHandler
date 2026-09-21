@@ -15,7 +15,6 @@
 """
 
 import json
-import os
 import shutil
 import subprocess
 import time
@@ -138,22 +137,39 @@ def _docker_run(image: str, port: int, host_workspace: Path, log=print) -> bool:
         return False
 
 
+def _check_prerequisites(log=print) -> tuple["RuntimeSettings | None", str]:
+    """公共前置检查：自启开关 + docker 可用性。
+
+    返回 (settings, status)：
+    - (settings, "ok")         检查通过，可继续
+    - (None, "disabled")       用户禁用了自启
+    - (None, "no_docker")      未检测到 docker
+    """
+    settings = get_settings()
+    if not settings.lab_autostart_sandbox:
+        return None, "disabled"
+    if not _docker_available():
+        return None, "no_docker"
+    return settings, "ok"
+
+
 def ensure_sandbox(log=print) -> bool:
     """按需检测并启动沙箱容器；返回端口最终是否可达。"""
-    if os.getenv("LAB_AUTOSTART_SANDBOX", "true").lower() in {"false", "0", "no"}:
+    settings, status = _check_prerequisites(log)
+    if status == "disabled":
         return True  # 用户禁用自启；交由 mcp_client 探活时报错
+    if status == "no_docker":
+        log("[sandbox] 未检测到 docker；请先装 docker 或手动起容器。")
+        return False
 
-    url = os.getenv("AIO_SANDBOX_MCP_URL", "http://127.0.0.1:8080/mcp")
-    image = os.getenv(
-        "AIO_SANDBOX_IMAGE",
-        "enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:latest",
-    )
-    port = int(os.getenv("AIO_SANDBOX_PORT", "8080"))
-    host_workspace = get_settings().workspace_dir
+    url = settings.aio_sandbox_mcp_url
+    image = settings.aio_sandbox_image
+    port = settings.aio_sandbox_port
+    host_workspace = settings.workspace_dir
     host_workspace.mkdir(parents=True, exist_ok=True)
 
     # 一次性迁移提示：无 workspace 挂载的旧容器意味着 agent 永远无法在沙箱读 PDF
-    if _docker_available() and not _container_has_workspace_mount(host_workspace):
+    if not _container_has_workspace_mount(host_workspace):
         log(
             "[sandbox] ⚠️ 检测到旧容器没有 workspace bind-mount。"
             f"sandbox 工具将无法读 {host_workspace} 下的 PDF/DOCX。\n"
@@ -164,10 +180,6 @@ def ensure_sandbox(log=print) -> bool:
 
     if probe_port(url):
         return True
-
-    if not _docker_available():
-        log("[sandbox] 未检测到 docker；请先装 docker 或手动起容器。")
-        return False
 
     state = _container_state()
     if state == "running":
@@ -223,10 +235,11 @@ def recreate_sandbox(log=print) -> bool:
     目的：`/done --clear` 不仅清 host workspace，还清容器内的
     pip 全局包 / /tmp / 长驻进程残留，使下一个任务从干净容器起步。
     """
-    if os.getenv("LAB_AUTOSTART_SANDBOX", "true").lower() in {"false", "0", "no"}:
+    settings, status = _check_prerequisites(log)
+    if status == "disabled":
         log("[sandbox] LAB_AUTOSTART_SANDBOX=false，跳过重建（请手动 docker rm 后重启 cli）")
         return True
-    if not _docker_available():
+    if status == "no_docker":
         log("[sandbox] 未检测到 docker，跳过重建")
         return False
 

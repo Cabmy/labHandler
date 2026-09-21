@@ -26,7 +26,9 @@ from runtime.loop.schema import (
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer
 
-_SUBMIT = {
+# loop 阶段的结构化出口：走 validate_payload，且校验耗尽时按角色升级（cycle.py 分流）。
+# 与 schema.SCHEMA_TOOLS 不同——后者还含有各自独立流程的 dream / skill_edit。
+SUBMIT_TOOLS = {
     SUBMIT_SPEC,
     SUBMIT_DISPATCH,
     SUBMIT_BRIEF,
@@ -85,7 +87,8 @@ async def run_waves(
         if end - start == 1:
             results[start] = await invoke(items[start])
             continue
-        tasks = [asyncio.create_task(invoke(items[i])) for i in range(start, end)]
+        tasks = [asyncio.create_task(invoke(items[i]))
+                 for i in range(start, end)]
         try:
             chunk = await asyncio.gather(*tasks)
         except BaseException:
@@ -147,26 +150,24 @@ async def run_calls(
     return out
 
 
-def _mark_exhausted(
+def _track_validation(
     result: CallResult,
-    name: str,
     validation_streak: dict[str, int],
     settings: RuntimeSettings,
 ) -> CallResult:
-    """同一 submit 连续校验失败达到上限时打标，由 loop 按角色分流（Flash 接管 / Pro 提示 halt）。"""
-    if validation_streak.get(name, 0) < settings.validation_retry_max:
+    """统一的连续校验失败熔断：VALIDATION 累加、其余清零，任何工具连续达上限即打 exhausted。
+
+    出口 submit 与普通工具共用这一条规则；后续分流在 cycle.py——submit 升级（Flash 接管 /
+    Pro halt），普通工具只 nudge 换写法。exhausted 只表示「连续失败已到上限」，不含角色语义。
+    """
+    name = result.name
+    if result.error is not ErrorClass.VALIDATION:
+        validation_streak.pop(name, None)
         return result
-    return CallResult(
-        result.name,
-        result.call_id,
-        result.args,
-        result.text,
-        result.error,
-        submit_name=result.submit_name,
-        submit_payload=result.submit_payload,
-        ran=result.ran,
-        exhausted=True,
-    )
+    validation_streak[name] = validation_streak.get(name, 0) + 1
+    if validation_streak[name] < settings.validation_retry_max:
+        return result
+    return replace(result, exhausted=True)
 
 
 async def _one(
@@ -186,13 +187,11 @@ async def _one(
 
     parsed, perr = parse_args(tc["arguments"])
     if parsed is None:
-        validation_streak[name] = validation_streak.get(name, 0) + 1
         result = CallResult(
-            name, call_id, None, VALIDATION_TOOL_RESULT.format(err=perr), ErrorClass.VALIDATION
+            name, call_id, None, VALIDATION_TOOL_RESULT.format(
+                err=perr), ErrorClass.VALIDATION
         )
-        if name in _SUBMIT:
-            result = _mark_exhausted(result, name, validation_streak, settings)
-    elif name in _SUBMIT:
+    elif name in SUBMIT_TOOLS:
         allowed = name == submit_tool or (
             name == SUBMIT_HALT and SUBMIT_HALT in registry.names()
         )
@@ -212,13 +211,11 @@ async def _one(
         else:
             err = validate_payload(name, parsed)
             if err:
-                validation_streak[name] = validation_streak.get(name, 0) + 1
                 result = CallResult(
-                    name, call_id, parsed, VALIDATION_TOOL_RESULT.format(err=err), ErrorClass.VALIDATION
+                    name, call_id, parsed, VALIDATION_TOOL_RESULT.format(
+                        err=err), ErrorClass.VALIDATION
                 )
-                result = _mark_exhausted(result, name, validation_streak, settings)
             else:
-                validation_streak[name] = 0
                 result = CallResult(
                     name, call_id, parsed, "ok", ErrorClass.OK, submit_name=name, submit_payload=parsed
                 )
@@ -227,9 +224,13 @@ async def _one(
         outcome = await registry.execute(
             name, parsed, local, timeout=settings.tool_timeout_s, tracer=tracer
         )
-        result = CallResult(name, call_id, parsed, outcome.text, outcome.error_class, ran=True)
+        result = CallResult(name, call_id, parsed,
+                            outcome.text, outcome.error_class, ran=True)
 
-    shown = json.dumps(parsed, ensure_ascii=False)[:200] if parsed is not None else tc["arguments"][:200]
+    result = _track_validation(result, validation_streak, settings)
+
+    shown = json.dumps(parsed, ensure_ascii=False)[
+        :200] if parsed is not None else tc["arguments"][:200]
     await emit(
         "tool",
         node=node,

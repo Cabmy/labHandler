@@ -1,7 +1,11 @@
 """共享的 workspace 文件扫描工具。"""
 
+import re
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
+
+# 文件读取单次最大字符数；fs_tools / memory 等模块统一引用
+READ_CHAR_CAP = 80_000
 
 
 def is_excluded_path(rel_path: Path) -> bool:
@@ -38,3 +42,63 @@ def iter_workspace_files(
         count += 1
         if max_files > 0 and count >= max_files:
             return
+
+
+def grep_in_roots(
+    pattern: str,
+    roots: list[Path],
+    limit: int,
+    *,
+    file_filter: Callable[[Path], bool] | None = None,
+    path_fmt: Callable[[Path], str] | None = None,
+) -> str:
+    """在多个根目录下按正则逐行搜索文件，返回格式化结果。
+
+    参数：
+        pattern：正则表达式字符串。
+        roots：搜索根目录列表。
+        limit：最大命中条数，达到后截断。
+        file_filter：可选回调，返回 True 表示跳过该文件。
+        path_fmt：可选回调，把路径格式化为 hits 中使用的字符串。
+                  缺省使用 str(path)。
+
+    非法正则返回 [ERROR/Validation]；无命中返回 "(no matches)"；
+    命中格式为 ``path:lineno:line[:200]``。
+    """
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        return f"[ERROR/Validation] invalid regex: {e}"
+
+    hits: list[str] = []
+    truncated = False
+    for root in roots:
+        if not root.exists():
+            continue
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            if file_filter is not None and file_filter(p):
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            path_str = path_fmt(p) if path_fmt else str(p)
+            for i, line in enumerate(text.splitlines(), 1):
+                if rx.search(line):
+                    hits.append(f"{path_str}:{i}:{line[:200]}")
+                    if len(hits) >= limit:
+                        truncated = True
+                        break
+            if truncated:
+                break
+        if truncated:
+            break
+
+    if not hits:
+        return "(no matches)"
+    body = "\n".join(hits)
+    if truncated:
+        body += f"\n[truncated limit={limit}]"
+    return body
