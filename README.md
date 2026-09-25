@@ -66,13 +66,15 @@ cp config/.env.example config/.env   # 填 LLM_API_KEY 与 EMBEDDING_API_KEY
 pytest tests/
 ```
 
+评测口径见 [docs/eval.md](docs/eval.md)。
+
 ## 启动
 
 ```bash
 python -m server
 ```
 
-默认 127.0.0.1:8000。首次启动会拉起 AIO Sandbox 容器（镜像约 2.29GB）。`LAB_AUTOSTART_SANDBOX=false` 可禁用。
+默认 127.0.0.1:8000。首次启动会拉起 AIO Sandbox 容器（镜像约 2.29GB），进程退出时 `docker stop` 该容器。`LAB_AUTOSTART_SANDBOX=false` 可禁用自启，退出时也不会停容器。
 
 ## Web 操作
 

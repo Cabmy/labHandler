@@ -6,6 +6,7 @@ LabRunner 只负责入口、取消和 AgentSpec。本模块拿一份 LabState �
 
 import hashlib
 import json
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -23,22 +24,22 @@ from runtime.context.notes import (
     write_long_note,
 )
 from runtime.lab.accept import AcceptResult, FAIL, NO_HARD_CRITERIA, TEST_INVALID, missing_gate
+from runtime.lab.effects import EffectLedger, default_probes
 from runtime.lab.helpers import (
     halt_of,
     partition,
     payload_of,
+    pin_assignment,
     render_progress,
     resume_spec,
     worst_gate,
 )
 from runtime.lab.ingest import ingest
+from runtime.lab.journal import Journal, JournalState
 from runtime.lab.persist import (
-    EffectLedger,
     CATALOG_FILE,
     SPEC_FILE,
-    load_checkpoint,
     read_text,
-    save_checkpoint,
     save_tree,
     write_text,
 )
@@ -78,7 +79,12 @@ _MAX_GATE_RUNS = 3
 
 @dataclass
 class LabState:
-    """一次 run 的可变状态。阶段函数只改这里，不往 runner 回塞局部变量。"""
+    """一次 run 的可变状态，JOURNAL.jsonl 的投影。
+
+    阶段函数只改这里，不往 runner 回塞局部变量。每个可变字段在变更的同时
+    写一条 journal 事件，崩溃后 replay 即可重建到断点；树快照（STATE.json）
+    只在树结构变化时经 flush_tree 落盘。
+    """
 
     runner: Any
     question: str
@@ -87,6 +93,7 @@ class LabState:
     on_event: EventSink | None
     resume: bool
     root: RuntimeTask
+    journal: Journal
     ledger: EffectLedger
     catalog: str
     progress: list[tuple[str, str]] = field(default_factory=list)
@@ -104,6 +111,54 @@ class LabState:
     dispatch_step: int = 0
     stage: str = "remember"
     resume_announced: bool = False
+    # step 内断点标记：replay 自 journal，续跑时决定从哪个子阶段进入。
+    step_dispatch: dict[int, dict[str, Any]] = field(default_factory=dict)
+    step_briefs: dict[int, dict[str, dict[str, Any]]
+                      ] = field(default_factory=dict)
+    step_judges: dict[int, str] = field(default_factory=dict)
+
+    def flush_tree(self) -> None:
+        save_tree(self.session_dir, self.tree)
+
+    def _journal_stage(self) -> None:
+        self.journal.append(
+            "stage",
+            {
+                "stage": self.stage,
+                "dispatch_step": self.dispatch_step,
+                "skill": getattr(self.runner._skill, "name", None) or "",
+            },
+        )
+
+    def set_stage(self, stage: str) -> None:
+        self.stage = stage
+        self._journal_stage()
+
+    def set_step(self, step: int) -> None:
+        """dispatch_step 只记已完成的步数，advance 每收尾一步调一次。"""
+        self.dispatch_step = step
+        self._journal_stage()
+
+    def add_progress(self, aid: str, text: str) -> None:
+        self.progress.append((aid, text))
+        self.journal.append("progress", {"aid": aid, "text": text})
+
+    def set_halt(self, halt: dict[str, Any]) -> None:
+        self.halt = halt
+        self.journal.append("halt", halt)
+
+    def set_run_gate(self, gate: AcceptResult) -> None:
+        self.run_gate = gate
+        self.journal.append(
+            "run_gate",
+            {
+                "state": gate.state,
+                "passed": gate.passed,
+                "failed": gate.failed,
+                "exit_code": gate.exit_code,
+                "log": gate.log,
+            },
+        )
 
     def record_gate(self, gate_id: str, state: str) -> None:
         """记下某个 assignment 的门禁结论；test_invalid 累计到上限就标为跑不起来。"""
@@ -111,15 +166,25 @@ class LabState:
         if state != TEST_INVALID:
             self.gate_tries.pop(gate_id, None)
             self.broken_gates.discard(gate_id)
-            return
-        tries = self.gate_tries.get(gate_id, 0) + 1
-        self.gate_tries[gate_id] = tries
-        if tries >= _MAX_GATE_RUNS:
-            self.broken_gates.add(gate_id)
+        else:
+            tries = self.gate_tries.get(gate_id, 0) + 1
+            self.gate_tries[gate_id] = tries
+            if tries >= _MAX_GATE_RUNS:
+                self.broken_gates.add(gate_id)
+        self.journal.append(
+            "gate",
+            {
+                "gate_id": gate_id,
+                "state": state,
+                "tries": self.gate_tries.get(gate_id),
+                "broken": gate_id in self.broken_gates,
+            },
+        )
 
     def gate_unrunnable(self) -> bool:
         """所有 test_invalid 的门禁都已判定跑不起来：不该再拦 finish。"""
-        stuck = {gid for gid, state in self.gates.items() if state == TEST_INVALID}
+        stuck = {gid for gid, state in self.gates.items() if state ==
+                 TEST_INVALID}
         return bool(stuck) and stuck <= self.broken_gates
 
     async def emit(self, payload: dict[str, Any]) -> None:
@@ -136,20 +201,28 @@ class LabState:
             reason.strip()
             or "Sandbox unreachable after 3 consecutive MCP failures."
         )
+        self.journal.append("sandbox_down", {"reason": self.sandbox_down})
         await self.emit(
             {
                 "kind": "error",
                 "detail": f"沙箱不可达，本场 lab 结束：{self.sandbox_down[:800]}",
             }
         )
-        self.stage = "summary"
-        self.persist()
+        self.set_stage("summary")
 
     def take_halt(self, submit: dict[str, Any] | None) -> dict[str, Any] | None:
         found = halt_of(submit)
         if found:
-            self.halt = found
+            self.set_halt(found)
         return found
+
+    def has_step_markers(self, step: int) -> bool:
+        """某一步是否已有 journal 标记：有说明上次崩在这一步内部。"""
+        return (
+            step in self.step_dispatch
+            or step in self.step_briefs
+            or step in self.step_judges
+        )
 
     def remember_block(self) -> str:
         rules = self.runner._applied_rules or []
@@ -157,62 +230,16 @@ class LabState:
             return "（本 lab 没有适用的 /remember 规则）"
         return "\n".join(f"{i}. {r}" for i, r in enumerate(rules))
 
-    def persist(self) -> None:
-        """把 Pro 对话和阶段进度写到 CHECKPOINT.json，并刷新任务树。"""
-        save_checkpoint(
-            self.session_dir,
-            {
-                "v": 1,
-                "question": self.question,
-                "pro_history": drop_dangling_tool_calls(list(self.pro_history)),
-                "progress": [list(row) for row in self.progress],
-                "executed_ids": sorted(self.executed_ids),
-                "gates": dict(self.gates),
-                "gate_tries": dict(self.gate_tries),
-                "broken_gates": sorted(self.broken_gates),
-                "run_gate": {
-                    "state": self.run_gate.state,
-                    "passed": self.run_gate.passed,
-                    "failed": self.run_gate.failed,
-                    "exit_code": self.run_gate.exit_code,
-                    "log": self.run_gate.log,
-                },
-                "halt": self.halt,
-                "sandbox_down": self.sandbox_down,
-                "skill": getattr(self.runner._skill, "name", None),
-                "dispatch_step": self.dispatch_step,
-                "stage": self.stage,
-            },
-        )
-        save_tree(self.session_dir, self.tree)
-
-    def restore(self, payload: dict[str, Any]) -> None:
-        history = payload.get("pro_history")
-        if isinstance(history, list):
-            self.pro_history = drop_dangling_tool_calls(
-                [m for m in history if isinstance(m, dict)]
-            )
-        progress = payload.get("progress")
-        if isinstance(progress, list):
-            self.progress = [
-                (str(row[0]), str(row[1]))
-                for row in progress
-                if isinstance(row, (list, tuple)) and len(row) >= 2
-            ]
-        ids = payload.get("executed_ids")
-        if isinstance(ids, list):
-            self.executed_ids = {str(x) for x in ids if x}
-        gates = payload.get("gates")
-        if isinstance(gates, dict):
-            self.gates = {str(k): str(v) for k, v in gates.items()}
-        tries = payload.get("gate_tries")
-        if isinstance(tries, dict):
-            self.gate_tries = {str(k): int(v) for k, v in tries.items()}
-        broken = payload.get("broken_gates")
-        if isinstance(broken, list):
-            self.broken_gates = {str(x) for x in broken}
-        gate = payload.get("run_gate")
-        if isinstance(gate, dict) and gate.get("state"):
+    def restore(self, state: JournalState) -> None:
+        """把 replay 结果注入内存，并校准 transcript 的增量落盘起点。"""
+        self.pro_history = state.transcript
+        self.progress = state.progress
+        self.executed_ids = state.executed_ids
+        self.gates = state.gates
+        self.gate_tries = state.gate_tries
+        self.broken_gates = state.broken_gates
+        if state.run_gate:
+            gate = state.run_gate
             self.run_gate = AcceptResult(
                 state=str(gate.get("state") or NO_HARD_CRITERIA),
                 passed=int(gate.get("passed") or 0),
@@ -220,17 +247,16 @@ class LabState:
                 exit_code=int(gate.get("exit_code") or 0),
                 log=str(gate.get("log") or ""),
             )
-        halt = payload.get("halt")
-        if isinstance(halt, dict) and str(halt.get("reason") or "").strip():
-            self.halt = halt
-        self.sandbox_down = str(payload.get("sandbox_down") or "")
-        self.dispatch_step = int(payload.get("dispatch_step") or 0)
-        stage = str(payload.get("stage") or "")
-        if stage in {"remember", "spec", "advance", "summary"}:
-            self.stage = stage
-        skill = str(payload.get("skill") or "").strip()
-        if skill:
-            self.runner._skill.name = skill
+        self.halt = state.halt
+        self.sandbox_down = state.sandbox_down
+        self.dispatch_step = state.dispatch_step
+        self.stage = state.stage
+        self.step_dispatch = state.step_dispatch
+        self.step_briefs = state.step_briefs
+        self.step_judges = state.step_judges
+        if state.skill:
+            self.runner._skill.name = state.skill
+        self.journal.sync_tx(len(self.pro_history))
 
     async def drive_pro(self, kind: TaskKind, user: str, label: str) -> dict[str, Any]:
         """跑一拍 Pro。只读主线并入同一条 transcript，并在尾部追加 phase_control。"""
@@ -239,9 +265,15 @@ class LabState:
         permission = phase.node_permission()
         if phase.shares_thread:
             _seed_pro_thread(self)
-            incoming = [*self.pro_history, phase_control_message(kind)]
+            tail = [phase_control_message(kind)]
             if user:
-                incoming.append({"role": "user", "content": user})
+                tail.append({"role": "user", "content": user})
+            # 续传去重：上次崩在本拍中途时，这批指令已随 transcript 落盘，
+            # 再追加一遍只会让 Pro 读到两遍同样的指令。
+            if self.pro_history[-len(tail):] == tail:
+                incoming = list(self.pro_history)
+            else:
+                incoming = [*self.pro_history, *tail]
             user_input = ""
             project_spec = read_text(self.session_dir, SPEC_FILE)
         else:
@@ -286,6 +318,9 @@ class LabState:
                 on_event=self.on_event,
                 tracer=runner.tracer,
                 clock=runner.clock,
+                transcript_sink=(
+                    self.journal.append_transcript if phase.shares_thread else None
+                ),
             )
         finally:
             if span_cm is not None:
@@ -300,7 +335,8 @@ class LabState:
             await self.mark_sandbox_down(str((result.brief or {}).get("brief") or ""))
 
         payload = _submit_payload(result.submit)
-        append_forget(self.session_dir, str(payload.get("forget_append") or ""))
+        append_forget(self.session_dir, str(
+            payload.get("forget_append") or ""))
         notes_touched = _notes_touched(payload)
         apply_notes(
             self.session_dir,
@@ -310,7 +346,8 @@ class LabState:
         )
         write_long_note(self.session_dir, payload.get("notes_write"))
         if phase.shares_thread and notes_touched:
-            _append_state(self, "notes_changed", _notes_snapshot(self.session_dir))
+            _append_state(self, "notes_changed",
+                          _notes_snapshot(self.session_dir))
 
         if result.submit:
             child.transit(TaskStatus.COMPLETED)
@@ -320,7 +357,7 @@ class LabState:
                 child.transit(TaskStatus.FAILED)
             except ValueError:
                 pass
-        self.persist()
+        self.flush_tree()
         return result.submit or {}
 
 
@@ -340,7 +377,10 @@ def _seed_pro_thread(st: LabState) -> None:
 
 
 def _append_state(st: LabState, kind: str, body: str) -> None:
-    st.pro_history.append({"role": "user", "content": render_state_update(kind, body)})
+    st.pro_history.append(
+        {"role": "user", "content": render_state_update(kind, body)})
+    # 追加即落盘：这条状态消息不该依赖下一次 drive 的 flush 才能活下来。
+    st.journal.append_transcript(st.pro_history, False)
 
 
 def _notes_touched(payload: dict[str, Any]) -> bool:
@@ -401,13 +441,23 @@ async def _begin(
     runner._applied_rules = None
     runner._skill = SkillBind()
     root = tree.get(tree.root_id)
-    ckpt = load_checkpoint(session_dir) if resume else None
-    if resume and ckpt and str(ckpt.get("question") or "").strip():
-        question = str(ckpt["question"])
+    journal = Journal.open(session_dir)
+    state = journal.replay() if resume else None
+    if state and state.question.strip():
+        question = state.question
+    if state is None or not state.question.strip():
+        journal.append("begin", {"question": question})
     if resume and root.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
         root.transit(TaskStatus.RUNNING)
     elif root.status is TaskStatus.PENDING:
         root.transit(TaskStatus.RUNNING)
+    # 崩溃时在途的非 root 节点永远等不到结果了：标 CANCELLED，树才反映真实状态。
+    for node in tree.nodes.values():
+        if node.task_id != tree.root_id and node.status is TaskStatus.RUNNING:
+            try:
+                node.transit(TaskStatus.CANCELLED)
+            except ValueError:
+                pass
     save_tree(session_dir, tree)
 
     reset_sandbox_failure_counter()
@@ -415,7 +465,12 @@ async def _begin(
         await reconcile_index(runner.llm, runner.settings)
     except Exception:
         pass
-    ledger = EffectLedger.load(session_dir, runner.settings.workspace_dir)
+    ledger = EffectLedger(
+        default_probes(),
+        journal,
+        runner.settings.workspace_dir,
+        entries=state.effects if state else None,
+    )
     catalog = read_text(session_dir, CATALOG_FILE) or await ingest(runner.settings, session_dir)
     st = LabState(
         runner=runner,
@@ -425,11 +480,12 @@ async def _begin(
         on_event=on_event,
         resume=resume,
         root=root,
+        journal=journal,
         ledger=ledger,
         catalog=catalog,
     )
-    if resume and ckpt:
-        st.restore(ckpt)
+    if state:
+        st.restore(state)
         await st.emit(
             {
                 "kind": "resume_skip",
@@ -441,6 +497,10 @@ async def _begin(
 
 
 async def remember(st: LabState) -> None:
+    if os.getenv("EVAL_DISABLE_REMEMBER") == "1":
+        st.runner._applied_rules = []
+        save_applied(st.session_dir, [])
+        return
     catalog = catalog_rules(load_profile())
     if st.resume:
         existing = load_applied(st.session_dir)
@@ -472,11 +532,12 @@ async def remember(st: LabState) -> None:
         st.runner._applied_rules = []
         save_applied(st.session_dir, [])
         await st.emit(
-            {"kind": "node_done", "node": "remember_judge", "log": [{"halted": True}]}
+            {"kind": "node_done", "node": "remember_judge",
+                "log": [{"halted": True}]}
         )
         await st.emit_halt(found)
-        st.stage = "summary"
-        st.persist()
+        st.set_stage("summary")
+        st.flush_tree()
         return
     st.runner._applied_rules = applied_from_payload(
         catalog, payload_of(submit, SUBMIT_REMEMBER)
@@ -489,8 +550,8 @@ async def remember(st: LabState) -> None:
             "log": [{"applicable": len(st.runner._applied_rules)}],
         }
     )
-    st.stage = "spec"
-    st.persist()
+    st.set_stage("spec")
+    st.flush_tree()
 
 
 async def write_spec(st: LabState) -> dict[str, Any] | None:
@@ -513,8 +574,8 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
         _append_state(st, "spec_created", _spec_state_body(rendered))
         await _mark_resumable(st)
         if st.stage == "remember":
-            st.stage = "advance"
-        st.persist()
+            st.set_stage("advance")
+        st.flush_tree()
         return None
 
     await st.emit({"kind": "node_start", "node": "spec"})
@@ -522,12 +583,12 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
     found = st.take_halt(submit)
     if found:
         await st.emit_halt(found)
-        st.stage = "summary"
-        st.persist()
+        st.set_stage("summary")
+        st.flush_tree()
         return None
     if st.sandbox_down:
-        st.stage = "summary"
-        st.persist()
+        st.set_stage("summary")
+        st.flush_tree()
         return None
 
     project = ProjectSpec.from_payload(payload_of(submit, SUBMIT_SPEC))
@@ -537,7 +598,7 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
             st.root.transit(TaskStatus.FAILED)
         except ValueError:
             pass
-        st.persist()
+        st.flush_tree()
         return {
             "verdict": "spec_failed",
             "summary": "",
@@ -545,52 +606,59 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
             "question": st.question,
         }
     await st.emit(
-        {"kind": "node_done", "node": "spec", "log": [{"milestones": len(project.milestones)}]}
+        {"kind": "node_done", "node": "spec", "log": [
+            {"milestones": len(project.milestones)}]}
     )
     write_text(st.session_dir, SPEC_FILE, project.render())
     _append_state(st, "spec_created", _spec_state_body(project.render()))
     await _mark_resumable(st)
-    st.stage = "advance"
-    st.persist()
+    st.set_stage("advance")
+    st.flush_tree()
     return None
 
 
 async def _mark_resumable(st: LabState) -> None:
     if not st.resume or st.halt or st.sandbox_down:
         return
-    st.resumable = {aid for aid in st.ledger.entries if st.ledger.satisfied(aid)}
+    st.resumable = {
+        aid for aid in st.ledger.entries if st.ledger.satisfied(aid)}
     have = {aid for aid, _ in st.progress}
     for aid in sorted(st.resumable):
         if aid in have:
             continue
-        st.progress.append((aid, "（续跑：产物已存在且未被改动，跳过重跑）"))
+        st.add_progress(aid, "（续跑：产物已存在且未被改动，跳过重跑）")
     if st.resumable:
         await st.emit({"kind": "resume_skip", "assignments": sorted(st.resumable)})
 
 
 async def advance(st: LabState) -> dict[str, Any] | None:
-    """逐步派发。用户停止则暂停（root 仍 RUNNING）；halt / 沙箱不可达 / 收工则落到 Summary。"""
+    """逐步派发。用户停止则暂停（root 仍 RUNNING）；halt / 沙箱不可达 / 收工则落到 Summary。
+
+    dispatch_step 记的是已完成的步数。续跑时若下一步已有 journal 标记，说明
+    上次崩在那一步内部，先按标记把它续完，再进主循环。
+    """
     if st.halt or st.sandbox_down or st.stage == "summary":
         return None
 
-    step = st.dispatch_step
     revisions = 0
     gate_nudge = ""
-    while step < _MAX_STEPS and not st.halt and not st.sandbox_down:
+    pending = st.dispatch_step + \
+        1 if st.has_step_markers(st.dispatch_step + 1) else 0
+    while st.dispatch_step < _MAX_STEPS and not st.halt and not st.sandbox_down:
         if st.runner._cancelled():
-            st.stage = "advance"
-            st.dispatch_step = step
-            st.persist()
+            st.set_stage("advance")
+            st.flush_tree()
             return {"verdict": "paused", "summary": "", "question": st.question}
 
-        step += 1
-        signal, gate_nudge, revisions = await _one_step(st, step, gate_nudge, revisions)
-        st.dispatch_step = step
+        step = st.dispatch_step + 1
+        if step == pending:
+            signal, gate_nudge, revisions = await _resume_step(st, step, gate_nudge, revisions)
+        else:
+            signal, gate_nudge, revisions = await _one_step(st, step, gate_nudge, revisions)
+        st.set_step(step)
         if signal == "break":
-            st.stage = "summary"
-            st.persist()
+            st.set_stage("summary")
             break
-        st.persist()
     return None
 
 
@@ -598,6 +666,58 @@ async def _one_step(
     st: LabState, step: int, gate_nudge: str, revisions: int
 ) -> tuple[str, str, int]:
     """跑一步：dispatch → workers → judge。返回 (break|continue, 下一步 nudge, revisions)。"""
+    dispatch, assignments, replay, signal, gate_nudge = await _dispatch_phase(
+        st, step, gate_nudge
+    )
+    if dispatch is None:
+        return signal, gate_nudge, revisions
+    return await _execute_and_judge(
+        st, step, dispatch, assignments, replay, [], gate_nudge, revisions
+    )
+
+
+async def _resume_step(
+    st: LabState, step: int, gate_nudge: str, revisions: int
+) -> tuple[str, str, int]:
+    """把崩在内部的某一步续完：按 journal 标记跳过已完成的子阶段。"""
+    marker = st.step_dispatch.get(step)
+    if marker is None:
+        # dispatch 未提交：重跑整步，dispatch drive 本身是 transcript 级续传。
+        return await _one_step(st, step, gate_nudge, revisions)
+    dispatch = Dispatch.from_payload(marker.get("payload") or {})
+    run_ids = {str(x) for x in marker.get("run") or []}
+    replay_ids = {str(x) for x in marker.get("replay") or []}
+    pinned = [pin_assignment(a, step, i)
+              for i, a in enumerate(dispatch.assignments)]
+    done = st.step_briefs.get(step, {})
+    done_briefs = [done[a.id] for a in pinned if a.id in done]
+    decision = st.step_judges.get(step)
+    if decision is not None:
+        # judge 已提交：复用 decision，分支里的 drive 仍是 transcript 级续传。
+        assignments = [
+            a for a in pinned if a.id in run_ids or a.id in replay_ids]
+        return await _apply_decision(
+            st, decision, dispatch, done_briefs, assignments, step, False,
+            gate_nudge, revisions,
+        )
+    assignments = [a for a in pinned if a.id in run_ids and a.id not in done]
+    replay = [a for a in pinned if a.id in replay_ids and a.id not in done]
+    if done:
+        await st.emit({"kind": "resume_skip", "assignments": sorted(done)})
+    return await _execute_and_judge(
+        st, step, dispatch, assignments, replay, done_briefs, gate_nudge, revisions
+    )
+
+
+async def _dispatch_phase(
+    st: LabState, step: int, gate_nudge: str
+) -> tuple[Dispatch | None, list, list, str, str]:
+    """dispatch drive + 校验 + partition。
+
+    返回的 dispatch 为 None 表示本步到此为止（break，或带 nudge 的 continue）。
+    partition 通过即写 dispatch 提交标记：之后崩了，续跑从 workers 接着走，
+    不再重发 dispatch。
+    """
     dispatch_user = (
         f"## 已完成的步骤\n{render_progress(st.progress)}\n\n"
         f"这是第 {step} 步（最多 {_MAX_STEPS} 步）。决定接下来这一步做什么，调用 submit_dispatch。"
@@ -642,9 +762,9 @@ async def _one_step(
     found = st.take_halt(submit)
     if found:
         await st.emit_halt(found)
-        return "break", gate_nudge, revisions
+        return None, [], [], "break", gate_nudge
     if st.sandbox_down:
-        return "break", gate_nudge, revisions
+        return None, [], [], "break", gate_nudge
     if not submit or submit.get("name") != SUBMIT_DISPATCH:
         await st.emit(
             {
@@ -652,8 +772,9 @@ async def _one_step(
                 "detail": "Pro 未能产出有效派发（校验失败或步数耗尽），未启动 worker",
             }
         )
-        return "break", gate_nudge, revisions
-    dispatch = Dispatch.from_payload(payload_of(submit, SUBMIT_DISPATCH))
+        return None, [], [], "break", gate_nudge
+    payload = payload_of(submit, SUBMIT_DISPATCH)
+    dispatch = Dispatch.from_payload(payload)
 
     if dispatch.is_empty:
         if st.run_gate.state in {FAIL, TEST_INVALID} and not st.gate_unrunnable():
@@ -663,20 +784,23 @@ async def _one_step(
                 "same product id to fix fail."
             )
             await st.emit(
-                {"kind": "node_done", "node": f"dispatch:{step}", "log": [{"rejected": msg[:400]}]}
+                {"kind": "node_done", "node": f"dispatch:{step}",
+                    "log": [{"rejected": msg[:400]}]}
             )
-            return "continue", msg, revisions
+            return None, [], [], "continue", msg
         await st.emit(
-            {"kind": "node_done", "node": f"dispatch:{step}", "log": [{"assignments": 0}]}
+            {"kind": "node_done", "node": f"dispatch:{step}",
+                "log": [{"assignments": 0}]}
         )
-        return "break", gate_nudge, revisions
+        return None, [], [], "break", gate_nudge
 
     gap = missing_gate(st.session_dir, dispatch.assignments)
     if gap:
         await st.emit(
-            {"kind": "node_done", "node": f"dispatch:{step}", "log": [{"rejected": gap[:400]}]}
+            {"kind": "node_done", "node": f"dispatch:{step}",
+                "log": [{"rejected": gap[:400]}]}
         )
-        return "continue", gap, revisions
+        return None, [], [], "continue", gap
 
     assignments, skipped, replay = partition(
         dispatch.assignments,
@@ -705,27 +829,61 @@ async def _one_step(
     if not assignments and not replay:
         if skipped and st.gate_unrunnable():
             return (
+                None, [], [],
                 "continue",
                 f"assignment id(s) {skipped} already ran and their gate cannot run in this "
                 "sandbox. There is no more Flash work: submit_dispatch with empty assignments.",
-                revisions,
             )
         if skipped:
             return (
+                None, [], [],
                 "continue",
                 f"assignment id(s) {skipped} already ran this lab (gate={st.run_gate.state}). "
                 "If the product is done, submit_dispatch with empty assignments. "
                 "If gate is test_invalid, write_acceptance then resubmit the same id (no new Flash). "
                 "If gate is fail, resubmit the same id to re-run Flash.",
-                revisions,
             )
-        return "continue", gate_nudge, revisions
+        return None, [], [], "continue", gate_nudge
 
-    briefs: list[dict[str, Any]] = []
+    # 提交点：之后的崩溃从这里续跑，不再重发 dispatch。
+    st.journal.append(
+        "dispatch",
+        {
+            "step": step,
+            "payload": payload,
+            "run": [a.id for a in assignments],
+            "replay": [a.id for a in replay],
+            "skipped": skipped,
+        },
+    )
+    st.journal.append("executed", {"ids": sorted(st.executed_ids)})
+    return dispatch, assignments, replay, "", gate_nudge
+
+
+async def _execute_and_judge(
+    st: LabState,
+    step: int,
+    dispatch: Dispatch,
+    assignments: list,
+    replay: list,
+    done_briefs: list[dict[str, Any]],
+    gate_nudge: str,
+    revisions: int,
+) -> tuple[str, str, int]:
+    """dispatch 提交之后：补跑缺失的 worker / 重跑门禁，然后 judge。
+
+    done_briefs 是续跑时从 journal 还原的已完成 worker brief，直接并入
+    judge 的输入，不重跑。
+    """
+    briefs: list[dict[str, Any]] = list(done_briefs)
     spec_invalid = False
-    step_gates: list[AcceptResult] = []
+    step_gates: list[AcceptResult] = [
+        AcceptResult(state=str((b.get("tests") or {}).get(
+            "state") or NO_HARD_CRITERIA))
+        for b in done_briefs
+    ]
     if assignments:
-        briefs, spec_invalid, wave_gate, step_halt = await run_step(
+        new_briefs, spec_invalid, wave_gate, step_halt = await run_step(
             st.runner,
             assignments,
             question=st.question,
@@ -735,25 +893,26 @@ async def _one_step(
             root=st.root,
             ledger=st.ledger,
             progress=st.progress,
+            on_progress=st.add_progress,
+            journal=st.journal,
+            step=step,
+            on_gate=st.record_gate,
             on_event=st.on_event,
         )
         if step_halt:
-            st.halt = step_halt
+            st.set_halt(step_halt)
             return "break", gate_nudge, revisions
         step_gates.append(wave_gate)
-        for a, brief in zip(assignments, briefs):
-            state = str((brief.get("tests") or {}).get("state") or "")
-            if state:
-                st.record_gate(a.gate_id, state)
-        if any(b.get("sandbox_unreachable") for b in briefs):
+        briefs += new_briefs
+        if any(b.get("sandbox_unreachable") for b in new_briefs):
             reason = next(
-                (str(b.get("brief") or "") for b in briefs if b.get("sandbox_unreachable")),
+                (str(b.get("brief") or "")
+                 for b in new_briefs if b.get("sandbox_unreachable")),
                 "",
             )
             await st.mark_sandbox_down(reason)
             return "break", gate_nudge, revisions
-        st.persist()
-        if any(b.get("takeover") for b in briefs):
+        if any(b.get("takeover") for b in new_briefs):
             await _takeover(
                 st, dispatch, briefs, assignments or replay, step, reason="validation_exhausted"
             )
@@ -761,21 +920,40 @@ async def _one_step(
                 return "break", gate_nudge, revisions
             return "continue", gate_nudge, revisions
     if replay:
-        extra, extra_gate = await _replay_gates(st, replay)
+        extra, extra_gate = await _replay_gates(st, replay, step)
         briefs = briefs + extra
         step_gates.append(extra_gate)
         if st.sandbox_down:
             return "break", gate_nudge, revisions
     last_gate = worst_gate(step_gates)
-    st.run_gate = last_gate
+    st.set_run_gate(last_gate)
 
     decision = await _judge(st, dispatch, briefs, last_gate)
     if st.halt or st.sandbox_down:
         return "break", gate_nudge, revisions
+    st.journal.append("judge", {"step": step, "decision": decision})
+    return await _apply_decision(
+        st, decision, dispatch, briefs, assignments or replay, step,
+        spec_invalid, gate_nudge, revisions,
+    )
+
+
+async def _apply_decision(
+    st: LabState,
+    decision: str,
+    dispatch: Dispatch,
+    briefs: list[dict[str, Any]],
+    assignments: list,
+    step: int,
+    spec_invalid: bool,
+    gate_nudge: str,
+    revisions: int,
+) -> tuple[str, str, int]:
+    """judge 之后的分支：finish 收工、takeover 接管、revise_spec 改 SPEC。"""
     if decision == "finish":
         return "break", gate_nudge, revisions
     if decision == "takeover":
-        await _takeover(st, dispatch, briefs, assignments or replay, step, reason="judge")
+        await _takeover(st, dispatch, briefs, assignments, step, reason="judge")
         if st.halt or st.sandbox_down:
             return "break", gate_nudge, revisions
         return "continue", gate_nudge, revisions
@@ -787,7 +965,7 @@ async def _one_step(
 
 
 async def _replay_gates(
-    st: LabState, replay: list
+    st: LabState, replay: list, step: int
 ) -> tuple[list[dict[str, Any]], AcceptResult]:
     """同一产品本 run 已派过 Flash，且门禁是 test_invalid：只重跑 pytest。"""
     gates: list[AcceptResult] = []
@@ -807,7 +985,8 @@ async def _replay_gates(
             "tests": gate.as_tests(),
         }
         briefs.append(brief)
-        st.progress.append((a.id, str(brief["brief"])))
+        st.journal.append("brief", {"step": step, "aid": a.id, "brief": brief})
+        st.add_progress(a.id, str(brief["brief"]))
         await st.emit(
             {
                 "kind": "worker_brief",
@@ -836,7 +1015,8 @@ def _gate_line(st: LabState) -> str:
     overall = _summary_gate(st).state
     if not st.gates:
         return overall
-    detail = ", ".join(f"{gid}={state}" for gid, state in sorted(st.gates.items()))
+    detail = ", ".join(f"{gid}={state}" for gid,
+                       state in sorted(st.gates.items()))
     return f"{overall}（{detail}）"
 
 
@@ -926,7 +1106,8 @@ async def _takeover(
     *,
     reason: str = "judge",
 ) -> None:
-    st.runner._trace_event(S.EV_HANDOFF, **{S.ATTR_FROM: "flash", S.ATTR_TO: "pro"})
+    st.runner._trace_event(
+        S.EV_HANDOFF, **{S.ATTR_FROM: "flash", S.ATTR_TO: "pro"})
     await st.emit({"kind": "pro_takeover", "reason": reason})
     cause = (
         "Flash exhausted schema validation; finish the step yourself."
@@ -950,7 +1131,7 @@ async def _takeover(
         return
     payload = payload_of(take, SUBMIT_BRIEF)
     if payload.get("brief"):
-        st.progress.append((f"step{step}-pro", str(payload["brief"])))
+        st.add_progress(f"step{step}-pro", str(payload["brief"]))
         for a in assignments:
             last_gate = await evaluate_gate(st.runner, st.session_dir, a.gate_id)
             if is_sandbox_unreachable(last_gate.log):
@@ -959,7 +1140,7 @@ async def _takeover(
             if not last_gate.is_pass:
                 break
     else:
-        st.progress.append((f"step{step}-pro", "Pro 接管未完成本步，该工作仍然待办"))
+        st.add_progress(f"step{step}-pro", "Pro 接管未完成本步，该工作仍然待办")
 
 
 async def _revise_spec(

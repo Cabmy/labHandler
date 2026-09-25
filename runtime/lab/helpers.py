@@ -31,6 +31,12 @@ def payload_of(submit: dict[str, Any], name: str) -> dict[str, Any]:
     return submit.get("payload", {}) if submit["name"] == name else {}
 
 
+def pin_assignment(a: Assignment, step: int, index: int) -> Assignment:
+    """派发提交点把空 id / acceptance_id 钉死。续跑重建 partition 结果时用同一套规则。"""
+    original = a.id or f"s{step}_{index}"
+    return replace(a, id=original, acceptance_id=a.gate_id or original)
+
+
 def partition(
     assignments: list[Assignment],
     resumable: set[str],
@@ -52,9 +58,9 @@ def partition(
     skipped: list[str] = []
     replay: list[Assignment] = []
     for i, a in enumerate(assignments):
-        original = a.id or f"s{step}_{i}"
-        gate_id = a.gate_id or original
-        pinned = replace(a, id=original, acceptance_id=gate_id)
+        pinned = pin_assignment(a, step, i)
+        original = pinned.id
+        gate_id = pinned.gate_id
         if original in resumable:
             resumable.discard(original)
             skipped.append(original)
@@ -100,7 +106,8 @@ def worst_gate(results: Iterable[AcceptResult]) -> AcceptResult:
 def step_gate(results: list[tuple[RuntimeTask, dict[str, Any]]]) -> AcceptResult:
     """整步的门禁结论。与 run 级同一套序，避免两处各自定义「整体门禁」。"""
     return worst_gate(
-        AcceptResult(state=str((brief.get("tests") or {}).get("state") or NO_HARD_CRITERIA))
+        AcceptResult(state=str((brief.get("tests") or {}).get(
+            "state") or NO_HARD_CRITERIA))
         for _, brief in results
     )
 
@@ -111,7 +118,8 @@ def resume_spec(tree: TaskTree) -> ProjectSpec | None:
         if task.kind is not TaskKind.SPEC or task.status is not TaskStatus.COMPLETED:
             continue
         brief = task.brief or {}
-        payload = brief.get("payload") if brief.get("name") == SUBMIT_SPEC else brief
+        payload = brief.get("payload") if brief.get(
+            "name") == SUBMIT_SPEC else brief
         if payload and payload.get("goal"):
             return ProjectSpec.from_payload(payload)
     return None

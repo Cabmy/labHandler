@@ -1,0 +1,5 @@
+id: remember_neg
+group: remember
+question: 按 GUIDE.md 写实验报告.md。这是报告题，编程题的文件名规则不适用。
+gold_applies: [0]
+forbid_applied: [1]

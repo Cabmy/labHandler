@@ -1,0 +1,5 @@
+id: pinned_lib
+group: delivery
+question: 按工作区 TASK.md 实现 vec.py 里的 scale_vec，签名保持原样。
+gold_applies: [1]
+signature: "def scale_vec"

@@ -1,0 +1,6 @@
+id: kv_ttl
+group: delivery
+question: 按工作区 TASK.md 实现带过期时间的 KV，不要改 storage.py。
+gold_applies: [1]
+frozen: storage.py
+signature: "def put_with_ttl"

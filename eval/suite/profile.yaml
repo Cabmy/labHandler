@@ -1,0 +1,8 @@
+identity:
+  name: 张鑫
+  student_id: 202112342
+preferences:
+  language: zh-CN
+  style_rules:
+    - 实验报告里的截图统一写成「（此处建议附 XX 截图）」占位，不要编造已经拍摄的截图。
+    - 编程题源文件按题目命名（如 two_sum.py），禁止 solution.py / main.py。

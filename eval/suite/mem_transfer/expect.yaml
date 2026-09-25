@@ -1,0 +1,13 @@
+id: mem_transfer
+group: memory
+question: 实现一个带过期时间的 KV：put_with_ttl(key, value, ttl_ms) 和 get(key)。不要改 storage.py。题面不补充覆盖写的语义。
+gold_applies: [1]
+frozen: storage.py
+signature: "def put_with_ttl"
+cards:
+  - type: lesson
+    task_type: coding
+    title: TTL 覆盖
+    content: |
+      put_with_ttl 覆盖已有键时必须改用本次调用的 ttl_ms。
+      键过期之后再次 put_with_ttl，get 立刻返回新值，不能继续把旧的过期时间套在新值上。

@@ -1,0 +1,9 @@
+id: compact_room
+group: compact
+question: 按工作区 TASK.md 实现 put_with_ttl(key, value, ttl_ms)。不要改 storage.py。
+gold_applies: [1]
+frozen: storage.py
+signature: "def put_with_ttl"
+budget: 200000
+reserve: 8192
+compact: absent

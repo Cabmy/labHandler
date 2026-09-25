@@ -95,7 +95,18 @@ def _annotate_ack_only(text: str) -> str:
     return text
 
 
+def pin_bash_cwd(cmd: str) -> str:
+    """沙箱进程的 cwd 不是挂载点，bash 一律从 /workspace 起。"""
+    body = (cmd or "").strip()
+    prefix = f"cd {_SANDBOX_WORKSPACE} && "
+    if not body:
+        return cmd
+    return body if body.startswith(prefix) else prefix + body
+
+
 async def call_sandbox(tool_name: str, **kwargs: Any) -> str:
+    if tool_name == "sandbox_execute_bash" and isinstance(kwargs.get("cmd"), str):
+        kwargs["cmd"] = pin_bash_cwd(kwargs["cmd"])
     _translate_kwargs(kwargs)
     try:
         result = await call_mcp_tool(tool_name, kwargs)

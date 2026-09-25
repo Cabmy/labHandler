@@ -1,6 +1,7 @@
 """参数解析、类型提示、schema 校验、oneshot 交卷。"""
 
 import json
+import os
 import re
 from typing import Any
 
@@ -215,8 +216,12 @@ def _validate_remember(payload: dict[str, Any]) -> str:
 def _validate_dispatch(payload: dict[str, Any]) -> str:
     """派发自洽性：写任务单独成波、测试不交给 Flash、id/领域不重叠、可测要有接口。"""
     assignments = payload.get("assignments") or []
-    if len(assignments) > MAX_ASSIGNMENTS:
-        return f"at most {MAX_ASSIGNMENTS} assignments per dispatch; split into more steps"
+    cap = MAX_ASSIGNMENTS
+    raw_cap = os.getenv("EVAL_MAX_ASSIGNMENTS", "").strip()
+    if raw_cap.isdigit():
+        cap = max(1, int(raw_cap))
+    if len(assignments) > cap:
+        return f"at most {cap} assignments per dispatch; split into more steps"
 
     ids = [str(a.get("id") or "") for a in assignments]
     if len(set(ids)) != len(ids):

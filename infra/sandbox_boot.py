@@ -8,6 +8,7 @@
 4. 未装 docker / docker 失败 -> 打印友好错误，不抛异常
    （后续由 mcp_client 给出一致报错）。
 5. 可关闭：LAB_AUTOSTART_SANDBOX=false 跳过整个流程（保留手动控制）。
+   自启打开时，进程退出由 stop_sandbox 执行 docker stop，不删除容器。
 6. 容器参数从 .env 读取：AIO_SANDBOX_IMAGE / AIO_SANDBOX_PORT / AIO_SANDBOX_MCP_URL。
 7. **workspace 绑定挂载**：host WORKSPACE_DIR -> 容器 /workspace（使
    sandbox_convert_to_markdown 等能直接读 PDF/DOCX）；无此挂载的旧容器
@@ -29,6 +30,23 @@ SANDBOX_WORKSPACE_MOUNT = "/workspace"  # 容器侧统一工作区目录
 
 def _docker_available() -> bool:
     return shutil.which("docker") is not None
+
+
+def _docker(args: list[str], log=print, *, missing_ok: bool = False) -> bool:
+    """跑一条 docker 子命令，容器名附在末尾。missing_ok 时容器不存在也算成功。"""
+    verb = " ".join(args)
+    try:
+        result = subprocess.run(
+            ["docker", *args, CONTAINER_NAME],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception as e:
+        log(f"[sandbox] docker {verb} 异常：{type(e).__name__}: {e}")
+        return False
+    if result.returncode == 0 or (missing_ok and "No such container" in (result.stderr or "")):
+        return True
+    log(f"[sandbox] docker {verb} 失败，stderr：{(result.stderr or '').strip()}")
+    return False
 
 
 def _container_state() -> str | None:
@@ -85,20 +103,6 @@ def _container_has_workspace_mount(host_workspace: Path) -> bool:
         return True
 
 
-def _docker_start(log=print) -> bool:
-    try:
-        r = subprocess.run(
-            ["docker", "start", CONTAINER_NAME],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode != 0:
-            log(f"[sandbox] docker start 失败，stderr：{(r.stderr or '').strip()}")
-        return r.returncode == 0
-    except Exception as e:
-        log(f"[sandbox] docker start 异常：{type(e).__name__}: {e}")
-        return False
-
-
 def _docker_run(image: str, port: int, host_workspace: Path, log=print) -> bool:
     """首次创建容器；本地无镜像时自动拉取（可能耗时几分钟）。
 
@@ -111,7 +115,7 @@ def _docker_run(image: str, port: int, host_workspace: Path, log=print) -> bool:
             [
                 "docker", "run", "-d", "--name", CONTAINER_NAME,
                 "--security-opt", "seccomp=unconfined", "--shm-size", "2g",
-                "-p", f"{port}:8080",
+                "-p", f"127.0.0.1:{port}:8080",
                 "-v", f"{host_workspace}:{SANDBOX_WORKSPACE_MOUNT}",
                 "-e", "DISABLE_JUPYTER=true", "-e", "DISABLE_CODE_SERVER=true",
                 image,
@@ -187,7 +191,7 @@ def ensure_sandbox(log=print) -> bool:
         log("[sandbox] 容器 running 但端口未通，等待健康检查...")
     elif state in {"exited", "created", "paused", "dead"}:
         log(f"[sandbox] 容器存在（{state}），尝试 docker start...")
-        if not _docker_start(log=log):
+        if not _docker(["start"], log):
             log("[sandbox] docker start 失败；请检查 `docker logs aio-sandbox`。")
             return False
     else:
@@ -210,23 +214,20 @@ def ensure_sandbox(log=print) -> bool:
     return False
 
 
-def _docker_rm(log=print) -> bool:
-    """docker rm -f aio-sandbox；容器不存在也视为成功。"""
-    try:
-        r = subprocess.run(
-            ["docker", "rm", "-f", CONTAINER_NAME],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode == 0:
-            return True
-        # 容器已不存在 -> 视为成功
-        if "No such container" in (r.stderr or ""):
-            return True
-        log(f"[sandbox] docker rm 失败，stderr：{(r.stderr or '').strip()}")
+def stop_sandbox(log=print) -> bool:
+    """关掉本进程负责的沙箱。手动模式、已停、不存在都不报错。"""
+    _settings, status = _check_prerequisites(log)
+    if status == "disabled":
+        return True
+    if status == "no_docker":
+        log("[sandbox] 未检测到 docker，跳过停止")
         return False
-    except Exception as e:
-        log(f"[sandbox] docker rm 异常：{type(e).__name__}: {e}")
+    if _container_state() != "running":
+        return True
+    if not _docker(["stop"], log, missing_ok=True):
         return False
+    log(f"[sandbox] {CONTAINER_NAME} 已停止")
+    return True
 
 
 def recreate_sandbox(log=print) -> bool:
@@ -235,7 +236,7 @@ def recreate_sandbox(log=print) -> bool:
     目的：`/done --clear` 不仅清 host workspace，还清容器内的
     pip 全局包 / /tmp / 长驻进程残留，使下一个任务从干净容器起步。
     """
-    settings, status = _check_prerequisites(log)
+    _settings, status = _check_prerequisites(log)
     if status == "disabled":
         log("[sandbox] LAB_AUTOSTART_SANDBOX=false，跳过重建（请手动 docker rm 后重启 cli）")
         return True
@@ -244,7 +245,7 @@ def recreate_sandbox(log=print) -> bool:
         return False
 
     if _container_state() is not None:
-        if _docker_rm(log=log):
+        if _docker(["rm", "-f"], log, missing_ok=True):
             log(f"[sandbox] {CONTAINER_NAME} 已删除")
         else:
             log(f"[sandbox] docker rm {CONTAINER_NAME} 失败；继续尝试重建")

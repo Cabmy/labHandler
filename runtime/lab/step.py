@@ -1,4 +1,8 @@
-"""一步内的 Flash 派发：组波、跑 worker、跑门禁。"""
+"""一步内的 Flash 派发：组波、跑 worker、跑门禁。
+
+worker 完成即把 brief 写进 journal，门禁结论经 on_gate 回调记帐：崩在波次
+中间时，已完成的 assignment 有据可查，续跑只需补跑缺失的那几个。
+"""
 
 import asyncio
 from collections.abc import Awaitable, Callable
@@ -6,9 +10,10 @@ from pathlib import Path
 from typing import Any
 
 from runtime.lab.accept import AcceptResult, NO_HARD_CRITERIA, PASS, TEST_INVALID, sanity_and_run
+from runtime.lab.effects import EffectLedger
 from runtime.lab.helpers import halt_of, step_gate
+from runtime.lab.journal import Journal
 from runtime.lab.persist import (
-    EffectLedger,
     SPEC_FILE,
     audit_offset,
     changed_files_from_audit,
@@ -65,6 +70,10 @@ async def run_step(
     root: RuntimeTask,
     ledger: EffectLedger,
     progress: list[tuple[str, str]],
+    on_progress: Callable[[str, str], None],
+    journal: Journal,
+    step: int,
+    on_gate: Callable[[str, str], None],
     on_event: EventSink | None,
 ) -> tuple[list[dict[str, Any]], bool, AcceptResult, dict[str, Any] | None]:
     permission = permission_for_wave(len(assignments))
@@ -112,6 +121,9 @@ async def run_step(
                 ledger=ledger,
                 done_so_far=done_so_far,
                 domains=domains,
+                journal=journal,
+                step=step,
+                on_gate=on_gate,
                 on_event=on_event,
             ),
             runner.settings,
@@ -134,7 +146,8 @@ async def run_step(
             continue
         if brief.get("outcome") == "spec_invalid":
             spec_invalid = True
-        progress.append((aid, str(brief.get("brief") or (found or {}).get("reason") or "")))
+        on_progress(aid, str(brief.get("brief") or (
+            found or {}).get("reason") or ""))
 
     return briefs, spec_invalid, step_gate(results), halt
 
@@ -150,6 +163,9 @@ async def run_worker(
     ledger: EffectLedger,
     done_so_far: list[tuple[str, str]],
     domains: list[str],
+    journal: Journal,
+    step: int,
+    on_gate: Callable[[str, str], None],
     on_event: EventSink | None,
 ) -> dict[str, Any]:
     if worker.status is TaskStatus.PENDING:
@@ -157,7 +173,8 @@ async def run_worker(
     audit_mark = audit_offset(runner.settings.workspace_dir)
 
     assignment = Assignment.from_payload(worker.node_spec or {})
-    others = [d for d in domains if d and d != (assignment.domain or assignment.goal)]
+    others = [d for d in domains if d and d !=
+              (assignment.domain or assignment.goal)]
     prompt = render_assignment(
         assignment,
         user_request=question,
@@ -255,6 +272,8 @@ async def run_worker(
                 pass
             worker.brief = brief
             ledger.drop(assignment.id)
+            journal.append(
+                "brief", {"step": step, "aid": assignment.id, "brief": brief})
             save_tree(session_dir, tree)
             return brief
 
@@ -274,11 +293,15 @@ async def run_worker(
         brief["tests"] = gate.as_tests()
         worker.brief = brief
 
-        succeeded = brief.get("outcome") == "done" and gate.state in {PASS, NO_HARD_CRITERIA}
+        succeeded = brief.get("outcome") == "done" and gate.state in {
+            PASS, NO_HARD_CRITERIA}
         if succeeded:
-            ledger.record(assignment.id, brief["changed_files"])
+            ledger.record(assignment.id, brief)
         else:
             ledger.drop(assignment.id)
+        on_gate(assignment.gate_id, gate.state)
+        journal.append(
+            "brief", {"step": step, "aid": assignment.id, "brief": brief})
 
         try:
             if succeeded:

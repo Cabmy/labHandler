@@ -8,13 +8,16 @@ import uvicorn
 def main() -> None:
     host = os.getenv("LAB_WEB_HOST", "127.0.0.1")
     port = int(os.getenv("LAB_WEB_PORT", "8000"))
-    # 启动时自检沙箱（与 CLI 一致；LAB_AUTOSTART_SANDBOX=false 可禁）
+    from infra.sandbox_boot import ensure_sandbox, stop_sandbox
+
     try:
-        from infra.sandbox_boot import ensure_sandbox
         ensure_sandbox(log=print)
     except Exception as e:
         print(f"[server] sandbox 自动启动检查失败（已跳过）：{e}")
-    uvicorn.run("server.app:app", host=host, port=port, log_level="info")
+    try:
+        uvicorn.run("server.app:app", host=host, port=port, log_level="info")
+    finally:
+        stop_sandbox(log=print)
 
 
 if __name__ == "__main__":

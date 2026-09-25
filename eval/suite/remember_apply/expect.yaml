@@ -1,0 +1,5 @@
+id: remember_apply
+group: remember
+question: 按 GUIDE.md 写实验报告.md。截图用占位，不要编造已经拍过。
+gold_applies: [0]
+forbid_applied: [1]

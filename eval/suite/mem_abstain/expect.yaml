@@ -1,0 +1,12 @@
+id: mem_abstain
+group: memory
+question: 按 PROMPT.md 写 essay.md。这道题和键值存储无关。
+gold_applies: []
+abstain: true
+cards:
+  - type: lesson
+    task_type: coding
+    title: MiniKV WAL
+    content: |
+      MiniKV 的 WAL 在崩溃恢复时要重放 put 与 delete。TTL 过期的键不要在重启后复活。
+      接口是 kv_put、kv_get、kv_delete。存储文件名是 minikv.wal。

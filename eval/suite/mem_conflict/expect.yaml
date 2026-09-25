@@ -1,0 +1,15 @@
+id: mem_conflict
+group: memory
+question: 按 TASK.md 实现 settings_store.py。同一 user+key 写两次时以卡片里更新的约定为准。
+gold_applies: [1]
+cards:
+  - type: lesson
+    task_type: coding
+    title: 旧约定 list
+    content: |
+      save_pref 把同一 user 的值追加进 list。load_pref 返回这些值拼接后的字符串，例如先 zh 再 en 得到 zhen。
+  - type: lesson
+    task_type: coding
+    title: 新约定 dict
+    content: |
+      这张卡更新，优先于旧卡。save_pref 用 dict 覆盖。load_pref 只返回最近一次写入的原值，不要和旧值拼接。

@@ -12,6 +12,7 @@
 
 from pathlib import Path
 import asyncio
+import os
 import re
 from typing import Any
 
@@ -263,6 +264,8 @@ async def prefetch_cards(
 
     分数低于 PREFETCH_MIN_SCORE 的卡片丢掉（全部低于则返回 []）。嵌入失败也不打断 lab。
     """
+    if os.getenv("EVAL_DISABLE_PREFETCH") == "1":
+        return []
     if not query.strip():
         return []
     try:

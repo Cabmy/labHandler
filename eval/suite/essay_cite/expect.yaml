@@ -1,0 +1,4 @@
+id: essay_cite
+group: delivery
+question: 按工作区 PROMPT.md 写 essay.md，直接引用和间接引用都要有。
+gold_applies: []

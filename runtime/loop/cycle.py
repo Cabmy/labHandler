@@ -167,6 +167,8 @@ async def run_loop(
     on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     tracer: Tracer | None = None,
     clock: Callable[[], float] = time.time,
+    transcript_sink: Callable[[
+        list[dict[str, Any]], bool], None] | None = None,
 ) -> LoopResult:
     role = spec.permission.value
     tools_reg = registry.bind(
@@ -192,12 +194,22 @@ async def run_loop(
     tokens = TokenBudget.from_settings(settings)
     dump = DumpScope(session_dir=session_dir,
                      agent=spec.name, task_id=task.task_id)
+    compacted_pending = False
+
+    def flush_transcript() -> None:
+        """把当前 history 交给持久化层。bool 参数标记自上次 flush 起发生过压缩。"""
+        nonlocal compacted_pending
+        if transcript_sink is None:
+            return
+        transcript_sink(list(history), compacted_pending)
+        compacted_pending = False
 
     def done(
         brief: dict[str, Any] | None,
         submit: dict[str, Any] | None,
         reason: str,
     ) -> LoopResult:
+        flush_transcript()
         return LoopResult(brief, submit, reason, history=list(history))
 
     async def emit(kind: str, **payload: Any) -> None:
@@ -210,7 +222,7 @@ async def run_loop(
 
     async def build_context() -> AgentContext:
         """返回本轮实际发给模型的上下文。压缩一旦发生，history 已换成压缩后的版本。"""
-        nonlocal history
+        nonlocal history, compacted_pending
         history = drop_dangling_tool_calls(history)
         notes = load_notes(session_dir)
 
@@ -243,6 +255,7 @@ async def run_loop(
         )
         if result.compacted:
             history = result.history
+            compacted_pending = True
             ctx = build()
             await emit(
                 "compact",
@@ -504,6 +517,7 @@ async def run_loop(
 
     try:
         while True:
+            flush_transcript()
             remaining = max(1.0, task.deadline - clock())
             if task.status is TaskStatus.PENDING:
                 task.transit(TaskStatus.RUNNING)

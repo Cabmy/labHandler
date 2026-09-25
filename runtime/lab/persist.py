@@ -1,22 +1,19 @@
-"""会话目录的持久化原语：原子写、Task 树快照、副作用账本、续跑扫描。
+"""会话目录的持久化原语：原子写、Task 树快照、续跑扫描。
 
-所有写入走 atomic_write_text（tmp + fsync + rename），崩在半路不会留下
-截断的文件。副作用账本让恢复具备幂等性：已经产出且内容未变的节点不重跑。
-CHECKPOINT.json 另存 Pro 对话和阶段进度，退出后续跑接回同一条 transcript。
+所有 JSON 写入走 atomic_write_text（tmp + fsync + rename），崩在半路不会留下
+截断的文件。阶段进度、Pro 对话与副作用账本不在这里——它们全部走
+runtime/lab/journal.py 的 append-only 事件日志（JOURNAL.jsonl）。
 """
 
-import hashlib
 import json
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from runtime.lab.journal import JOURNAL_FILE
 from runtime.task import TaskTree, TaskStatus
 
 STATE_FILE = "STATE.json"
-LEDGER_FILE = "EFFECTS.json"
-CHECKPOINT_FILE = "CHECKPOINT.json"
 SPEC_FILE = "SPEC.md"
 CATALOG_FILE = "CATALOG.md"
 
@@ -58,7 +55,8 @@ def read_text(sdir: Path, name: str) -> str:
 
 
 def write_json(sdir: Path, name: str, payload: Any) -> None:
-    atomic_write_text(sdir / name, json.dumps(payload, ensure_ascii=False, indent=2))
+    atomic_write_text(sdir / name, json.dumps(payload,
+                      ensure_ascii=False, indent=2))
 
 
 def read_json(sdir: Path, name: str) -> Any | None:
@@ -77,16 +75,6 @@ def save_tree(sdir: Path, tree: TaskTree) -> None:
     write_json(sdir, STATE_FILE, tree.to_dict())
 
 
-def save_checkpoint(sdir: Path, payload: dict[str, Any]) -> None:
-    """Pro 对话 + 阶段进度。与 STATE.json 分开，避免把长 transcript 塞进任务树。"""
-    write_json(sdir, CHECKPOINT_FILE, payload)
-
-
-def load_checkpoint(sdir: Path) -> dict[str, Any] | None:
-    raw = read_json(sdir, CHECKPOINT_FILE)
-    return raw if isinstance(raw, dict) else None
-
-
 def load_tree(sdir: Path) -> TaskTree | None:
     """损坏或缺 root_id 的 STATE.json 返回 None。调用方据此判定不可续跑。"""
     data = read_json(sdir, STATE_FILE)
@@ -96,76 +84,6 @@ def load_tree(sdir: Path) -> TaskTree | None:
         return TaskTree.from_dict(data)
     except (KeyError, ValueError, TypeError):
         return None
-
-
-# ── 副作用账本（恢复幂等）────────────────────────────────
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-@dataclass
-class EffectLedger:
-    """node_id -> {相对路径: 内容 sha256}。
-
-    worker 完成后记录它实际产出的文件指纹；续跑时若文件仍在且指纹一致，
-    说明这个节点的副作用已经落地，不必重跑。
-    """
-
-    sdir: Path
-    workspace: Path
-    entries: dict[str, dict[str, str]]
-
-    @classmethod
-    def load(cls, sdir: Path, workspace: Path) -> "EffectLedger":
-        raw = read_json(sdir, LEDGER_FILE)
-        entries = raw if isinstance(raw, dict) else {}
-        return cls(sdir=sdir, workspace=workspace, entries=entries)
-
-    def _resolve(self, rel: str) -> Path | None:
-        candidate = (self.workspace / rel).resolve()
-        try:
-            candidate.relative_to(self.workspace)
-        except ValueError:
-            return None
-        return candidate if candidate.is_file() else None
-
-    def record(self, node_id: str, changed_files: list[str]) -> None:
-        fingerprints: dict[str, str] = {}
-        for rel in changed_files:
-            path = self._resolve(rel)
-            if path is None:
-                continue
-            try:
-                fingerprints[rel] = sha256_file(path)
-            except OSError:
-                continue
-        self.entries[node_id] = fingerprints
-        write_json(self.sdir, LEDGER_FILE, self.entries)
-
-    def satisfied(self, node_id: str) -> bool:
-        """节点产出是否仍然完好。无记录或指纹对不上都返回 False。"""
-        fingerprints = self.entries.get(node_id)
-        if not fingerprints:
-            return False
-        for rel, digest in fingerprints.items():
-            path = self._resolve(rel)
-            if path is None:
-                return False
-            try:
-                if sha256_file(path) != digest:
-                    return False
-            except OSError:
-                return False
-        return True
-
-    def drop(self, node_id: str) -> None:
-        if self.entries.pop(node_id, None) is not None:
-            write_json(self.sdir, LEDGER_FILE, self.entries)
 
 
 # ── 续跑扫描 ────────────────────────────────────────────
@@ -186,9 +104,9 @@ def latest_incomplete(workspace: Path) -> tuple[str, TaskTree] | None:
         root_task = tree.get(tree.root_id)
         if root_task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
             return d.name, tree
-        # 用户停止或 SPEC 失败：有 checkpoint 就能接着跑，终态树也能挂回去。
+        # 用户停止或 SPEC 失败：有事件日志就能接着跑，终态树也能挂回去。
         if root_task.status in {TaskStatus.CANCELLED, TaskStatus.FAILED} and (
-            d / CHECKPOINT_FILE
+            d / JOURNAL_FILE
         ).is_file():
             return d.name, tree
         if any(n.status is TaskStatus.RUNNING for n in tree.nodes.values()):

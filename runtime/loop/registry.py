@@ -23,6 +23,10 @@ from tools.sandbox_tools import is_sandbox_unreachable
 
 Handler = Callable[[dict[str, Any], "ToolContext"], Awaitable[str]]
 
+def visible_observation(text: str) -> str:
+    """成功调用若无正文，补成可见观察。空白会被当成调用失败。"""
+    return text if text and text.strip() else "(empty)"
+
 
 @dataclass
 class ToolSpec:
@@ -248,6 +252,6 @@ class ToolRegistry:
                 call_id=str(ctx.extras.get("tool_call_id") or ""),
                 body=text,
             )
-        return ToolOutcome(text, ErrorClass.OK)
+        return ToolOutcome(visible_observation(text), ErrorClass.OK)
 
 
