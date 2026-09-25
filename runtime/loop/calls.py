@@ -24,7 +24,7 @@ from runtime.loop.schema import (
     SUBMIT_SUMMARY,
 )
 from runtime.observe import spans as S
-from runtime.observe.tracer import Tracer
+from runtime.observe.tracer import Tracer, as_tracer
 
 # loop 阶段的结构化出口：走 validate_payload，且校验耗尽时按角色升级（cycle.py 分流）。
 # 与 schema.SCHEMA_TOOLS 不同——后者还含有各自独立流程的 dream / skill_edit。
@@ -113,6 +113,7 @@ async def run_calls(
     validation_streak: dict[str, int],
     emit: Emit,
 ) -> list[CallResult]:
+    tracer = as_tracer(tracer)
     flags = [registry.parallelizable(c["name"]) for c in calls]
 
     async def invoke(tc: dict[str, Any]) -> CallResult:
@@ -131,7 +132,7 @@ async def run_calls(
     out: list[CallResult] = []
     for start, end in waves(flags):
         batch = calls[start:end]
-        if tracer is not None and end - start > 1:
+        if end - start > 1:
             with tracer.span(
                 S.TOOL_WAVE,
                 kind=S.KIND_CHAIN,

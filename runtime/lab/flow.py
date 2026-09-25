@@ -32,6 +32,7 @@ from runtime.lab.helpers import (
     pin_assignment,
     render_progress,
     resume_spec,
+    sanitize_decision,
     worst_gate,
 )
 from runtime.lab.ingest import ingest
@@ -47,7 +48,6 @@ from runtime.lab.remember import (
     applied_from_payload,
     catalog_rules,
     load_applied,
-    rules_satisfied,
     save_applied,
 )
 from runtime.lab.spec import Dispatch, ProjectSpec
@@ -289,22 +289,15 @@ class LabState:
         )
         child.transit(TaskStatus.RUNNING)
 
-        span_cm = (
-            runner.tracer.span(
-                S.TASK,
-                kind=S.KIND_AGENT,
-                **{
-                    S.ATTR_TASK_ID: child.task_id,
-                    S.ATTR_TASK_KIND: kind.value,
-                    S.ATTR_AGENT: f"pro:{label}",
-                },
-            )
-            if runner.tracer is not None
-            else None
-        )
-        if span_cm is not None:
-            span_cm.__enter__()
-        try:
+        with runner.tracer.span(
+            S.TASK,
+            kind=S.KIND_AGENT,
+            **{
+                S.ATTR_TASK_ID: child.task_id,
+                S.ATTR_TASK_KIND: kind.value,
+                S.ATTR_AGENT: f"pro:{label}",
+            },
+        ):
             result = await run_loop(
                 child,
                 runner._agent_spec(kind, permission),
@@ -322,9 +315,6 @@ class LabState:
                     self.journal.append_transcript if phase.shares_thread else None
                 ),
             )
-        finally:
-            if span_cm is not None:
-                span_cm.__exit__(None, None, None)
 
         if phase.shares_thread:
             # 存回去的 transcript 必须配平：末尾若留着没有 tool 响应的
@@ -1075,15 +1065,13 @@ async def _judge(
                 return "halt"
         last_gate = worst_gate(refreshed)
         st.run_gate = last_gate
-    if decision == "finish" and not rules_satisfied(st.runner._applied_rules or [], verdict):
-        decision = "continue"
-    if decision == "finish" and (
-        last_gate.state == FAIL
-        or (last_gate.state == TEST_INVALID and not st.gate_unrunnable())
-    ):
-        decision = "continue"
-    if decision == "takeover" and last_gate.state == TEST_INVALID:
-        decision = "continue"
+    decision = sanitize_decision(
+        decision,
+        verdict,
+        gate_state=last_gate.state,
+        gate_unrunnable=st.gate_unrunnable(),
+        applied_rules=st.runner._applied_rules or [],
+    )
 
     st.runner._trace_event(
         S.EV_DECISION,

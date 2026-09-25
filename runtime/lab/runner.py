@@ -17,7 +17,7 @@ from runtime.llm import LLMGateway
 from runtime.loop import AgentSpec
 from runtime.loop.tools import ToolRegistry, build_registry
 from runtime.observe import spans as S
-from runtime.observe.tracer import Tracer
+from runtime.observe.tracer import Tracer, as_tracer
 from runtime.phase import PRO, phase_of, system_for
 from runtime.task import Permission, TaskKind, TaskTree
 from tools.skill_tool import LOAD_SKILL, SkillBind
@@ -38,7 +38,8 @@ class LabRunner:
         self.settings = settings
         self.llm = llm
         self.registry = registry or build_registry()
-        self.tracer = tracer
+        # 归一后 tracer 永不为 None：调用点直接 with self.tracer.span(...)，无 None 分支。
+        self.tracer = as_tracer(tracer)
         self.clock = clock
         self._cancel = asyncio.Event()
         self._applied_rules: list[str] | None = None
@@ -69,8 +70,7 @@ class LabRunner:
         )
 
     def _trace_event(self, name: str, **attrs: Any) -> None:
-        if self.tracer is not None:
-            self.tracer.event(name, **attrs)
+        self.tracer.event(name, **attrs)
 
     def _agent_spec(self, kind: TaskKind, permission: Permission) -> AgentSpec:
         """把阶段定义解析成这一拍的 AgentSpec：模型、注入后的 system、工具可见范围。"""
@@ -117,29 +117,19 @@ class LabRunner:
         on_event: EventSink | None = None,
         resume: bool = False,
     ) -> dict[str, Any]:
-        tracer = self.tracer
-        span_cm = (
-            tracer.span(
+        self._arm()
+        try:
+            with self.tracer.span(
                 S.RUN,
                 kind=S.KIND_AGENT,
                 inputs=question,
                 **{S.ATTR_THREAD_ID: session_dir.name, S.ATTR_TASK_ID: tree.root_id},
-            )
-            if tracer is not None
-            else None
-        )
-        run_span = span_cm.__enter__() if span_cm is not None else None
-        self._arm()
-        try:
-            result = await run_lab(
-                self, question, session_dir, tree, on_event=on_event, resume=resume
-            )
-            if run_span is not None:
+            ) as run_span:
+                result = await run_lab(
+                    self, question, session_dir, tree, on_event=on_event, resume=resume
+                )
                 run_span.set(**{S.ATTR_OUTCOME: result.get("verdict")})
                 run_span.output(result.get("summary", "")[:2000])
-            return result
+                return result
         finally:
-            if span_cm is not None:
-                span_cm.__exit__(None, None, None)
-            if tracer is not None:
-                tracer.flush()
+            self.tracer.flush()

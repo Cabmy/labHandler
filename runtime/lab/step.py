@@ -33,30 +33,20 @@ EventSink = Callable[[dict[str, Any]], Awaitable[None]]
 
 
 async def run_gate(runner: Any, session_dir: Path, assignment_id: str) -> AcceptResult:
-    span_cm = (
-        runner.tracer.span(
-            S.ACCEPT, kind=S.KIND_EVALUATOR, **{S.ATTR_ASSIGNMENT_ID: assignment_id}
-        )
-        if runner.tracer is not None
-        else None
-    )
-    span = span_cm.__enter__() if span_cm is not None else None
-    try:
+    with runner.tracer.span(
+        S.ACCEPT, kind=S.KIND_EVALUATOR, **{S.ATTR_ASSIGNMENT_ID: assignment_id}
+    ) as span:
         gate = await sanity_and_run(session_dir, assignment_id, settings=runner.settings)
-        if span is not None:
-            span.set(
-                **{
-                    S.ATTR_GATE_STATE: gate.state,
-                    S.ATTR_GATE_PASSED: gate.passed,
-                    S.ATTR_GATE_FAILED: gate.failed,
-                    S.ATTR_GATE_EXIT: gate.exit_code,
-                }
-            )
-            span.output(gate.log[-1000:])
+        span.set(
+            **{
+                S.ATTR_GATE_STATE: gate.state,
+                S.ATTR_GATE_PASSED: gate.passed,
+                S.ATTR_GATE_FAILED: gate.failed,
+                S.ATTR_GATE_EXIT: gate.exit_code,
+            }
+        )
+        span.output(gate.log[-1000:])
         return gate
-    finally:
-        if span_cm is not None:
-            span_cm.__exit__(None, None, None)
 
 
 async def run_step(
@@ -93,22 +83,15 @@ async def run_step(
     domains = [a.domain or a.goal for a in assignments]
     done_so_far = list(progress)
 
-    span_cm = (
-        runner.tracer.span(
-            S.STEP,
-            kind=S.KIND_CHAIN,
-            **{
-                S.ATTR_WAVE_SIZE: len(workers),
-                S.ATTR_PERMISSION: permission.value,
-                S.ATTR_STEP_GOAL: step_goal,
-            },
-        )
-        if runner.tracer is not None
-        else None
-    )
-    if span_cm is not None:
-        span_cm.__enter__()
-    try:
+    with runner.tracer.span(
+        S.STEP,
+        kind=S.KIND_CHAIN,
+        **{
+            S.ATTR_WAVE_SIZE: len(workers),
+            S.ATTR_PERMISSION: permission.value,
+            S.ATTR_STEP_GOAL: step_goal,
+        },
+    ):
         results = await run_wave(
             workers,
             lambda w: run_worker(
@@ -129,9 +112,6 @@ async def run_step(
             runner.settings,
             tracer=runner.tracer,
         )
-    finally:
-        if span_cm is not None:
-            span_cm.__exit__(None, None, None)
 
     briefs = []
     spec_invalid = False
@@ -184,25 +164,19 @@ async def run_worker(
         parallel_domains=others if len(domains) > 1 else None,
     )
 
-    span_cm = (
-        runner.tracer.span(
-            S.TASK,
-            kind=S.KIND_AGENT,
-            inputs=prompt,
-            **{
-                S.ATTR_TASK_ID: worker.task_id,
-                S.ATTR_TASK_KIND: TaskKind.WORKER.value,
-                S.ATTR_ASSIGNMENT_ID: assignment.id,
-                S.ATTR_DOMAIN: assignment.domain,
-                S.ATTR_AGENT: f"flash:{assignment.id}",
-                S.ATTR_PERMISSION: worker.permission.value,
-            },
-        )
-        if runner.tracer is not None
-        else None
-    )
-    task_span = span_cm.__enter__() if span_cm is not None else None
-    try:
+    with runner.tracer.span(
+        S.TASK,
+        kind=S.KIND_AGENT,
+        inputs=prompt,
+        **{
+            S.ATTR_TASK_ID: worker.task_id,
+            S.ATTR_TASK_KIND: TaskKind.WORKER.value,
+            S.ATTR_ASSIGNMENT_ID: assignment.id,
+            S.ATTR_DOMAIN: assignment.domain,
+            S.ATTR_AGENT: f"flash:{assignment.id}",
+            S.ATTR_PERMISSION: worker.permission.value,
+        },
+    ) as task_span:
         await runner._emit(on_event, {"kind": "node_start", "node": f"flash:{assignment.id}"})
         try:
             result = await asyncio.wait_for(
@@ -245,9 +219,8 @@ async def run_worker(
                     pass
                 ledger.drop(assignment.id)
                 save_tree(session_dir, tree)
-                if task_span is not None:
-                    task_span.set(**{S.ATTR_OUTCOME: "halt"})
-                    task_span.output(str(halted.get("reason") or "")[:2000])
+                task_span.set(**{S.ATTR_OUTCOME: "halt"})
+                task_span.output(str(halted.get("reason") or "")[:2000])
                 await runner._emit(
                     on_event,
                     {
@@ -311,11 +284,10 @@ async def run_worker(
         except ValueError:
             pass
 
-        if task_span is not None:
-            task_span.set(
-                **{S.ATTR_OUTCOME: brief.get("outcome"), S.ATTR_GATE_STATE: gate.state}
-            )
-            task_span.output(str(brief.get("brief") or "")[:2000])
+        task_span.set(
+            **{S.ATTR_OUTCOME: brief.get("outcome"), S.ATTR_GATE_STATE: gate.state}
+        )
+        task_span.output(str(brief.get("brief") or "")[:2000])
 
         await runner._emit(
             on_event,
@@ -331,6 +303,3 @@ async def run_worker(
         )
         save_tree(session_dir, tree)
         return brief
-    finally:
-        if span_cm is not None:
-            span_cm.__exit__(None, None, None)

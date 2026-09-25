@@ -1,13 +1,12 @@
 """用户画像：profile/me.yaml 为唯一事实源。
 
 点号路径读写（identity.name、preferences.writing_style.formality）。
-写回先落同目录 .tmp，再 POSIX rename：崩溃后磁盘上始终是一份完整 YAML。
+写回走 runtime.lab.persist.atomic_write_text（tmp+fsync+rename+dir fsync）：
+崩溃后磁盘上始终是一份完整 YAML。
 load：文件缺失或 YAML 非法时得到空 dict，不抛。
 inject_for_agent 把 identity / preferences / style_rules 拼进名单内 agent 的 system 末尾。
 """
 
-import os
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -25,17 +24,14 @@ def _profile_path() -> Path:
 
 
 def _atomic_write(data: dict[str, Any]) -> None:
-    """把 dict 写成 YAML。先写 .tmp 再 os.replace；失败则 shutil.move。崩溃后磁盘上始终是完整文件。"""
-    path = _profile_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
-    # os.replace 在 POSIX 上原子替换；失败则 shutil.move
-    try:
-        os.replace(tmp, path)
-    except Exception:
-        shutil.move(str(tmp), str(path))
+    """把 dict 写成 YAML，走仓库统一原子写（tmp+fsync+rename+dir fsync）。
+
+    延迟导入：runtime.lab.persist 的依赖链会回到 memory.profile，顶层 import 成环。
+    """
+    from runtime.lab.persist import atomic_write_text
+
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    atomic_write_text(_profile_path(), text)
 
 
 # ─── 公开 API ───────────────────────────────────────────────────
@@ -100,13 +96,13 @@ def inject_for_agent(
 ) -> str:
     """把 identity / preferences 以及本 lab 适用的 style_rules 拼到 system 末尾。
 
-    仅 coder / planner / verifier / summarizer / pro / flash 会注入。
+    仅 pro / flash 会注入。
     include_rules=False 时不写规则段（remember_judge 裁定前）。
     rules 非 None 时只用这份名单，不再读 profile 全量 style_rules。
     优先级：当轮用户指令 > 本 lab 适用规则 > skill SOP。
     """
     agent = agent_name.lower()
-    if agent not in {"coder", "planner", "verifier", "summarizer", "pro", "flash"}:
+    if agent not in {"pro", "flash"}:
         return system_prompt
 
     data = load_profile()

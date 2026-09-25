@@ -21,7 +21,7 @@ from config.runtime import RuntimeSettings
 from runtime.context.budget import TokenBudget, count_messages
 from runtime.context.notes import SessionNotes, clear_forget, forget_directive
 from runtime.observe import spans as S
-from runtime.observe.tracer import Tracer
+from runtime.observe.tracer import Tracer, as_tracer
 
 DUMP_DIR = "tool_results"
 OFFLOAD_MARKER = "[offloaded "
@@ -255,8 +255,10 @@ def _render_for_summary(turns: list[Turn]) -> str:
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function") if isinstance(tc, dict) else {}
                     if isinstance(fn, dict):
-                        calls.append(f"{fn.get('name')}({str(fn.get('arguments') or '')[:200]})")
-                parts.append(f"[assistant] {content}\n[调用] " + "; ".join(calls))
+                        calls.append(
+                            f"{fn.get('name')}({str(fn.get('arguments') or '')[:200]})")
+                parts.append(
+                    f"[assistant] {content}\n[调用] " + "; ".join(calls))
             elif role == "tool":
                 tool = names.get(str(msg.get("tool_call_id") or ""), "tool")
                 clipped = content[:_INLINE_TOOL_CAP]
@@ -335,24 +337,19 @@ async def compact_history(
     recent = movable[-keep_n:]
     summarized = {id(t) for t in old}
 
-    span_cm = (
-        tracer.span(
-            S.COMPACT,
-            kind=S.KIND_CHAIN,
-            **{
-                S.ATTR_TOKENS_BEFORE: projected,
-                S.ATTR_TURNS_SUMMARIZED: len(old),
-                S.ATTR_TURNS_KEPT: len(recent),
-            },
-        )
-        if tracer
-        else None
-    )
-    span = span_cm.__enter__() if span_cm is not None else None
-    try:
+    with as_tracer(tracer).span(
+        S.COMPACT,
+        kind=S.KIND_CHAIN,
+        **{
+            S.ATTR_TOKENS_BEFORE: projected,
+            S.ATTR_TURNS_SUMMARIZED: len(old),
+            S.ATTR_TURNS_KEPT: len(recent),
+        },
+    ) as span:
         dumped = offload_tool_bodies(old, dump)
         dump_rel = dump.rel_dir
-        dump_hint = f"`{dump_rel}/`" + (f"（{len(dumped)} 个文件）" if dumped else "")
+        dump_hint = f"`{dump_rel}/`" + \
+            (f"（{len(dumped)} 个文件）" if dumped else "")
         summary, error = await _summarize(
             old,
             settings=settings,
@@ -398,17 +395,13 @@ async def compact_history(
             forget_cleared=cleared,
             error=error,
         )
-        if span is not None:
-            span.set(
-                **{
-                    S.ATTR_TOKENS_AFTER: after,
-                    S.ATTR_COMPACTED: True,
-                    S.ATTR_FORGET_CLEARED: cleared,
-                }
-            )
-            if error:
-                span.set(**{S.ATTR_REASON: error})
+        span.set(
+            **{
+                S.ATTR_TOKENS_AFTER: after,
+                S.ATTR_COMPACTED: True,
+                S.ATTR_FORGET_CLEARED: cleared,
+            }
+        )
+        if error:
+            span.set(**{S.ATTR_REASON: error})
         return result
-    finally:
-        if span_cm is not None:
-            span_cm.__exit__(None, None, None)

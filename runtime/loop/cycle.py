@@ -23,7 +23,7 @@ from runtime.loop.control import decide
 from runtime.errors import ErrorClass
 from runtime.llm import LLMGateway
 from runtime.observe import spans as S
-from runtime.observe.tracer import Tracer
+from runtime.observe.tracer import Tracer, as_tracer
 from runtime.phase import FLASH, PRO
 from runtime.loop.retry import sleep_delay
 from runtime.loop.calls import SUBMIT_TOOLS, run_calls
@@ -171,6 +171,7 @@ async def run_loop(
         list[dict[str, Any]], bool], None] | None = None,
 ) -> LoopResult:
     role = spec.permission.value
+    tracer = as_tracer(tracer)
     tools_reg = registry.bind(
         spec.visible_role,
         submit_tool=spec.submit_tool,
@@ -217,8 +218,7 @@ async def run_loop(
             await on_event({"kind": kind, **payload})
 
     def trace_event(name: str, **attrs: Any) -> None:
-        if tracer is not None:
-            tracer.event(name, **attrs)
+        tracer.event(name, **attrs)
 
     async def build_context() -> AgentContext:
         """返回本轮实际发给模型的上下文。压缩一旦发生，history 已换成压缩后的版本。"""
@@ -271,31 +271,24 @@ async def run_loop(
     async def one_turn() -> LoopResult | None:
         nonlocal force_brief, force_halt, last_error, last_stag, history, retrieved
 
-        span_cm = (
-            tracer.span(
-                S.TURN,
-                kind=S.KIND_CHAIN,
-                **{
-                    S.ATTR_TASK_ID: task.task_id,
-                    S.ATTR_AGENT: spec.name,
-                    S.ATTR_STEP: task.step_count,
-                    S.ATTR_STEP_BUDGET: task.step_budget,
-                },
-            )
-            if tracer is not None
-            else None
-        )
-        turn_span = span_cm.__enter__() if span_cm is not None else None
-        try:
+        with tracer.span(
+            S.TURN,
+            kind=S.KIND_CHAIN,
+            **{
+                S.ATTR_TASK_ID: task.task_id,
+                S.ATTR_AGENT: spec.name,
+                S.ATTR_STEP: task.step_count,
+                S.ATTR_STEP_BUDGET: task.step_budget,
+            },
+        ) as turn_span:
             ctx = await build_context()
-            if turn_span is not None:
-                turn_span.set(
-                    **{
-                        S.ATTR_TOKENS_IN: ctx.input_tokens,
-                        S.ATTR_SYSTEM_HASH: ctx.system_hash,
-                        S.ATTR_TOOLS_HASH: ctx.tools_hash,
-                    }
-                )
+            turn_span.set(
+                **{
+                    S.ATTR_TOKENS_IN: ctx.input_tokens,
+                    S.ATTR_SYSTEM_HASH: ctx.system_hash,
+                    S.ATTR_TOOLS_HASH: ctx.tools_hash,
+                }
+            )
 
             problems = validate_message_sequence(ctx.messages)
             if problems:
@@ -320,12 +313,11 @@ async def run_loop(
             )
             last_error = result.error_class
             tokens.observe(ctx.input_tokens, result.usage)
-            if turn_span is not None:
-                turn_span.set(
-                    **{
-                        S.ATTR_TOKENS_CACHED: int(result.usage.get("cached_tokens") or 0),
-                    }
-                )
+            turn_span.set(
+                **{
+                    S.ATTR_TOKENS_CACHED: int(result.usage.get("cached_tokens") or 0),
+                }
+            )
 
             if result.error_class is ErrorClass.AUTH:
                 task.record(result.error_class,
@@ -505,15 +497,11 @@ async def run_loop(
                 )
 
             if submit_payload is not None:
-                if turn_span is not None:
-                    turn_span.set(**{S.ATTR_OUTCOME: submit_name})
+                turn_span.set(**{S.ATTR_OUTCOME: submit_name})
                 if submit_name == SUBMIT_BRIEF:
                     return done(coerce_brief(submit_payload), submit_payload, "submit_brief")
                 return done(None, {"name": submit_name, "payload": submit_payload}, "submit")
             return None
-        finally:
-            if span_cm is not None:
-                span_cm.__exit__(None, None, None)
 
     try:
         while True:

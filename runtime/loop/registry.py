@@ -15,13 +15,15 @@ from typing import Any
 from config.runtime import RuntimeSettings
 from runtime.errors import ErrorClass, classify
 from runtime.observe import spans as S
-from runtime.observe.tracer import Tracer
+from runtime.observe.tracer import Tracer, as_tracer
+from runtime.context.compact import DumpScope, LIVE_OFFLOAD_CHARS, dump_tool_result
 from runtime.loop.parse import check_args, openai_tool
 from runtime.loop.schema import SCHEMA_TOOLS
 from tools.policy import get_auditor
 from tools.sandbox_tools import is_sandbox_unreachable
 
 Handler = Callable[[dict[str, Any], "ToolContext"], Awaitable[str]]
+
 
 def visible_observation(text: str) -> str:
     """成功调用若无正文，补成可见观察。空白会被当成调用失败。"""
@@ -80,7 +82,8 @@ class ToolRegistry:
         submit_tool: str = "",
     ) -> None:
         self._specs = {s.name: s for s in specs}
-        self._advertised = advertised if advertised is not None else list(specs)
+        self._advertised = advertised if advertised is not None else list(
+            specs)
         self._advertised_names = {s.name for s in self._advertised}
         self._phase = phase
         self._submit_tool = submit_tool
@@ -104,7 +107,8 @@ class ToolRegistry:
         named = extra | {submit_tool}
         if advertise is not None:
             adv = [self._specs[n] for n in advertise if n in self._specs]
-            allow_set = allow if allow is not None else frozenset(s.name for s in adv)
+            allow_set = allow if allow is not None else frozenset(
+                s.name for s in adv)
             exec_specs = [s for s in adv if s.name in allow_set]
             return ToolRegistry(
                 exec_specs, advertised=adv, phase=phase, submit_tool=submit_tool
@@ -125,7 +129,8 @@ class ToolRegistry:
             openai_tool(
                 s.name,
                 s.description,
-                s.input_schema if s.name in SCHEMA_TOOLS else _advertise(s.input_schema),
+                s.input_schema if s.name in SCHEMA_TOOLS else _advertise(
+                    s.input_schema),
             )
             for s in self._advertised
         ]
@@ -163,12 +168,12 @@ class ToolRegistry:
         timeout: float,
         tracer: Tracer | None = None,
     ) -> ToolOutcome:
-        if tracer is None:
-            return await self._execute(name, raw_args, ctx, timeout=timeout, tracer=None)
+        tracer = as_tracer(tracer)
         with tracer.span(
             S.TOOL,
             kind=S.KIND_TOOL,
-            inputs=raw_args if isinstance(raw_args, dict) else str(raw_args)[:2000],
+            inputs=raw_args if isinstance(
+                raw_args, dict) else str(raw_args)[:2000],
             **{
                 S.ATTR_TOOL: name,
                 S.ATTR_PERMISSION: ctx.role,
@@ -187,15 +192,15 @@ class ToolRegistry:
         ctx: ToolContext,
         *,
         timeout: float,
-        tracer: Tracer | None,
+        tracer: Tracer,
     ) -> ToolOutcome:
         spec = self._specs.get(name)
         if spec is None:
             return ToolOutcome(self.unavailable_message(name), ErrorClass.VALIDATION)
         if ctx.role not in spec.permissions and name not in SCHEMA_TOOLS:
             get_auditor().record(name, {}, f"denied:role={ctx.role}")
-            if tracer is not None:
-                tracer.event(S.GUARDRAIL, **{S.ATTR_TOOL: name, S.ATTR_TOOL_ALLOWED: False})
+            tracer.event(S.GUARDRAIL, **
+                         {S.ATTR_TOOL: name, S.ATTR_TOOL_ALLOWED: False})
             return ToolOutcome(
                 f"[ERROR/PermissionError] tool {name} is not allowed for role={ctx.role}",
                 ErrorClass.PERMISSION,
@@ -239,8 +244,6 @@ class ToolRegistry:
             cls = classify(None, text=text)
             return ToolOutcome(text, ErrorClass.LOGIC if cls is ErrorClass.OK else cls)
         get_auditor().record(name, args, "ok")
-        from runtime.context.compact import DumpScope, LIVE_OFFLOAD_CHARS, dump_tool_result
-
         dump = ctx.extras.get("dump")
         if (
             isinstance(dump, DumpScope)
@@ -253,5 +256,3 @@ class ToolRegistry:
                 body=text,
             )
         return ToolOutcome(visible_observation(text), ErrorClass.OK)
-
-

@@ -385,31 +385,9 @@ async def done() -> dict[str, Any]:
                 await asyncio.wait_for(asyncio.shield(_current_task), timeout=15)
             except Exception:
                 pass
-    from memory.retrieve import index_card_ids
-
-    cards = (_session.last_result or {}).get("knowledge_cards") or []
-    # 卡片先入档并向量索引，再 _session.done 复位；反序会丢掉未索引卡片。
-    archive_extra: dict[str, Any] = {}
-    if cards:
-        from memory.archive import get_task_archive
-
-        title = (_session.last_result or {}).get("question") or "未命名任务"
-        summary = (_session.last_result or {}).get("summary") or ""
-        archive = get_task_archive()
-        if archive.has_new_cards(cards):
-            task_id = archive.create_task(title, "other", summary[:4000])
-            card_ids = archive.create_cards(task_id, cards, title, "other")
-            if card_ids:
-                archive_extra = await index_card_ids(card_ids, _session.llm, _session.settings)
-                archive_extra["task_id"] = task_id
-                archive_extra["card_ids"] = card_ids
-        if _session.last_result:
-            # 已处理，清空以免 _session.done 再建空 task
-            _session.last_result["knowledge_cards"] = []
-    result = await asyncio.to_thread(_session.done, lambda m: None)
-    if archive_extra:
-        result["archive"] = {**(result.get("archive") or {}), **archive_extra}
-    return result
+    # 卡片先入档并向量索引，再 done 复位；反序会丢掉未索引卡片。
+    archive_result = await _session.archive_async()
+    return await asyncio.to_thread(_session.done, lambda m: None, archive_result)
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

@@ -1,10 +1,11 @@
-"""LabRunner 用的纯函数：payload 抽取、续跑切分、门禁取最差。"""
+"""LabRunner 用的纯函数：payload 抽取、续跑切分、门禁取最差、judge 决策修正。"""
 
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
 from runtime.lab.accept import AcceptResult, FAIL, NO_HARD_CRITERIA, PASS, TEST_INVALID
+from runtime.lab.remember import rules_satisfied
 from runtime.lab.spec import Assignment, ProjectSpec
 from runtime.loop.schema import SUBMIT_HALT, SUBMIT_SPEC
 from runtime.task import RuntimeTask, TaskKind, TaskStatus, TaskTree
@@ -110,6 +111,31 @@ def step_gate(results: list[tuple[RuntimeTask, dict[str, Any]]]) -> AcceptResult
             "state") or NO_HARD_CRITERIA))
         for _, brief in results
     )
+
+
+def sanitize_decision(
+    decision: str,
+    verdict: dict[str, Any],
+    *,
+    gate_state: str,
+    gate_unrunnable: bool,
+    applied_rules: list[str],
+) -> str:
+    """judge 决策的降级修正，纯函数（与 runtime/loop/control.py 的 decide 同构）。
+
+    finish 只在规则全满足且门禁不挡路时成立；takeover 解不了跑不起来的门禁。
+    不满足时一律降回 continue，让下一轮继续推。
+    """
+    if decision == "finish" and not rules_satisfied(applied_rules, verdict):
+        decision = "continue"
+    if decision == "finish" and (
+        gate_state == FAIL or (
+            gate_state == TEST_INVALID and not gate_unrunnable)
+    ):
+        decision = "continue"
+    if decision == "takeover" and gate_state == TEST_INVALID:
+        decision = "continue"
+    return decision
 
 
 def resume_spec(tree: TaskTree) -> ProjectSpec | None:

@@ -1,7 +1,8 @@
 """会话目录的持久化原语：原子写、Task 树快照、续跑扫描。
 
-所有 JSON 写入走 atomic_write_text（tmp + fsync + rename），崩在半路不会留下
-截断的文件。阶段进度、Pro 对话与副作用账本不在这里——它们全部走
+atomic_write_text（tmp + fsync + rename + dir fsync）是仓库唯一的原子写实现，
+session 目录快照与 memory/profile 的 YAML 写回都走它，崩在半路不会留下截断的文件。
+阶段进度、Pro 对话与副作用账本不在这里——它们全部走
 runtime/lab/journal.py 的 append-only 事件日志（JOURNAL.jsonl）。
 """
 

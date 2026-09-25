@@ -113,61 +113,79 @@ class LabSession:
         self.last_result = result
         return result
 
-    def archive(self) -> dict[str, Any]:
+    _NO_CARDS: dict[str, Any] = {
+        "task_id": None,
+        "card_ids": [],
+        "indexed": 0,
+        "failed": 0,
+        "errors": [],
+        "skipped": "no_cards",
+    }
+
+    def _archive_create(self) -> dict[str, Any]:
+        """同步段：把 last_result 里的 knowledge_cards 建进卡片档案，返回含 card_ids 的账。
+
+        向量索引不在这里做——它 async，由 archive / archive_async 按调用现场选择怎么等。
+        """
         from memory.archive import get_task_archive
-        from memory.retrieve import index_card_ids
-        import asyncio
 
         cards = self.last_result.get("knowledge_cards") or []
         title = self.last_result.get("question") or "未命名任务"
         summary = self.last_result.get("summary") or ""
         ttype = "other"
         if not cards:
-            return {
-                "task_id": None,
-                "card_ids": [],
-                "indexed": 0,
-                "failed": 0,
-                "errors": [],
-                "skipped": "no_cards",
-            }
+            return dict(self._NO_CARDS)
         try:
             archive = get_task_archive()
             if not archive.has_new_cards(cards):
-                return {
-                    "task_id": None,
-                    "card_ids": [],
-                    "indexed": 0,
-                    "failed": 0,
-                    "errors": [],
-                    "skipped": "no_cards",
-                }
+                return dict(self._NO_CARDS)
             task_id = archive.create_task(title, ttype, summary[:4000])
             card_ids = archive.create_cards(task_id, cards, title, ttype)
-            result: dict[str, Any] = {
+            return {
                 "task_id": task_id,
                 "card_ids": card_ids,
                 "indexed": 0,
                 "failed": 0,
                 "errors": [],
             }
-            if card_ids:
-
-                async def _idx() -> dict[str, Any]:
-                    return await index_card_ids(card_ids, self.llm, self.settings)
-
-                try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
-                if loop and loop.is_running():
-                    result["index_pending"] = True
-                else:
-                    idx = asyncio.run(_idx())
-                    result.update(idx)
-            return result
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
+
+    async def archive_async(self) -> dict[str, Any]:
+        """事件循环内调用的归档：建卡后原地 await 向量索引。/api/done 走这条路。"""
+        from memory.retrieve import index_card_ids
+
+        result = self._archive_create()
+        card_ids = result.get("card_ids") or []
+        if card_ids:
+            result.update(await index_card_ids(card_ids, self.llm, self.settings))
+        return result
+
+    def archive(self) -> dict[str, Any]:
+        """同步归档：无运行中的 loop 时 asyncio.run 索引；有 loop 时标 index_pending 跳过。"""
+        from memory.retrieve import index_card_ids
+        import asyncio
+
+        result = self._archive_create()
+        card_ids = result.get("card_ids") or []
+        if not card_ids:
+            return result
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            result["index_pending"] = True
+            return result
+
+        async def _idx() -> dict[str, Any]:
+            return await index_card_ids(card_ids, self.llm, self.settings)
+
+        try:
+            result.update(asyncio.run(_idx()))
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        return result
 
     def clear_workspace(self) -> tuple[Path, list[str]]:
         ws = self.settings.workspace_dir
@@ -183,9 +201,12 @@ class LabSession:
         ws.mkdir(parents=True, exist_ok=True)
         return bucket, moved
 
-    def done(self, log=print) -> dict[str, Any]:
+    def done(
+        self, log=print, archive_result: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         self.request_stop()
-        archive_result = self.archive()
+        if archive_result is None:
+            archive_result = self.archive()
         bucket, moved = self.clear_workspace()
         try:
             from infra.sandbox_boot import recreate_sandbox
