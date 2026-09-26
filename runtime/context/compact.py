@@ -8,7 +8,7 @@ NOTES.md 与 SPEC.md 的最新快照在 assemble 的 state 槽（history 之后�
 变更事件以 <state_update> 追加在 history 里；纪要保留最新版本的要点，不要整份复述。
 FORGET.md 只在 Pro 压缩时作为排除指令并清空；Flash 压缩不碰它。被遗忘的卡片此前已经
 从 cards 槽消失，这里只负责让它不要从旧对话经摘要回流。
-是否该压、阈值、usage 校准归 TokenBudget；本模块只切回合、落盘 tool 正文、写纪要。
+是否该压、阈值、usage 校准归 TokenBudget；本模块只切回合、写纪要、落盘 tool 正文。
 """
 
 import re
@@ -223,7 +223,7 @@ def dump_tool_result(
 
 
 def offload_tool_bodies(turns: list[Turn], scope: DumpScope) -> list[str]:
-    """把将被摘要的回合里的 tool 正文落盘，返回已写入的文件名。只写磁盘，不改消息内容。"""
+    """把已摘要回合里的 tool 正文落盘，返回已写入的文件名。只写磁盘，不改消息内容。"""
     written: list[str] = []
     for turn in turns:
         names = _tool_name_map(turn)
@@ -243,7 +243,7 @@ def offload_tool_bodies(turns: list[Turn], scope: DumpScope) -> list[str]:
 
 
 def _render_for_summary(turns: list[Turn]) -> str:
-    """把待摘要的回合渲染成纯文本。tool 正文只留头部（全文已在磁盘）；整段再截到 _BLOB_CHAR_CAP。"""
+    """把待摘要的回合渲染成纯文本。tool 正文只留头部（全文随后卸盘）；整段再截到 _BLOB_CHAR_CAP。"""
     parts: list[str] = []
     for turn in turns:
         names = _tool_name_map(turn)
@@ -318,7 +318,7 @@ async def compact_history(
 ) -> CompactResult:
     """超过 TokenBudget 触发阈值才压缩。未触发、或可移动回合不超过保留数时，原样返回且无副作用。
 
-    触发后：旧回合 tool 正文落入 dump 槽 → Flash 总结 → 连续旧片段就地换成一条纪要（pinned 留原位）。
+    触发后：Flash 总结旧回合 → tool 正文落入 dump 槽 → 连续旧片段就地换成一条纪要（pinned 留原位）。
     仅 Pro（apply_forget）读取并清空 FORGET.md。
     摘要失败仍替换 history，纪要位置写失败说明，compacted=True。
     """
@@ -346,18 +346,22 @@ async def compact_history(
             S.ATTR_TURNS_KEPT: len(recent),
         },
     ) as span:
-        dumped = offload_tool_bodies(old, dump)
         dump_rel = dump.rel_dir
-        dump_hint = f"`{dump_rel}/`" + \
-            (f"（{len(dumped)} 个文件）" if dumped else "")
+        # 先摘要：从仍在上下文里的旧回合生成纪要。此时 tool 正文尚未卸盘，
+        # 但 _render_for_summary 直接读消息原文，卸盘与否不改变喂给 Flash 的内容。
         summary, error = await _summarize(
             old,
             settings=settings,
             llm=llm,
             notes=notes,
-            dump_hint=dump_hint,
+            dump_hint=f"`{dump_rel}/`",
             apply_forget=apply_forget,
         )
+
+        # 再卸盘：把已摘要回合的 tool 正文落盘，用真实文件数拼出 digest 的定位提示。
+        dumped = offload_tool_bodies(old, dump)
+        dump_hint = f"`{dump_rel}/`" + \
+            (f"（{len(dumped)} 个文件）" if dumped else "")
 
         note = summary if summary else f"(摘要生成失败：{error}。)"
         digest = {

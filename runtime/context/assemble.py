@@ -10,6 +10,9 @@ state：本拍最新 NOTES.md / SPEC.md 快照。放在 history 之后，变动�
 cards：SPEC 预取的跨 lab 卡片正文，仅 Pro。memory_forget 一拍之内就会变，必须
        排在 history 之后。本次作业要求先入场，旧 lab 经验后到。
 retrieved：本 loop 里 memory_search/grep/read、notes_read、load_skill 的追加结果，不进 history。
+events：harness 就本轮循环执行状况注入的告警（输出截断、只回文本没调 submit、死循环、
+       预算耗尽、致命/鉴权错误），来自 task.events。每拍最易变，排最末只作废缓存尾巴；
+       不进 history，随 STATE.json 持久化。
 
 history 是工具消息的唯一载体，其中已经包含成对的 assistant(tool_calls) +
 tool 响应。装配层没有第二个 tool 槽位。
@@ -87,12 +90,14 @@ def assemble(
     if cards:
         messages.append({"role": "user", "content": cards})
     if retrieved:
-        messages.append({"role": "user", "content": f"## Retrieved knowledge\n{retrieved}"})
+        messages.append(
+            {"role": "user", "content": f"## Retrieved knowledge\n{retrieved}"})
 
     event_lines = [e.get("text", "") for e in events if e.get("text")]
     if event_lines:
         messages.append(
-            {"role": "user", "content": "## Execution events\n" + "\n".join(event_lines)}
+            {"role": "user", "content": "## Execution events\n" +
+                "\n".join(event_lines)}
         )
 
     tokens = count_messages(messages) + count_tool_schemas(tool_schemas)
