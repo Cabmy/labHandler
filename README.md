@@ -12,6 +12,84 @@ ingest 材料目录 → Remember-Judge 裁定长期规则 → Pro 写 SPEC.md
 
 缺用户才能给的信息时，任一阶段可 `submit_halt` 短路到 SUMMARY。
 
+## 架构
+
+分层视图：HTTP 入口 → RuntimeTask 控制面 → 阶段流水线 → 每个 Pro/Flash 节点的
+一轮 ReAct → LLM 网关与工具（经 MCP 进 Docker 沙箱），最下是持久化/记忆/可观测横切层。
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│ server · FastAPI 127.0.0.1:8000                                    │
+│   Web UI ─► /chat · /stop · /done · /remember · /dream · /skill    │
+│   AgentRouter whitelist header · one lab per session · thread_id   │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 ▼
+┌────────────────────────────────────────────────────────────────────┐
+│ control plane · runtime/task.py RuntimeTask tree                   │
+│   status · step_budget · wall-clock deadline · permission · cancel │
+│   LLM sees only the semantic projection, never counters/cancel     │
+│                                                                    │
+│   LabRunner (runtime/lab/runner.py) ─► flow.run_lab(LabState)      │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 ▼
+┌────────────────────────────────────────────────────────────────────┐
+│ phase pipeline · order in runtime/lab/flow.py, defs in phase.py    │
+│                                                                    │
+│   ingest catalog                                                   │
+│     └─► Remember-Judge (Pro, tool_choice=required) submit_remember │
+│     └─► Pro submit_spec ─► SPEC.md (folds in applied /remember)    │
+│     └─► step loop (<= _MAX_STEPS):                                 │
+│           Pro submit_dispatch ─► write_acceptance(task_id)         │
+│             ├─ 1 Flash  = writable                                 │
+│             └─ N Flash  = all read-only, parallel                  │
+│           Flash submit_brief ─► programmatic gate (pytest)         │
+│             pass · fail · test_invalid · no_hard_criteria          │
+│           Pro submit_judge ─► continue|finish|revise_spec|takeover │
+│     └─► Pro submit_summary ─► SUMMARY.md                           │
+│                                                                    │
+│   any phase submit_halt ─► short-circuit SUMMARY (need_user)       │
+└────────────────────────────────┬───────────────────────────────────┘
+                                 ▼  per Pro / Flash node
+┌────────────────────────────────────────────────────────────────────┐
+│ one ReAct turn · runtime/loop/cycle.py:run_loop                    │
+│                                                                    │
+│   assemble(context) ─► llm.chat ─► tool_calls ─► task.record       │
+│      ▲                                            │                │
+│      │  budget / compact                          ▼                │
+│      │  (> COMPACT_TRIGGER_RATIO -> compact)   control.decide      │
+│      └────────────────────────────  retry|nudge|force_brief|stop   │
+│                                                                    │
+│   structured output via function calling only; read-only calls     │
+│   run parallel, write/submit serialize; one submit_* exit each     │
+└────────────────┬────────────────────────┬──────────────────────────┘
+                 ▼                        ▼
+┌──────────────────────────────┐  ┌──────────────────────────────────┐
+│ LLM gateway · runtime/llm.py │  │ tools · tools/ + loop/registry   │
+│   Pro (glm) / Flash dual gate│  │   fs · search · sandbox · skill  │
+│   AsyncOpenAI streaming      │  │   profile · policy SecurityPolicy│
+│   max_retries=0              │  │   path guard + cmd whitelist     │
+│   _breaker: consecutive fails│  │   + role write-protect           │
+│     -> escalate error FATAL  │  │   heavy ops -> MCP -> Docker     │
+└──────────────────────────────┘  └─────────────────┬────────────────┘
+                                                    ▼ MCP
+                                  ┌──────────────────────────────────┐
+                                  │ Docker AIO Sandbox               │
+                                  │   PYTHONPATH=/workspace pytest   │
+                                  │   artifacts + SUMMARY.md         │
+                                  │     written back to workspace/   │
+                                  └──────────────────────────────────┘
+
+┌────────────────────────────────────────────────────────────────────┐
+│ cross-cutting                                                      │
+│   persist · JOURNAL.jsonl (append-only) + STATE.json + ledger      │
+│             idempotent resume by artifact sha256 fingerprint       │
+│   memory  · card markdown (source of truth) + SQLite vectors       │
+│             /dream offline curation                                │
+│   observe · Langfuse spans + local JSONL                           │
+│             run / step / turn / llm / tool / gate                  │
+└────────────────────────────────────────────────────────────────────┘
+```
+
 ## 核心设计
 
 - **SPEC 指挥**：Pro 先写 SPEC.md 钉死总目标与接口契约，之后每步只交出下一份 Flash 任务书；Flash 每次新开空对话，一次只做一步能做完的量。
