@@ -1,6 +1,6 @@
 """执行一步里的 Flash worker：1 个串行可写，多个只读并行。
 
-任一 worker 的 outcome=spec_invalid / halt，或 sandbox_unreachable 时取消
+任一 worker 的 outcome=spec_invalid，或 sandbox_unreachable 时取消
 尚未完成的兄弟，并给它们合成 failed brief。并发上限为
 settings.max_parallel_readonly_workers。
 """
@@ -17,7 +17,7 @@ from runtime.task import Permission, RuntimeTask, TaskStatus
 
 
 def _cancels_wave(brief: dict[str, Any]) -> bool:
-    return brief.get("outcome") in {"spec_invalid", "halt"} or bool(
+    return brief.get("outcome") == "spec_invalid" or bool(
         brief.get("sandbox_unreachable")
     )
 

@@ -873,7 +873,7 @@ async def _execute_and_judge(
         for b in done_briefs
     ]
     if assignments:
-        new_briefs, spec_invalid, wave_gate, step_halt = await run_step(
+        new_briefs, spec_invalid, wave_gate = await run_step(
             st.runner,
             assignments,
             question=st.question,
@@ -889,9 +889,6 @@ async def _execute_and_judge(
             on_gate=st.record_gate,
             on_event=st.on_event,
         )
-        if step_halt:
-            st.set_halt(step_halt)
-            return "break", gate_nudge, revisions
         step_gates.append(wave_gate)
         briefs += new_briefs
         if any(b.get("sandbox_unreachable") for b in new_briefs):

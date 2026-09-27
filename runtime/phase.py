@@ -213,7 +213,8 @@ PHASES: dict[TaskKind, PhaseSpec] = {
         agent=FLASH,
         prompt=FLASH_SYSTEM,
         submit_tool=SUBMIT_BRIEF,
-        extra_tools=_HALT,
+        # 无 submit_halt：Flash 缺用户才能给的信息时用 outcome=blocked 的 brief 上报，
+        # 由 Pro 在 Judge 里确认并决定是否 halt。
         # permission 由 permission_for_wave 给：独个 Flash 拿写权限，并行则全部只读。
     ),
 }
@@ -229,7 +230,8 @@ def phase_of(kind: TaskKind) -> PhaseSpec:
 def phase_control_message(kind: TaskKind) -> dict[str, Any]:
     """Pro 主线追加到 history 尾部的宿主阶段控制消息。"""
     phase = phase_of(kind)
-    permission = (phase.visible or phase.permission or Permission.READONLY).value
+    permission = (
+        phase.visible or phase.permission or Permission.READONLY).value
     return {
         "role": "user",
         "content": render_phase_control(

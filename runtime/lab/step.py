@@ -11,7 +11,7 @@ from typing import Any
 
 from runtime.lab.accept import AcceptResult, NO_HARD_CRITERIA, PASS, TEST_INVALID, sanity_and_run
 from runtime.lab.effects import EffectLedger
-from runtime.lab.helpers import halt_of, step_gate
+from runtime.lab.helpers import step_gate
 from runtime.lab.journal import Journal
 from runtime.lab.persist import (
     SPEC_FILE,
@@ -24,7 +24,6 @@ from runtime.lab.scheduler import permission_for_wave, run_wave
 from runtime.lab.spec import Assignment, render_assignment
 from runtime.loop import run_loop
 from runtime.loop.parse import synthetic_brief
-from runtime.loop.schema import SUBMIT_HALT
 from runtime.observe import spans as S
 from runtime.task import RuntimeTask, TaskKind, TaskStatus, TaskTree
 from tools.sandbox_tools import is_sandbox_unreachable
@@ -65,7 +64,7 @@ async def run_step(
     step: int,
     on_gate: Callable[[str, str], None],
     on_event: EventSink | None,
-) -> tuple[list[dict[str, Any]], bool, AcceptResult, dict[str, Any] | None]:
+) -> tuple[list[dict[str, Any]], bool, AcceptResult]:
     permission = permission_for_wave(len(assignments))
     workers = [
         tree.add_child(
@@ -115,21 +114,16 @@ async def run_step(
 
     briefs = []
     spec_invalid = False
-    halt: dict[str, Any] | None = None
     for worker, brief in results:
         briefs.append(brief)
-        found = halt_of(brief)
-        if found:
-            halt = found
         aid = str((worker.node_spec or {}).get("id") or "")
         if not aid:
             continue
         if brief.get("outcome") == "spec_invalid":
             spec_invalid = True
-        on_progress(aid, str(brief.get("brief") or (
-            found or {}).get("reason") or ""))
+        on_progress(aid, str(brief.get("brief") or ""))
 
-    return briefs, spec_invalid, step_gate(results), halt
+    return briefs, spec_invalid, step_gate(results)
 
 
 async def run_worker(
@@ -204,33 +198,6 @@ async def run_worker(
             if result.reason == "validation_takeover":
                 brief["takeover"] = True
                 brief["outcome"] = "failed"
-            halted = halt_of(result.submit)
-            if halted:
-                payload = {
-                    "name": SUBMIT_HALT,
-                    "payload": halted,
-                    "outcome": "halt",
-                    "brief": halted.get("reason"),
-                }
-                worker.brief = payload
-                try:
-                    worker.transit(TaskStatus.COMPLETED)
-                except ValueError:
-                    pass
-                ledger.drop(assignment.id)
-                save_tree(session_dir, tree)
-                task_span.set(**{S.ATTR_OUTCOME: "halt"})
-                task_span.output(str(halted.get("reason") or "")[:2000])
-                await runner._emit(
-                    on_event,
-                    {
-                        "kind": "halt",
-                        "reason": str(halted.get("reason") or "")[:800],
-                        "need_from_user": str(halted.get("need_from_user") or "")[:800],
-                        "assignment_id": assignment.id,
-                    },
-                )
-                return payload
         except asyncio.TimeoutError:
             brief = synthetic_brief(
                 outcome="failed",

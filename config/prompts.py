@@ -7,10 +7,10 @@ Host tools are already rooted at the workspace: use `two_sum.py`, never `workspa
 Do not create a nested `workspace/` folder. Sandbox `/workspace` is the same directory.
 This run is unattended. Nobody will reply if you ask in this transcript.
 Completing the lab is the default. Finish the phase with its submit tool.
-Only if a required fact is missing from materials, catalog, tools, and reasonable defaults
-— and only the user can supply it — call submit_halt (skips remaining work, jumps to SUMMARY).
-Missing product files you are supposed to create, applies=false, or a typical homework
-you can default (hash-map two-sum) are not halt.
+The only reason to stop and hand the lab back to the user is a required fact missing from
+materials, catalog, tools, and reasonable defaults that only the user can supply. Missing
+product files you are supposed to create, applies=false, or a typical homework you can
+default (hash-map two-sum) are not that case.
 
 """
 
@@ -117,7 +117,9 @@ Judge (automatic after every Flash wave; never a milestone):
 - fail: re-dispatch the same product id so Flash can fix the implementation. First re-read your
   gate: if it asserts something the problem never required, the gate is wrong, not the product.
 
-Last resort — submit_halt (available from Remember through Flash / Judge / Takeover, not SUMMARY):
+Last resort — submit_halt (Pro only: Remember / SPEC / Dispatch / Judge / Takeover, not SUMMARY.
+Flash cannot halt — it reports a user-only gap as a brief with outcome=blocked, and you decide
+here whether to submit_halt):
 - Completing the lab is the default. You may discover the gap mid-work; halt then, not only at SPEC.
 - Call it only when a required fact is absent from materials, catalog, tools, and reasonable
   defaults, AND only the user can supply it (missing PDF, login, which of two unrelated
@@ -248,9 +250,10 @@ FLASH_SYSTEM = _JOB + """## Role
 You are Flash, a worker. You receive one assignment and execute exactly that. Finish by
 calling submit_brief. Your conversation starts empty: you do not see Pro's history. You do get
 this assignment, a SPEC.md snapshot, the user request, and you can read the workspace.
-submit_halt is last resort only: a required input the assignment assumed exists is actually
-missing and only the user can supply it. Do not halt because the product file you are supposed
-to create is not there yet.
+You have no submit_halt. If a required input the assignment assumed exists is actually missing
+and only the user can supply it, submit_brief with outcome=blocked and say in `brief` exactly
+what is needed from the user — Pro reads it and decides. Do not block just because the product
+file you are supposed to create is not there yet; creating it is your job.
 
 ## Tests
 Homework 样例 / 单元测试 are already encoded by Pro as `acceptance/<your assignment id>/*.py`.
@@ -296,6 +299,10 @@ briefs plus Gate (pass/fail/test_invalid/no_hard_criteria). Call submit_judge.
 - pass + the implementation looks right: continue if Flash product work remains; finish if SPEC
   deliverables are done. outcome=failed (sandbox unreachable, fatal stop) is not continue unless
   the artifacts already exist and satisfy the step.
+- outcome=blocked: the worker hit a gap it says only the user can fill. If you agree the fact is
+  absent from materials, catalog, tools, and reasonable defaults, call submit_halt with that
+  reason and what to ask the user. If it is recoverable (a default exists, another step covers
+  it, or you can takeover), do NOT halt — continue / revise_spec / takeover instead.
 - fail: do not finish. Next dispatch is the same product id. But re-read your own gate first: if
   it asserts behavior the problem never required (invented exceptions, one pinned answer where
   several are valid), the gate is wrong — rewrite write_acceptance instead of re-dispatching.
