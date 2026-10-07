@@ -6,9 +6,9 @@ from typing import Any
 
 from runtime.lab.accept import AcceptResult, FAIL, NO_HARD_CRITERIA, PASS, TEST_INVALID
 from runtime.lab.remember import rules_satisfied
-from runtime.lab.spec import Assignment, ProjectSpec
-from runtime.loop.schema import SUBMIT_HALT, SUBMIT_SPEC
-from runtime.task import RuntimeTask, TaskKind, TaskStatus, TaskTree
+from runtime.lab.spec import Assignment
+from runtime.loop.schema import SUBMIT_HALT
+from runtime.task import RuntimeTask
 
 _PROGRESS_CAP = 8000
 
@@ -136,16 +136,3 @@ def sanitize_decision(
     if decision == "takeover" and gate_state == TEST_INVALID:
         decision = "continue"
     return decision
-
-
-def resume_spec(tree: TaskTree) -> ProjectSpec | None:
-    """从已 COMPLETED 的 SPEC 节点取出 payload。没有可用 goal 时返回 None，走新起草路径。"""
-    for task in tree.nodes.values():
-        if task.kind is not TaskKind.SPEC or task.status is not TaskStatus.COMPLETED:
-            continue
-        brief = task.brief or {}
-        payload = brief.get("payload") if brief.get(
-            "name") == SUBMIT_SPEC else brief
-        if payload and payload.get("goal"):
-            return ProjectSpec.from_payload(payload)
-    return None

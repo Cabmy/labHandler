@@ -12,7 +12,7 @@ cards：SPEC 预取的跨 lab 卡片正文，仅 Pro。memory_forget 一拍之�
 retrieved：本 loop 里 memory_search/grep/read、notes_read、load_skill 的追加结果，不进 history。
 events：harness 就本轮循环执行状况注入的告警（输出截断、只回文本没调 submit、死循环、
        预算耗尽、致命/鉴权错误），来自 task.events。每拍最易变，排最末只作废缓存尾巴；
-       不进 history，随 STATE.json 持久化。
+       不进 history，随 attempt_ended 的计数快照记入 Journal。
 
 history 是工具消息的唯一载体，其中已经包含成对的 assistant(tool_calls) +
 tool 响应。装配层没有第二个 tool 槽位。

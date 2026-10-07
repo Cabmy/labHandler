@@ -1,20 +1,12 @@
-"""会话目录的持久化原语：原子写、Task 树快照、续跑扫描。
-
-infra.files.atomic_write_text（tmp + fsync + rename + dir fsync）是共享原子写实现，
-session 目录快照与 memory/profile 的 YAML 写回都走它，崩在半路不会留下截断的文件。
-阶段进度、Pro 对话与副作用账本不在这里——它们全部走
-runtime/lab/journal.py 的 append-only 事件日志（JOURNAL.jsonl）。
-"""
+"""会话文件原语与 Journal 恢复扫描；不维护第二份生命周期快照。"""
 
 import json
 from pathlib import Path
 from typing import Any
 
 from infra.files import atomic_write_text
-from runtime.lab.journal import JOURNAL_FILE
-from runtime.task import TaskTree, TaskStatus
+from runtime.lab.journal import JOURNAL_FILE, Journal, JournalState
 
-STATE_FILE = "STATE.json"
 SPEC_FILE = "SPEC.md"
 CATALOG_FILE = "CATALOG.md"
 
@@ -55,26 +47,7 @@ def read_json(sdir: Path, name: str) -> Any | None:
         return None
 
 
-# ── Task 树快照 ─────────────────────────────────────────
-
-def save_tree(sdir: Path, tree: TaskTree) -> None:
-    write_json(sdir, STATE_FILE, tree.to_dict())
-
-
-def load_tree(sdir: Path) -> TaskTree | None:
-    """损坏或缺 root_id 的 STATE.json 返回 None。调用方据此判定不可续跑。"""
-    data = read_json(sdir, STATE_FILE)
-    if not isinstance(data, dict) or "root_id" not in data:
-        return None
-    try:
-        return TaskTree.from_dict(data)
-    except (KeyError, ValueError, TypeError):
-        return None
-
-
-# ── 续跑扫描 ────────────────────────────────────────────
-
-def latest_incomplete(workspace: Path) -> tuple[str, TaskTree] | None:
+def latest_incomplete(workspace: Path) -> tuple[str, JournalState] | None:
     root = session_root(workspace)
     if not root.is_dir():
         return None
@@ -83,20 +56,13 @@ def latest_incomplete(workspace: Path) -> tuple[str, TaskTree] | None:
         key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
-    for d in dirs:
-        tree = load_tree(d)
-        if tree is None:
+    for directory in dirs:
+        try:
+            state = Journal(directory / JOURNAL_FILE).replay()
+        except (ValueError, KeyError, TypeError):
             continue
-        root_task = tree.get(tree.root_id)
-        if root_task.status in {TaskStatus.PENDING, TaskStatus.RUNNING}:
-            return d.name, tree
-        # 用户停止或 SPEC 失败：有事件日志就能接着跑，终态树也能挂回去。
-        if root_task.status in {TaskStatus.CANCELLED, TaskStatus.FAILED} and (
-            d / JOURNAL_FILE
-        ).is_file():
-            return d.name, tree
-        if any(n.status is TaskStatus.RUNNING for n in tree.nodes.values()):
-            return d.name, tree
+        if state.resumable:
+            return directory.name, state
     return None
 
 

@@ -124,40 +124,16 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _state(session_dir: Path) -> dict[str, Any]:
-    path = session_dir / "STATE.json"
-    if not path.is_file():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
-def _payload(node: dict[str, Any]) -> dict[str, Any]:
-    brief = node.get("brief") or {}
-    if isinstance(brief, dict) and isinstance(brief.get("payload"), dict):
-        return brief["payload"]
-    return brief if isinstance(brief, dict) else {}
-
-
-def _judge_view(state: dict[str, Any]) -> dict[str, Any]:
-    finished = False
-    verdict: dict[str, Any] = {}
-    remember: list[dict[str, Any]] = []
-    for node in (state.get("nodes") or {}).values():
-        if not isinstance(node, dict):
-            continue
-        kind = node.get("kind")
-        payload = _payload(node)
-        if kind == "judge" and payload.get("decision") == "finish":
-            finished = True
-            verdict = payload
-        if kind == "remember_judge":
-            remember = [row for row in (payload.get(
-                "verdicts") or []) if isinstance(row, dict)]
-    return {"finished": finished, "verdict": verdict, "remember": remember}
+def _judge_view(session_dir: Path) -> dict[str, Any]:
+    from runtime.lab.journal import JOURNAL_FILE, Journal
+    state = Journal(session_dir / JOURNAL_FILE).replay()
+    verdict = state.latest_submit("submit_judge") or {}
+    remembered = state.latest_submit("submit_remember") or {}
+    return {
+        "finished": verdict.get("decision") == "finish",
+        "verdict": verdict,
+        "remember": [row for row in remembered.get("verdicts", []) if isinstance(row, dict)],
+    }
 
 
 async def run_case(
@@ -220,8 +196,7 @@ async def run_case(
         hidden_log = f"{type(exc).__name__}: {exc}"
 
     session_dir = session.session_path
-    state = _state(session_dir) if session_dir.exists() else {}
-    view = _judge_view(state)
+    view = _judge_view(session_dir)
     applied = load_applied(session_dir) if session_dir.exists() else []
     rules_ok = rules_satisfied(applied or [], view["verdict"])
     cards_now = load_cards(session_dir) if session_dir.exists() else None

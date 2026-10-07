@@ -19,7 +19,9 @@ from runtime.loop.tools import ToolRegistry, build_registry
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer, as_tracer
 from runtime.phase import PRO, phase_of, system_for
-from runtime.task import Permission, TaskKind, TaskTree
+from runtime.task import Permission, TaskKind
+from runtime.lab.journal import Journal
+from runtime.lab.execution import RunPaused
 from tools.skill_tool import LOAD_SKILL, SkillBind
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
@@ -41,19 +43,18 @@ class LabRunner:
         # 归一后 tracer 永不为 None：调用点直接 with self.tracer.span(...)，无 None 分支。
         self.tracer = as_tracer(tracer)
         self.clock = clock
-        self._cancel = asyncio.Event()
+        self._active: asyncio.Task | None = None
         self._applied_rules: list[str] | None = None
         self._skill = SkillBind()
 
+    @property
+    def running(self) -> bool:
+        return self._active is not None
+
     def request_stop(self) -> None:
-        self._cancel.set()
-
-    def _cancelled(self) -> bool:
-        return self._cancel.is_set()
-
-    def _arm(self) -> None:
-        """每次 run 开始时解除上一次的停止信号，否则停一次之后永远停着。"""
-        self._cancel.clear()
+        # 不另存取消标记：运行协程就是执行与取消的唯一控制源。
+        if self.running and not self._active.cancelling():
+            self._active.cancel()
 
     async def _emit(self, sink: EventSink | None, payload: dict[str, Any]) -> None:
         if sink:
@@ -112,24 +113,58 @@ class LabRunner:
         self,
         question: str,
         session_dir: Path,
-        tree: TaskTree,
         *,
         on_event: EventSink | None = None,
         resume: bool = False,
     ) -> dict[str, Any]:
-        self._arm()
+        if self.running:
+            raise RuntimeError("lab is already running")
+        journal = Journal.open(session_dir)
+        state = journal.replay()
+        if resume:
+            if not state.resumable:
+                raise ValueError("session is not resumable")
+            question = state.question
+        else:
+            if state.begun:
+                raise ValueError("new lab requires a new session directory")
+            journal.append("begin", {"version": 1, "question": question})
+        journal.append("run_started", {})
         try:
             with self.tracer.span(
                 S.RUN,
                 kind=S.KIND_AGENT,
                 inputs=question,
-                **{S.ATTR_THREAD_ID: session_dir.name, S.ATTR_TASK_ID: tree.root_id},
+                **{S.ATTR_THREAD_ID: session_dir.name},
             ) as run_span:
-                result = await run_lab(
-                    self, question, session_dir, tree, on_event=on_event, resume=resume
-                )
+                self._active = asyncio.create_task(run_lab(
+                    self, question, session_dir, journal, state if resume else None,
+                    on_event=on_event, resume=resume,
+                ))
+                try:
+                    result = await self._active
+                except asyncio.CancelledError:
+                    # await 会将调用者取消传递给子协程；外部取消继续传播，
+                    # request_stop 只取消子协程，转换成明确的暂停结果。
+                    external = bool(asyncio.current_task().cancelling())
+                    reason = "cancelled" if external else "user_stop"
+                    journal.append("run_paused", {"reason": reason})
+                    if external:
+                        raise
+                    return {"verdict": "paused", "reason": reason,
+                            "summary": "", "question": question}
+                except RunPaused as exc:
+                    journal.append("run_paused", {"reason": str(exc)})
+                    return {"verdict": "paused", "reason": str(exc),
+                            "summary": "", "question": question}
+                except Exception as exc:
+                    journal.append("run_paused", {"reason": f"{type(exc).__name__}: {exc}"})
+                    raise
+                # run_lab 只有成功写出 Summary 才正常收尾；不检查业务 verdict。
+                journal.append("session_closed", {"result": result})
                 run_span.set(**{S.ATTR_OUTCOME: result.get("verdict")})
                 run_span.output(result.get("summary", "")[:2000])
                 return result
         finally:
+            self._active = None
             self.tracer.flush()

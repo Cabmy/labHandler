@@ -1,7 +1,7 @@
 """会话的 append-only 事件日志：JOURNAL.jsonl 是一次 lab 的唯一事实源。
 
 每行一个事件 {"seq", "kind", "payload"}，append 即写盘 + fsync。replay 逐行
-解析并容忍坏行——尾部截断处就是崩溃点。LabState 是日志的投影：恢复时 replay
+解析完整记录，尾部半行就是崩溃点；已提交的坏行拒绝恢复。LabState 是日志的投影：恢复时 replay
 重建全部可变状态；transcript 由最后一个 tx_snapshot 加其后的 tx_delta 重建，
 因此 Pro 崩在任意一轮都能从已落盘的前缀续传，而不是整阶段重跑。
 """
@@ -21,7 +21,12 @@ _STAGES = {"remember", "spec", "advance", "summary"}
 class JournalState:
     """replay 的产物：一份可直接注入 LabState 的还原快照。"""
 
+    begun: bool = False
     question: str = ""
+    # 有 session_closed 才终结；无 live 协程的 open 会话始终可恢复。
+    result: dict[str, Any] | None = None
+    pause_reason: str = "interrupted"
+    attempts: dict[str, dict[str, Any]] = field(default_factory=dict)
     transcript: list[dict[str, Any]] = field(default_factory=list)
     stage: str = "remember"
     dispatch_step: int = 0
@@ -41,6 +46,25 @@ class JournalState:
     # 副作用账本：node_id -> {probe: fingerprint}。
     effects: dict[str, dict[str, Any]] = field(default_factory=dict)
 
+    @property
+    def resumable(self) -> bool:
+        return self.begun and self.result is None
+
+    def status(self, *, running: bool = False) -> str | None:
+        """运行状态是视图；磁盘从不声称有一个活着的协程。"""
+        if running:
+            return "RUNNING"
+        if not self.begun:
+            return None
+        return "FINISHED" if self.result is not None else "PAUSED"
+
+    def latest_submit(self, name: str) -> dict[str, Any] | None:
+        for attempt in reversed(list(self.attempts.values())):
+            submit = (attempt.get("end") or {}).get("submit") or {}
+            if submit.get("name") == name:
+                return submit["payload"]
+        return None
+
 
 class Journal:
     """单个会话目录的事件日志。单写者：一次 run 只有一个 Journal 实例在写。"""
@@ -55,11 +79,14 @@ class Journal:
         sdir.mkdir(parents=True, exist_ok=True)
         journal = cls(sdir / JOURNAL_FILE)
         if journal.path.is_file():
-            try:
-                with journal.path.open(encoding="utf-8") as f:
-                    journal._seq = sum(1 for _ in f)
-            except OSError:
-                journal._seq = 0
+            # 只有以换行结尾的记录提交成功；先移除崩溃留下的半行再追加，
+            # 否则下一条事件会粘到坏行后面一起丢失。
+            with journal.path.open("r+b") as f:
+                data = f.read()
+                boundary = data.rfind(b"\n") + 1
+                if boundary < len(data):
+                    f.truncate(boundary)
+                journal._seq = data[:boundary].count(b"\n")
         return journal
 
     def sync_tx(self, length: int) -> None:
@@ -89,24 +116,25 @@ class Journal:
         self._tx_len = len(history)
 
     def _iter_events(self) -> Iterator[tuple[str, dict[str, Any]]]:
-        """逐行产出 (kind, payload)。坏行跳过：尾部截断即崩溃点，中间坏行不连坐。"""
+        """只重放完整的已提交记录，拒绝静默跳过损坏的生命周期事实。"""
         if not self.path.is_file():
             return
         try:
-            lines = self.path.read_text(encoding="utf-8").splitlines()
-        except OSError:
+            lines = self.path.read_bytes().splitlines(keepends=True)
+        except FileNotFoundError:
             return
         for line in lines:
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+            if not line.endswith(b"\n"):
+                break
+            rec = json.loads(line)
             if not isinstance(rec, dict):
-                continue
+                raise ValueError("journal event must be an object")
             kind = rec.get("kind")
             payload = rec.get("payload")
             if isinstance(kind, str) and isinstance(payload, dict):
                 yield kind, payload
+            else:
+                raise ValueError("invalid journal event")
 
     def replay(self) -> JournalState:
         # 延迟导入：cycle 经 context.compact 回头依赖 persist，顶层导入会成环。
@@ -116,7 +144,20 @@ class Journal:
         tx: list[dict[str, Any]] = []
         for kind, payload in self._iter_events():
             if kind == "begin":
+                if payload.get("version") != 1:
+                    raise ValueError("unsupported journal format")
+                st.begun = True
                 st.question = str(payload.get("question") or "")
+            elif kind == "run_started":
+                st.pause_reason = "interrupted"
+            elif kind == "run_paused":
+                st.pause_reason = str(payload["reason"])
+            elif kind == "session_closed":
+                st.result = dict(payload["result"])
+            elif kind == "attempt_started":
+                st.attempts[payload["task_id"]] = dict(payload)
+            elif kind == "attempt_ended":
+                st.attempts[payload["task_id"]]["end"] = dict(payload)
             elif kind == "tx_snapshot":
                 messages = payload.get("messages")
                 tx = [m for m in messages if isinstance(m, dict)] if isinstance(messages, list) else []

@@ -1,6 +1,6 @@
-"""lab 生命周期：一次会话对应一个 thread_id、一棵 Task 树、一个会话目录。
+"""lab 生命周期：一次会话对应一个 thread_id、一个 Journal、一个会话目录。
 
-新任务永远新开会话。续跑只通过 attach_resume 显式挂上未完成的树，
+新任务永远新开会话。续跑只通过 attach_resume 显式选择未收尾的 Journal，
 并 replay JOURNAL.jsonl 恢复 Pro 对话与阶段进度到断点。
 done() 归档知识卡、把 workspace 挪进 .trash、重建沙箱，并换一棵空 runner。
 """
@@ -18,7 +18,7 @@ from runtime.observe.sinks import build_sinks
 from runtime.observe.tracer import Tracer
 from runtime.lab.runner import LabRunner
 from runtime.lab.persist import latest_incomplete, session_dir as make_session_dir
-from runtime.task import TaskTree, new_session_task
+from runtime.lab.journal import JOURNAL_FILE, Journal
 from runtime.loop.tools import build_registry
 
 
@@ -55,7 +55,6 @@ class LabSession:
             clock=clock,
         )
         self.thread_id = _new_thread_id()
-        self.tree: TaskTree | None = None
         self.last_result: dict[str, Any] = {}
         self._resuming = False
 
@@ -63,50 +62,48 @@ class LabSession:
     def session_path(self) -> Path:
         return make_session_dir(self.settings.workspace_dir, self.thread_id)
 
+    @property
+    def status(self) -> str | None:
+        return Journal(self.session_path / JOURNAL_FILE).replay().status(running=self.runner.running)
+
     def peek_resume(self) -> dict[str, Any] | None:
         found = latest_incomplete(self.settings.workspace_dir)
         if not found:
             return None
-        tid, tree = found
-        root = tree.get(tree.root_id)
-        return {"thread_id": tid, "status": root.status.value}
+        tid, state = found
+        running = self.runner.running and tid == self.thread_id
+        return {"thread_id": tid, "status": state.status(running=running),
+                "reason": "" if running else state.pause_reason}
 
-    def attach_resume(self, thread_id: str, tree: TaskTree) -> None:
-        """挂上一个未完成的会话。续跑是显式动作，只在这里发生。"""
+    def attach_resume(self, thread_id: str) -> None:
+        """选择未收尾的会话；可恢复性由 runner 在读取 Journal 时校验。"""
+        if self.runner.running:
+            raise RuntimeError("lab is already running")
         self.thread_id = thread_id
-        self.tree = tree
         self._resuming = True
 
     def decline_resume(self) -> dict[str, Any]:
         found = latest_incomplete(self.settings.workspace_dir)
         if found:
-            self.thread_id, self.tree = found[0], found[1]
+            self.thread_id = found[0]
         return self.done(log=lambda m: None)
 
     def request_stop(self) -> None:
         self.runner.request_stop()
 
     async def run(self, question: str, on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None) -> dict[str, Any]:
+        if self.runner.running:
+            raise RuntimeError("lab is already running")
+        self.last_result = {}
         resume = self._resuming
         if not resume:
-            # 每个新任务都是一条独立会话：新的 thread_id、新的 Task 树、新的目录。
-            # 复用上一轮的树会让新任务读到上一轮的 SPEC.md 和材料。
             self.thread_id = _new_thread_id()
-            self.tree = TaskTree(
-                new_session_task(
-                    step_budget=self.settings.pro_step_budget + self.settings.flash_step_budget,
-                    wall_time_s=self.settings.task_wall_time_s * 4,
-                    now=self.clock(),
-                )
-            )
-        assert self.tree is not None
         self._resuming = False
         self.tracer.new_trace()
         self.session_path.mkdir(parents=True, exist_ok=True)
         result = await self.runner.run(
             question,
             self.session_path,
-            self.tree,
             on_event=on_event,
             resume=resume,
         )
@@ -204,7 +201,8 @@ class LabSession:
     def done(
         self, log=print, archive_result: dict[str, Any] | None = None
     ) -> dict[str, Any]:
-        self.request_stop()
+        if self.runner.running:
+            raise RuntimeError("wait for the running lab to stop before clearing workspace")
         if archive_result is None:
             archive_result = self.archive()
         bucket, moved = self.clear_workspace()
@@ -214,8 +212,8 @@ class LabSession:
             sandbox = "ok" if recreate_sandbox(log=log) else "not_ready"
         except Exception as e:
             sandbox = f"failed: {type(e).__name__}: {e}"
-        self.tree = None
         self.last_result = {}
+        self._resuming = False
         self.thread_id = _new_thread_id()
         self.runner = LabRunner(
             self.settings,

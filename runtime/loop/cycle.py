@@ -30,7 +30,7 @@ from runtime.loop.calls import SUBMIT_TOOLS, run_calls
 from runtime.loop.parse import coerce_brief, synthetic_brief, tool_choice_required
 from runtime.loop.schema import SUBMIT_BRIEF, SUBMIT_HALT
 from runtime.loop.stagnation import NUDGE_TEXT, StagnationSignal, StagnationTracker
-from runtime.task import Permission, RuntimeTask, TaskStatus
+from runtime.task import Permission, RuntimeTask
 from runtime.loop.registry import ToolContext, ToolRegistry
 from tools.sandbox_tools import is_sandbox_unreachable
 from tools.skill_tool import LOAD_SKILL, LOAD_SKILL_REFERENCE
@@ -508,8 +508,6 @@ async def run_loop(
         while True:
             flush_transcript()
             remaining = max(1.0, task.deadline - clock())
-            if task.status is TaskStatus.PENDING:
-                task.transit(TaskStatus.RUNNING)
 
             finished = await asyncio.wait_for(one_turn(), timeout=remaining)
             if finished is not None:
@@ -573,3 +571,6 @@ async def run_loop(
             None,
             "deadline",
         )
+
+    finally:
+        flush_transcript()

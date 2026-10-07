@@ -22,7 +22,6 @@ workspace/
 
 # 内部设计
 tests/
-docs/
 tmp/
 benchmark/
 eval/runs/

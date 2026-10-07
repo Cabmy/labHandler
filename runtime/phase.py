@@ -11,7 +11,7 @@ TaskKind 是阶段的唯一身份。prompt、结构化出口、广告工具表�
   只把结构化结果交回 Pro。
 
 两个权限概念不要混：
-- permission 是节点权限，进 Task 树与审计，决定文件写检查放不放行。
+- permission 是节点权限，进执行记录与审计，决定文件写检查放不放行。
 - 广告表可以宽于执行允许集（只读主线为了前缀缓存）；写检查仍看 permission。
   规划阶段节点仍是 pro，广告里有 write_acceptance / 各 submit_*，执行端按
   allow_tools 拒绝当前阶段不该调的名字。

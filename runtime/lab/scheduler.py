@@ -1,8 +1,7 @@
-"""执行一步里的 Flash worker：1 个串行可写，多个只读并行。
+"""有界并发执行一波 assignment；协程拥有执行生命周期。
 
-任一 worker 的 outcome=spec_invalid，或 sandbox_unreachable 时取消
-尚未完成的兄弟，并给它们合成 failed brief。并发上限为
-settings.max_parallel_readonly_workers。
+每个返回（包括合成的异常结果）立即提交。兄弟取消会形成 blocked brief；
+整波被用户取消时只保留此前已提交的结果，其余 assignment 续跑时补做。
 """
 
 import asyncio
@@ -13,17 +12,14 @@ from config.runtime import RuntimeSettings
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer, as_tracer
 from runtime.loop.parse import synthetic_brief
-from runtime.task import Permission, RuntimeTask, TaskStatus
+from runtime.task import Permission, RuntimeTask
 
 
 def _cancels_wave(brief: dict[str, Any]) -> bool:
-    return brief.get("outcome") == "spec_invalid" or bool(
-        brief.get("sandbox_unreachable")
-    )
+    return brief.get("outcome") == "spec_invalid" or bool(brief.get("sandbox_unreachable"))
 
 
 def permission_for_wave(n: int) -> Permission:
-    """单个 worker 可写；多个并行一律只读，避免并发写冲突。"""
     return Permission.WRITE if n == 1 else Permission.READONLY
 
 
@@ -33,83 +29,49 @@ async def run_wave(
     settings: RuntimeSettings,
     *,
     tracer: Tracer | None = None,
+    on_result: Callable[[RuntimeTask, dict[str, Any]], None],
 ) -> list[tuple[RuntimeTask, dict[str, Any]]]:
     tracer = as_tracer(tracer)
-    if not workers:
-        return []
-    if len(workers) == 1:
-        w = workers[0]
-        try:
-            brief = await runner(w)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            tracer.event(
-                S.EV_STEP_ERROR,
-                **{S.ATTR_TASK_ID: w.task_id, S.ATTR_REASON: f"{type(e).__name__}: {e}"},
-            )
-            brief = synthetic_brief(
-                outcome="failed", brief=f"{type(e).__name__}: {e}"
-            )
-        return [(w, brief)]
-
     sem = asyncio.Semaphore(settings.max_parallel_readonly_workers)
     results: dict[str, dict[str, Any]] = {}
 
-    async def one(w: RuntimeTask) -> None:
+    def commit(worker: RuntimeTask, brief: dict[str, Any]) -> None:
+        on_result(worker, brief)
+        results[worker.task_id] = brief
+
+    async def one(worker: RuntimeTask) -> None:
         async with sem:
             try:
-                results[w.task_id] = await runner(w)
+                brief = await runner(worker)
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                tracer.event(
-                    S.EV_STEP_ERROR,
-                    **{S.ATTR_TASK_ID: w.task_id, S.ATTR_REASON: f"{type(e).__name__}: {e}"},
-                )
-                results[w.task_id] = synthetic_brief(
-                    outcome="failed", brief=f"{type(e).__name__}: {e}"
-                )
+            except Exception as exc:
+                tracer.event(S.EV_STEP_ERROR, **{
+                    S.ATTR_TASK_ID: worker.task_id,
+                    S.ATTR_REASON: f"{type(exc).__name__}: {exc}",
+                })
+                brief = synthetic_brief(outcome="failed", brief=f"{type(exc).__name__}: {exc}")
+            commit(worker, brief)
 
-    tasks = {w.task_id: asyncio.ensure_future(one(w)) for w in workers}
-    pending = set(tasks.values())
+    tasks = [asyncio.create_task(one(worker)) for worker in workers]
+    pending = set(tasks)
     try:
         while pending:
-            _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            if any(_cancels_wave(results.get(w.task_id) or {}) for w in workers):
-                for t in pending:
-                    t.cancel()
+            completed, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in completed:
+                await task  # 持久化失败等控制面异常不得被吞掉。
+            if any(_cancels_wave(brief) for brief in results.values()):
                 break
-        if pending:
-            await asyncio.gather(*pending, return_exceptions=True)
     finally:
-        for t in tasks.values():
-            if not t.done():
-                t.cancel()
-        outcomes = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        # one() 已把普通异常写成 failed brief。此处剩余的是未捕获异常，记进 span。
-        for (task_id, _), outcome in zip(tasks.items(), outcomes):
-            if isinstance(outcome, Exception):
-                tracer.event(
-                    S.EV_STEP_ERROR,
-                    **{
-                        S.ATTR_TASK_ID: task_id,
-                        S.ATTR_REASON: f"unhandled {type(outcome).__name__}: {outcome}",
-                    },
-                )
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
-    out: list[tuple[RuntimeTask, dict[str, Any]]] = []
-    for w in workers:
-        brief = results.get(w.task_id)
-        if brief is None:
-            brief = synthetic_brief(
-                outcome="failed",
-                brief="Sibling workers were cancelled after spec_invalid, halt, or sandbox_unreachable.",
-            )
-            if w.status is TaskStatus.RUNNING:
-                try:
-                    w.transit(TaskStatus.CANCELLED)
-                except ValueError:
-                    pass
-        out.append((w, brief))
-    return out
+    for worker in workers:
+        if worker.task_id not in results:
+            commit(worker, synthetic_brief(
+                outcome="blocked",
+                brief="Cancelled because a sibling reported spec_invalid or sandbox_unreachable.",
+            ))
+    return [(worker, results[worker.task_id]) for worker in workers]

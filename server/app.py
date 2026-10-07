@@ -70,6 +70,8 @@ async def _warm_memory_index() -> None:
 async def _shutdown() -> None:
     """进程退出前刷出 span、关闭 LLM client，否则最后一段 trace 会丢在缓冲里。"""
     _session.request_stop()
+    if _current_task is not None:
+        await asyncio.gather(_current_task, return_exceptions=True)
     _session.tracer.shutdown()
     await _session.llm.aclose()
 
@@ -146,7 +148,7 @@ class TaskRequest(BaseModel):
 async def _run_lab(question: str) -> None:
     """把一次 LabSession.run 写成 final/error 事件并关闭 SSE。
 
-    续跑 vs 新开由 session 是否已 attach tree 决定。
+    续跑 vs 新开由 session 是否已 attach_resume 决定。
     """
 
     async def sink(ev: dict[str, Any]) -> None:
@@ -205,10 +207,10 @@ async def resume_lab(req: ResumeRequest) -> dict[str, Any]:
         peek = await asyncio.to_thread(latest_incomplete, _ws())
         if not peek:
             raise HTTPException(status_code=404, detail="没有未完成的 lab")
-        tid, tree = peek
+        tid, _ = peek
         if not req.continue_lab:
             return await asyncio.to_thread(_session.decline_resume)
-        _session.attach_resume(tid, tree)
+        _session.attach_resume(tid)
         while not _event_queue.empty():
             _event_queue.get_nowait()
         _current_task = asyncio.create_task(_run_lab(req.question))
@@ -247,6 +249,7 @@ async def get_state() -> dict[str, Any]:
     peek = _session.peek_resume()
     return {
         "running": _is_running(),
+        "status": _session.status,
         "thread_id": _session.thread_id,
         "resumable": peek,
         "verdict": (_session.last_result or {}).get("verdict"),
@@ -384,8 +387,8 @@ async def done() -> dict[str, Any]:
         if _current_task is not None:
             try:
                 await asyncio.wait_for(asyncio.shield(_current_task), timeout=15)
-            except Exception:
-                pass
+            except asyncio.TimeoutError:
+                raise HTTPException(status_code=409, detail="任务仍在清理，请稍后再归档")
     # 卡片先入档并向量索引，再 done 复位；反序会丢掉未索引卡片。
     archive_result = await _session.archive_async()
     return await asyncio.to_thread(_session.done, lambda m: None, archive_result)

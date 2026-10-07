@@ -4,7 +4,6 @@ worker 完成即把 brief 写进 journal，门禁结论经 on_gate 回调记帐�
 中间时，已完成的 assignment 有据可查，续跑只需补跑缺失的那几个。
 """
 
-import asyncio
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -18,14 +17,14 @@ from runtime.lab.persist import (
     audit_offset,
     changed_files_from_audit,
     read_text,
-    save_tree,
 )
 from runtime.lab.scheduler import permission_for_wave, run_wave
 from runtime.lab.spec import Assignment, render_assignment
 from runtime.loop import run_loop
 from runtime.loop.parse import synthetic_brief
 from runtime.observe import spans as S
-from runtime.task import RuntimeTask, TaskKind, TaskStatus, TaskTree
+from runtime.task import RuntimeTask, TaskKind
+from runtime.lab.execution import Attempt
 from tools.sandbox_tools import is_sandbox_unreachable
 
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
@@ -55,8 +54,6 @@ async def run_step(
     question: str,
     step_goal: str,
     session_dir: Path,
-    tree: TaskTree,
-    root: RuntimeTask,
     ledger: EffectLedger,
     progress: list[tuple[str, str]],
     on_progress: Callable[[str, str], None],
@@ -67,8 +64,7 @@ async def run_step(
 ) -> tuple[list[dict[str, Any]], bool, AcceptResult]:
     permission = permission_for_wave(len(assignments))
     workers = [
-        tree.add_child(
-            root.task_id,
+        RuntimeTask(
             kind=TaskKind.WORKER,
             permission=permission,
             step_budget=runner.settings.flash_step_budget,
@@ -77,7 +73,18 @@ async def run_step(
         )
         for a in assignments
     ]
-    save_tree(session_dir, tree)
+
+    def commit(worker: RuntimeTask, brief: dict[str, Any]) -> None:
+        assignment = Assignment.from_payload(worker.node_spec)
+        gate_state = (brief.get("tests") or {}).get("state")
+        if brief.get("outcome") == "done" and gate_state in {PASS, NO_HARD_CRITERIA}:
+            ledger.record(assignment.id, brief)
+        else:
+            ledger.drop(assignment.id)
+        if gate_state:
+            on_gate(assignment.gate_id, gate_state)
+        journal.append("brief", {"step": step, "aid": assignment.id, "brief": brief})
+        on_progress(assignment.id, str(brief.get("brief") or ""))
 
     domains = [a.domain or a.goal for a in assignments]
     done_so_far = list(progress)
@@ -99,17 +106,14 @@ async def run_step(
                 question=question,
                 step_goal=step_goal,
                 session_dir=session_dir,
-                tree=tree,
-                ledger=ledger,
                 done_so_far=done_so_far,
                 domains=domains,
                 journal=journal,
-                step=step,
-                on_gate=on_gate,
                 on_event=on_event,
             ),
             runner.settings,
             tracer=runner.tracer,
+            on_result=commit,
         )
 
     briefs = []
@@ -121,7 +125,6 @@ async def run_step(
             continue
         if brief.get("outcome") == "spec_invalid":
             spec_invalid = True
-        on_progress(aid, str(brief.get("brief") or ""))
 
     return briefs, spec_invalid, step_gate(results)
 
@@ -133,17 +136,12 @@ async def run_worker(
     question: str,
     step_goal: str,
     session_dir: Path,
-    tree: TaskTree,
-    ledger: EffectLedger,
     done_so_far: list[tuple[str, str]],
     domains: list[str],
     journal: Journal,
-    step: int,
-    on_gate: Callable[[str, str], None],
     on_event: EventSink | None,
 ) -> dict[str, Any]:
-    if worker.status is TaskStatus.PENDING:
-        worker.transit(TaskStatus.RUNNING)
+    worker.deadline = runner.clock() + runner.settings.task_wall_time_s
     audit_mark = audit_offset(runner.settings.workspace_dir)
 
     assignment = Assignment.from_payload(worker.node_spec or {})
@@ -172,50 +170,29 @@ async def run_worker(
         },
     ) as task_span:
         await runner._emit(on_event, {"kind": "node_start", "node": f"flash:{assignment.id}"})
-        try:
-            result = await asyncio.wait_for(
-                run_loop(
-                    worker,
-                    runner._agent_spec(TaskKind.WORKER, worker.permission),
-                    settings=runner.settings,
-                    llm=runner.llm,
-                    registry=runner.registry,
-                    session_dir=session_dir,
-                    user_input=prompt,
-                    project_spec="",
-                    on_event=on_event,
-                    tracer=runner.tracer,
-                    clock=runner.clock,
-                ),
-                timeout=max(1.0, worker.deadline - runner.clock()),
+        with Attempt(journal, worker).scope() as attempt:
+            result = attempt.result = await run_loop(
+                worker,
+                runner._agent_spec(TaskKind.WORKER, worker.permission),
+                settings=runner.settings,
+                llm=runner.llm,
+                registry=runner.registry,
+                session_dir=session_dir,
+                user_input=prompt,
+                project_spec="",
+                on_event=on_event,
+                tracer=runner.tracer,
+                clock=runner.clock,
             )
-            brief = result.brief or synthetic_brief(
-                outcome="failed", brief=result.reason or "no brief"
-            )
-            if result.reason == "sandbox_unreachable":
-                brief["sandbox_unreachable"] = True
-                brief["outcome"] = "failed"
-            if result.reason == "validation_takeover":
-                brief["takeover"] = True
-                brief["outcome"] = "failed"
-        except asyncio.TimeoutError:
-            brief = synthetic_brief(
-                outcome="failed",
-                brief="Your assignment was stopped because the execution budget was exhausted.",
-                changed_files=changed_files_from_audit(
-                    runner.settings.workspace_dir, since=audit_mark
-                ),
-            )
-            try:
-                worker.transit(TaskStatus.CANCELLED)
-            except ValueError:
-                pass
-            worker.brief = brief
-            ledger.drop(assignment.id)
-            journal.append(
-                "brief", {"step": step, "aid": assignment.id, "brief": brief})
-            save_tree(session_dir, tree)
-            return brief
+        brief = result.brief or synthetic_brief(
+            outcome="failed", brief=result.reason or "no brief"
+        )
+        if result.reason == "sandbox_unreachable":
+            brief["sandbox_unreachable"] = True
+            brief["outcome"] = "failed"
+        if result.reason == "validation_takeover":
+            brief["takeover"] = True
+            brief["outcome"] = "failed"
 
         brief["changed_files"] = brief.get("changed_files") or changed_files_from_audit(
             runner.settings.workspace_dir, since=audit_mark
@@ -231,26 +208,6 @@ async def run_worker(
             if is_sandbox_unreachable(gate.log):
                 brief["sandbox_unreachable"] = True
         brief["tests"] = gate.as_tests()
-        worker.brief = brief
-
-        succeeded = brief.get("outcome") == "done" and gate.state in {
-            PASS, NO_HARD_CRITERIA}
-        if succeeded:
-            ledger.record(assignment.id, brief)
-        else:
-            ledger.drop(assignment.id)
-        on_gate(assignment.gate_id, gate.state)
-        journal.append(
-            "brief", {"step": step, "aid": assignment.id, "brief": brief})
-
-        try:
-            if succeeded:
-                worker.transit(TaskStatus.COMPLETED)
-            elif worker.status is TaskStatus.RUNNING:
-                worker.transit(TaskStatus.FAILED)
-        except ValueError:
-            pass
-
         task_span.set(
             **{S.ATTR_OUTCOME: brief.get("outcome"), S.ATTR_GATE_STATE: gate.state}
         )
@@ -268,5 +225,4 @@ async def run_worker(
                 "gate": gate.state,
             },
         )
-        save_tree(session_dir, tree)
         return brief

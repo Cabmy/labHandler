@@ -14,7 +14,7 @@ ingest 材料目录 → Remember-Judge 裁定长期规则 → Pro 写 SPEC.md
 
 ## 架构
 
-分层视图：HTTP 入口 → RuntimeTask 控制面 → 阶段流水线 → 每个 Pro/Flash 节点的
+分层视图：HTTP 入口 → 会话运行器与 RuntimeTask 控制面 → 阶段流水线 → 每个 Pro/Flash 节点的
 一轮 ReAct → LLM 网关与工具（经 MCP 进 Docker 沙箱），最下是持久化/记忆/可观测横切层。
 Pro、Flash 是职责角色，不代表具体供应商；可使用不同网关，也可使用名称相同的模型。
 
@@ -26,8 +26,8 @@ Pro、Flash 是职责角色，不代表具体供应商；可使用不同网关�
 └────────────────────────────────┬───────────────────────────────────┘
                                  ▼
 ┌────────────────────────────────────────────────────────────────────┐
-│ control plane · runtime/task.py RuntimeTask tree                   │
-│   status · step_budget · wall-clock deadline · permission · cancel │
+│ control plane · runtime/task.py per-attempt control                 │
+│   step_budget · deadline · permission; runner owns cancellation    │
 │   LLM sees only the semantic projection, never counters/cancel     │
 │                                                                    │
 │   LabRunner (runtime/lab/runner.py) ─► flow.run_lab(LabState)      │
@@ -82,7 +82,7 @@ Pro、Flash 是职责角色，不代表具体供应商；可使用不同网关�
 
 ┌────────────────────────────────────────────────────────────────────┐
 │ cross-cutting                                                      │
-│   persist · JOURNAL.jsonl (append-only) + STATE.json + ledger      │
+│   persist · JOURNAL.jsonl: lifecycle, attempts, progress, effects  │
 │             idempotent resume by artifact sha256 fingerprint       │
 │   memory  · card markdown (source of truth) + SQLite / sqlite-vec  │
 │             /dream offline curation                                │
@@ -96,7 +96,7 @@ Pro、Flash 是职责角色，不代表具体供应商；可使用不同网关�
 - **SPEC 指挥**：Pro 先写 SPEC.md 钉死总目标与接口契约，之后每步只交出下一份 Flash 任务书；Flash 每次新开空对话，一次只做一步能做完的量。
 - **阶段强制**：工具表按「角色 × 阶段」收窄，每阶段只暴露自己的 submit 出口；表外调用直接被拒。
 - **程序性验收四态**：`pass` / `fail` / `test_invalid` / `no_hard_criteria`（无硬指标不等于通过）。验收代码只由 Pro 写，在沙箱内跑 pytest；产物不可检验时如实标注，交 Judge 语义判断。
-- **Runtime Task 控制面**：状态、预算、取消、权限在 Task 树上，LLM 只看见语义投影。
+- **生命周期**：会话只持久化是否收尾；运行状态从 live 协程派生为 `RUNNING / PAUSED / FINISHED`。子任务是不可复活的执行记录，`RuntimeTask` 只管预算、权限和语义事件。恢复只读 Journal，详见 [状态与恢复设计](doc/LIFECYCLE.md)。
 - **上下文管理**：超预算即压缩——近期留原文、早期成纪要、tool 正文卸盘，压完重新装配再发请求。NOTES.md 常驻，FORGET.md 记排除项。
 - **幂等续跑**：append-only JOURNAL.jsonl 逐轮落盘，崩在任意一轮可续；副作用账本按产物指纹跳过已完成任务。
 - **安全边界**：host 白名单 + 路径守护 + 审计；重量操作走 MCP 进 Docker 沙箱。
@@ -164,7 +164,7 @@ case 的 `budget` / `reserve` 可覆盖上下文预算，普通 case 使用启�
 检索验证（不启动 Docker）：
 
 ```bash
-python -m pytest -q eval/test_memory.py eval/test_providers.py
+python -m pytest -q eval/test_lifecycle.py eval/test_memory.py eval/test_providers.py
 # 实际调用配置中的 Embedding 与 Flash API，仅使用合成卡片和临时数据：
 python -m eval.live_memory --output /tmp/labhandler-memory-check
 ```

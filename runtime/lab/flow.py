@@ -31,7 +31,6 @@ from runtime.lab.helpers import (
     payload_of,
     pin_assignment,
     render_progress,
-    resume_spec,
     sanitize_decision,
     worst_gate,
 )
@@ -41,7 +40,6 @@ from runtime.lab.persist import (
     CATALOG_FILE,
     SPEC_FILE,
     read_text,
-    save_tree,
     write_text,
 )
 from runtime.lab.remember import (
@@ -63,7 +61,8 @@ from runtime.loop.schema import (
 )
 from runtime.observe import spans as S
 from runtime.phase import phase_control_message, phase_of
-from runtime.task import RuntimeTask, TaskKind, TaskStatus, TaskTree
+from runtime.task import RuntimeTask, TaskKind
+from runtime.lab.execution import Attempt, RunPaused
 from tools.sandbox_tools import is_sandbox_unreachable, reset_sandbox_failure_counter
 from tools.skill_tool import SkillBind
 
@@ -82,17 +81,14 @@ class LabState:
     """一次 run 的可变状态，JOURNAL.jsonl 的投影。
 
     阶段函数只改这里，不往 runner 回塞局部变量。每个可变字段在变更的同时
-    写一条 journal 事件，崩溃后 replay 即可重建到断点；树快照（STATE.json）
-    只在树结构变化时经 flush_tree 落盘。
+    写一条 journal 事件，崩溃后 replay 即可重建到断点。
     """
 
     runner: Any
     question: str
     session_dir: Path
-    tree: TaskTree
     on_event: EventSink | None
     resume: bool
-    root: RuntimeTask
     journal: Journal
     ledger: EffectLedger
     catalog: str
@@ -116,9 +112,6 @@ class LabState:
     step_briefs: dict[int, dict[str, dict[str, Any]]
                       ] = field(default_factory=dict)
     step_judges: dict[int, str] = field(default_factory=dict)
-
-    def flush_tree(self) -> None:
-        save_tree(self.session_dir, self.tree)
 
     def _journal_stage(self) -> None:
         self.journal.append(
@@ -280,26 +273,24 @@ class LabState:
             incoming = []
             user_input = user
             project_spec = ""
-        child = self.tree.add_child(
-            self.root.task_id,
+        task = RuntimeTask(
             kind=kind,
             permission=permission,
             step_budget=runner.settings.pro_step_budget,
             deadline=runner.clock() + runner.settings.task_wall_time_s,
         )
-        child.transit(TaskStatus.RUNNING)
 
-        with runner.tracer.span(
+        with Attempt(self.journal, task).scope() as attempt, runner.tracer.span(
             S.TASK,
             kind=S.KIND_AGENT,
             **{
-                S.ATTR_TASK_ID: child.task_id,
+                S.ATTR_TASK_ID: task.task_id,
                 S.ATTR_TASK_KIND: kind.value,
                 S.ATTR_AGENT: f"pro:{label}",
             },
         ):
-            result = await run_loop(
-                child,
+            result = attempt.result = await run_loop(
+                task,
                 runner._agent_spec(kind, permission),
                 settings=runner.settings,
                 llm=runner.llm,
@@ -323,6 +314,8 @@ class LabState:
 
         if result.reason == "sandbox_unreachable":
             await self.mark_sandbox_down(str((result.brief or {}).get("brief") or ""))
+        elif result.submit is None:
+            raise RunPaused(f"{kind.value}:{result.reason}")
 
         payload = _submit_payload(result.submit)
         append_forget(self.session_dir, str(
@@ -339,15 +332,6 @@ class LabState:
             _append_state(self, "notes_changed",
                           _notes_snapshot(self.session_dir))
 
-        if result.submit:
-            child.transit(TaskStatus.COMPLETED)
-            child.brief = result.submit
-        else:
-            try:
-                child.transit(TaskStatus.FAILED)
-            except ValueError:
-                pass
-        self.flush_tree()
         return result.submit or {}
 
 
@@ -403,20 +387,18 @@ async def run_lab(
     runner: Any,
     question: str,
     session_dir: Path,
-    tree: TaskTree,
+    journal: Journal,
+    state: JournalState | None,
     *,
     on_event: EventSink | None,
     resume: bool,
 ) -> dict[str, Any]:
-    st = await _begin(runner, question, session_dir, tree, on_event, resume)
+    st = await _begin(runner, question, session_dir, journal, state, on_event, resume)
     if st.stage != "summary":
         await remember(st)
-        failed = await write_spec(st)
-        if failed:
-            return failed
-        paused = await advance(st)
-        if paused:
-            return paused
+        await write_spec(st)
+        await advance(st)
+    st.set_stage("summary")
     return await summarize(st)
 
 
@@ -424,31 +406,15 @@ async def _begin(
     runner: Any,
     question: str,
     session_dir: Path,
-    tree: TaskTree,
+    journal: Journal,
+    state: JournalState | None,
     on_event: EventSink | None,
     resume: bool,
 ) -> LabState:
     runner._applied_rules = None
     runner._skill = SkillBind()
-    root = tree.get(tree.root_id)
-    journal = Journal.open(session_dir)
-    state = journal.replay() if resume else None
     if state and state.question.strip():
         question = state.question
-    if state is None or not state.question.strip():
-        journal.append("begin", {"question": question})
-    if resume and root.status in {TaskStatus.FAILED, TaskStatus.CANCELLED}:
-        root.transit(TaskStatus.RUNNING)
-    elif root.status is TaskStatus.PENDING:
-        root.transit(TaskStatus.RUNNING)
-    # 崩溃时在途的非 root 节点永远等不到结果了：标 CANCELLED，树才反映真实状态。
-    for node in tree.nodes.values():
-        if node.task_id != tree.root_id and node.status is TaskStatus.RUNNING:
-            try:
-                node.transit(TaskStatus.CANCELLED)
-            except ValueError:
-                pass
-    save_tree(session_dir, tree)
 
     reset_sandbox_failure_counter()
     ledger = EffectLedger(
@@ -462,10 +428,8 @@ async def _begin(
         runner=runner,
         question=question,
         session_dir=session_dir,
-        tree=tree,
         on_event=on_event,
         resume=resume,
-        root=root,
         journal=journal,
         ledger=ledger,
         catalog=catalog,
@@ -523,7 +487,6 @@ async def remember(st: LabState) -> None:
         )
         await st.emit_halt(found)
         st.set_stage("summary")
-        st.flush_tree()
         return
     st.runner._applied_rules = applied_from_payload(
         catalog, payload_of(submit, SUBMIT_REMEMBER)
@@ -537,11 +500,10 @@ async def remember(st: LabState) -> None:
         }
     )
     st.set_stage("spec")
-    st.flush_tree()
 
 
-async def write_spec(st: LabState) -> dict[str, Any] | None:
-    """写出 SPEC.md。失败返回 spec_failed；halt / 沙箱不可达则落到 Summary。"""
+async def write_spec(st: LabState) -> None:
+    """写出 SPEC.md。失败暂停；halt / 沙箱不可达则落到 Summary。"""
     if st.halt or st.sandbox_down:
         return None
 
@@ -560,7 +522,8 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
             write_cards(st.session_dir, cards)
     await st.emit({"kind": "cards", "n": len(cards), "errors": errors})
 
-    project = resume_spec(st.tree) if st.resume else None
+    saved_spec = st.journal.replay().latest_submit(SUBMIT_SPEC) if st.resume else None
+    project = ProjectSpec.from_payload(saved_spec) if saved_spec else None
     if st.resume and project is not None:
         await st.emit({"kind": "node_done", "node": "spec", "log": [{"resumed": True}]})
         rendered = project.render()
@@ -568,9 +531,8 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
         _seed_pro_thread(st)
         _append_state(st, "spec_created", _spec_state_body(rendered))
         await _mark_resumable(st)
-        if st.stage == "remember":
+        if st.stage in {"remember", "spec"}:
             st.set_stage("advance")
-        st.flush_tree()
         return None
 
     await st.emit({"kind": "node_start", "node": "spec"})
@@ -579,27 +541,15 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
     if found:
         await st.emit_halt(found)
         st.set_stage("summary")
-        st.flush_tree()
         return None
     if st.sandbox_down:
         st.set_stage("summary")
-        st.flush_tree()
         return None
 
     project = ProjectSpec.from_payload(payload_of(submit, SUBMIT_SPEC))
     if not project.goal:
         await st.emit({"kind": "error", "detail": "Pro 未能产出 SPEC.md，任务终止"})
-        try:
-            st.root.transit(TaskStatus.FAILED)
-        except ValueError:
-            pass
-        st.flush_tree()
-        return {
-            "verdict": "spec_failed",
-            "summary": "",
-            "knowledge_cards": [],
-            "question": st.question,
-        }
+        raise RunPaused("spec_failed")
     await st.emit(
         {"kind": "node_done", "node": "spec", "log": [
             {"milestones": len(project.milestones)}]}
@@ -608,7 +558,6 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
     _append_state(st, "spec_created", _spec_state_body(project.render()))
     await _mark_resumable(st)
     st.set_stage("advance")
-    st.flush_tree()
     return None
 
 
@@ -626,8 +575,8 @@ async def _mark_resumable(st: LabState) -> None:
         await st.emit({"kind": "resume_skip", "assignments": sorted(st.resumable)})
 
 
-async def advance(st: LabState) -> dict[str, Any] | None:
-    """逐步派发。用户停止则暂停（root 仍 RUNNING）；halt / 沙箱不可达 / 收工则落到 Summary。
+async def advance(st: LabState) -> None:
+    """逐步派发。取消由 LabRunner 统一处理；halt / 沙箱不可达 / 收工落到 Summary。
 
     dispatch_step 记的是已完成的步数。续跑时若下一步已有 journal 标记，说明
     上次崩在那一步内部，先按标记把它续完，再进主循环。
@@ -640,11 +589,6 @@ async def advance(st: LabState) -> dict[str, Any] | None:
     pending = st.dispatch_step + \
         1 if st.has_step_markers(st.dispatch_step + 1) else 0
     while st.dispatch_step < _MAX_STEPS and not st.halt and not st.sandbox_down:
-        if st.runner._cancelled():
-            st.set_stage("advance")
-            st.flush_tree()
-            return {"verdict": "paused", "summary": "", "question": st.question}
-
         step = st.dispatch_step + 1
         if step == pending:
             signal, gate_nudge, revisions = await _resume_step(st, step, gate_nudge, revisions)
@@ -884,8 +828,6 @@ async def _execute_and_judge(
             question=st.question,
             step_goal=dispatch.step_goal,
             session_dir=st.session_dir,
-            tree=st.tree,
-            root=st.root,
             ledger=st.ledger,
             progress=st.progress,
             on_progress=st.add_progress,
@@ -1196,23 +1138,18 @@ async def summarize(st: LabState) -> dict[str, Any]:
             "If it says no_hard_criteria, say so in user_summary."
         )
     await st.emit({"kind": "node_start", "node": "summary"})
-    payload = payload_of(
-        await st.drive_pro(TaskKind.SUMMARY, summary_user, "summary"),
-        SUBMIT_SUMMARY,
-    )
-    summary_text = str(payload.get("user_summary") or "")
-    if summary_text:
-        st.runner.settings.workspace_dir.mkdir(parents=True, exist_ok=True)
-        (st.runner.settings.workspace_dir / "SUMMARY.md").write_text(
-            summary_text, encoding="utf-8"
+    payload = st.journal.replay().latest_submit(SUBMIT_SUMMARY) if st.resume else None
+    if not payload or not str(payload.get("user_summary") or "").strip():
+        payload = payload_of(
+            await st.drive_pro(TaskKind.SUMMARY, summary_user, "summary"),
+            SUBMIT_SUMMARY,
         )
+    summary_text = str(payload.get("user_summary") or "")
+    if not summary_text.strip():
+        raise RunPaused("summary_failed")
+    write_text(st.runner.settings.workspace_dir, "SUMMARY.md", summary_text)
     await st.emit({"kind": "node_done", "node": "summary", "log": []})
 
-    try:
-        st.root.transit(TaskStatus.COMPLETED)
-    except ValueError:
-        pass
-    save_tree(st.session_dir, st.tree)
     return {
         "verdict": (
             "need_user"

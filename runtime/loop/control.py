@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from config.runtime import RuntimeSettings
 from runtime.errors import ErrorClass
 from runtime.loop.stagnation import StagnationSignal, NUDGE_TEXT
-from runtime.task import TaskSnapshot, TaskStatus
+from runtime.task import TaskSnapshot
 from runtime.loop.retry import delay_for
 
 
@@ -30,9 +30,6 @@ def decide(
     settings: RuntimeSettings,
     now: float,
 ) -> Decision:
-    if snap.status in {TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.COMPLETED}:
-        return Decision(kind="stop", reason=snap.status.value.lower())
-
     if error_class is ErrorClass.AUTH:
         return Decision(kind="stop", reason="auth")
     if error_class is ErrorClass.FATAL:

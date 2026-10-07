@@ -1,10 +1,12 @@
-"""RuntimeTask 控制面：树、状态、预算计数、投影事件。"""
+"""一次 agent 执行的控制面：身份、权限、预算和语义事件。
 
-import time
+生命周期归执行协程所有；此对象不持久化，也不复活或跨尝试复用。
+"""
+
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Self
+from typing import Any
 
 from runtime.errors import ErrorClass
 from runtime.loop.stagnation import StagnationSignal
@@ -13,11 +15,10 @@ from runtime.loop.stagnation import StagnationSignal
 class TaskKind(str, Enum):
     """节点种类，同时是阶段的唯一身份。
 
-    除 SESSION 外每一项都在 runtime.phase.PHASES 里有一条定义，那里说明本阶段
+    每一项都在 runtime.phase.PHASES 里有一条定义，那里说明本阶段
     由谁执行、看得见哪些工具、从哪个 submit_* 交卷。
     """
 
-    SESSION = "session"
     SPEC = "spec"          # Pro 起草/修订 SPEC.md
     DISPATCH = "dispatch"  # Pro 决定下一步派谁做什么
     WORKER = "worker"      # Flash 执行一份任务书
@@ -27,38 +28,16 @@ class TaskKind(str, Enum):
     SUMMARY = "summary"
 
 
-class TaskStatus(str, Enum):
-    PENDING = "PENDING"
-    RUNNING = "RUNNING"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
-    CANCELLED = "CANCELLED"
-
-
 class Permission(str, Enum):
     READONLY = "readonly"
     WRITE = "write"
     PRO = "pro"
 
 
-_LEGAL = {
-    TaskStatus.PENDING: {TaskStatus.RUNNING, TaskStatus.CANCELLED},
-    TaskStatus.RUNNING: {
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-    },
-    TaskStatus.COMPLETED: set(),
-    TaskStatus.FAILED: {TaskStatus.RUNNING},
-    TaskStatus.CANCELLED: {TaskStatus.RUNNING},
-}
-
-
 @dataclass
 class TaskSnapshot:
     task_id: str
     kind: TaskKind
-    status: TaskStatus
     permission: Permission
     deadline: float
     step_count: int
@@ -74,14 +53,11 @@ class TaskSnapshot:
 
 @dataclass
 class RuntimeTask:
-    task_id: str
-    parent_id: str | None
     kind: TaskKind
     permission: Permission
     step_budget: int
     deadline: float
-    status: TaskStatus = TaskStatus.PENDING
-    children: list[str] = field(default_factory=list)
+    task_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     step_count: int = 0
     tool_failures: int = 0
     transient_count: int = 0
@@ -90,14 +66,7 @@ class RuntimeTask:
     consecutive_logic: int = 0
     execution_state: dict[str, Any] = field(default_factory=dict)
     events: list[dict[str, str]] = field(default_factory=list)
-    brief: dict[str, Any] | None = None
     node_spec: dict[str, Any] = field(default_factory=dict)
-
-    def transit(self, new_status: TaskStatus) -> None:
-        allowed = _LEGAL[self.status]
-        if new_status not in allowed and new_status != self.status:
-            raise ValueError(f"illegal transition {self.status} -> {new_status}")
-        self.status = new_status
 
     def record(
         self,
@@ -160,7 +129,6 @@ class RuntimeTask:
         return TaskSnapshot(
             task_id=self.task_id,
             kind=self.kind,
-            status=self.status,
             permission=self.permission,
             deadline=self.deadline,
             step_count=self.step_count,
@@ -173,115 +141,3 @@ class RuntimeTask:
             events=list(self.events),
             execution_state=dict(self.execution_state),
         )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "task_id": self.task_id,
-            "parent_id": self.parent_id,
-            "kind": self.kind.value,
-            "permission": self.permission.value,
-            "step_budget": self.step_budget,
-            "deadline": self.deadline,
-            "status": self.status.value,
-            "children": list(self.children),
-            "step_count": self.step_count,
-            "tool_failures": self.tool_failures,
-            "transient_count": self.transient_count,
-            "validation_count": self.validation_count,
-            "consecutive_logic": self.consecutive_logic,
-            "execution_state": self.execution_state,
-            "events": self.events,
-            "brief": self.brief,
-            "node_spec": self.node_spec,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Self:
-        return cls(
-            task_id=data["task_id"],
-            parent_id=data.get("parent_id"),
-            kind=TaskKind(data["kind"]),
-            permission=Permission(data["permission"]),
-            step_budget=int(data["step_budget"]),
-            deadline=float(data["deadline"]),
-            status=TaskStatus(data["status"]),
-            children=list(data.get("children") or []),
-            step_count=int(data.get("step_count") or 0),
-            tool_failures=int(data.get("tool_failures") or 0),
-            transient_count=int(data.get("transient_count") or 0),
-            validation_count=int(data.get("validation_count") or 0),
-            consecutive_logic=int(data.get("consecutive_logic") or 0),
-            execution_state=dict(data.get("execution_state") or {}),
-            events=list(data.get("events") or []),
-            brief=data.get("brief"),
-            node_spec=dict(data.get("node_spec") or {}),
-        )
-
-
-class TaskTree:
-    """一棵 RuntimeTask 树。"""
-
-    def __init__(self, root: RuntimeTask) -> None:
-        self.root_id = root.task_id
-        self.nodes: dict[str, RuntimeTask] = {root.task_id: root}
-
-    def get(self, task_id: str) -> RuntimeTask:
-        return self.nodes[task_id]
-
-    def add_child(
-        self,
-        parent_id: str,
-        *,
-        kind: TaskKind,
-        permission: Permission,
-        step_budget: int,
-        deadline: float,
-        node_spec: dict[str, Any] | None = None,
-    ) -> RuntimeTask:
-        parent = self.nodes[parent_id]
-        child = RuntimeTask(
-            task_id=f"{kind.value}_{uuid.uuid4().hex[:8]}",
-            parent_id=parent_id,
-            kind=kind,
-            permission=permission,
-            step_budget=step_budget,
-            deadline=deadline,
-            node_spec=node_spec or {},
-        )
-        self.nodes[child.task_id] = child
-        parent.children.append(child.task_id)
-        return child
-
-    def children_of(self, task_id: str) -> list[RuntimeTask]:
-        node = self.nodes[task_id]
-        return [self.nodes[cid] for cid in node.children]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "root_id": self.root_id,
-            "nodes": {tid: t.to_dict() for tid, t in self.nodes.items()},
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> Self:
-        nodes = {
-            tid: RuntimeTask.from_dict(payload)
-            for tid, payload in (data.get("nodes") or {}).items()
-        }
-        root_id = data["root_id"]
-        tree = cls.__new__(cls)
-        tree.root_id = root_id
-        tree.nodes = nodes
-        return tree
-
-
-def new_session_task(*, step_budget: int, wall_time_s: float, now: float | None = None) -> RuntimeTask:
-    t0 = now if now is not None else time.time()
-    return RuntimeTask(
-        task_id=f"session_{uuid.uuid4().hex[:10]}",
-        parent_id=None,
-        kind=TaskKind.SESSION,
-        permission=Permission.PRO,
-        step_budget=step_budget,
-        deadline=t0 + wall_time_s,
-    )
