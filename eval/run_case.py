@@ -165,7 +165,7 @@ async def archive_knowledge(session: Any, result: dict[str, Any]) -> dict[str, A
     if not cards:
         return {"skipped": "no_cards", "card_ids": []}
     settings = get_settings()
-    archive = TaskArchive(str(settings.memory_db_path))
+    archive = TaskArchive(settings)
     archive_mod._default_archive = archive
     if not archive.has_new_cards(cards):
         return {"skipped": "no_new_cards", "card_ids": []}

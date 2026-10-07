@@ -12,9 +12,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from config.prompts import render_state_update
+from config.prompts import MEMORY_RETRIEVAL_DEGRADED, render_state_update
 from memory.profile import load_profile
-from memory.retrieve import prefetch_cards, reconcile_index
+from memory.retrieve import prefetch_cards
 from runtime.context.notes import (
     append_forget,
     apply_notes,
@@ -35,7 +35,7 @@ from runtime.lab.helpers import (
     sanitize_decision,
     worst_gate,
 )
-from runtime.lab.ingest import ingest
+from runtime.lab.ingest import ingest, retrieval_query
 from runtime.lab.journal import Journal, JournalState
 from runtime.lab.persist import (
     CATALOG_FILE,
@@ -451,10 +451,6 @@ async def _begin(
     save_tree(session_dir, tree)
 
     reset_sandbox_failure_counter()
-    try:
-        await reconcile_index(runner.llm, runner.settings)
-    except Exception:
-        pass
     ledger = EffectLedger(
         default_probes(),
         journal,
@@ -550,10 +546,19 @@ async def write_spec(st: LabState) -> dict[str, Any] | None:
         return None
 
     cards = load_cards(st.session_dir)
+    errors: list[str] = []
     if cards is None:
-        cards = await prefetch_cards(st.question, st.runner.llm, settings=st.runner.settings)
-        write_cards(st.session_dir, cards)
-    await st.emit({"kind": "cards", "n": len(cards)})
+        query = retrieval_query(st.question, st.session_dir)
+        result = await prefetch_cards(query, st.runner.llm, settings=st.runner.settings)
+        cards, errors = result.cards, result.errors
+        if errors:
+            _seed_pro_thread(st)
+            _append_state(st, "memory_retrieval_degraded",
+                          MEMORY_RETRIEVAL_DEGRADED
+                          + "\n".join(errors + cards))
+        else:
+            write_cards(st.session_dir, cards)
+    await st.emit({"kind": "cards", "n": len(cards), "errors": errors})
 
     project = resume_spec(st.tree) if st.resume else None
     if st.resume and project is not None:

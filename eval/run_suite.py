@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""按 docs/eval.md 跑 suite。Pro 固定 grok-4.7，Flash 沿用 .env 配置。不改 config/.env。
+"""运行评测 suite。模型、网关及运行配置统一由 config.runtime 读取 config/.env。
+
+case 的 budget / reserve 与消融开关是显式实验条件；其余配置沿用启动时配置。
 
   PYTHONPATH=. python eval/run_suite.py --k 3
   PYTHONPATH=. python eval/run_suite.py --k 3 --ablation no_prefetch
 消融：none | no_prefetch | no_compact | no_remember | no_parallel
 """
 
-from __future__ import annotations
 import yaml
 
 import argparse
@@ -21,17 +22,12 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-# 必须在 import config.runtime 之前钉住 Pro 模型。load_dotenv 不覆盖已有环境变量。
-os.environ["PRO_MODEL"] = "grok-4.7"
-os.environ.pop("FLASH_MODEL", None)  # Flash 沿用 .env（当前 deepseek-v4-flash）
-# 评测进程不把 span 打到 Langfuse。留空会盖过 .env，本地 traces.jsonl 仍在。
-os.environ["LANGFUSE_PUBLIC_KEY"] = ""
-os.environ["LANGFUSE_SECRET_KEY"] = ""
-
-
 REPO = Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
+
+from config.runtime import RuntimeSettings, get_settings
+from eval import reset_all_singletons
 
 SUITE = Path(__file__).resolve().parent / "suite"
 PROFILE = SUITE / "profile.yaml"
@@ -49,18 +45,15 @@ def _load(case_dir: Path) -> dict[str, Any]:
     return data
 
 
-def _reset() -> None:
-    from config.runtime import get_settings
-    import memory.archive as archive_mod
-    import tools.policy as policy_mod
-
-    get_settings.cache_clear()
-    archive_mod._default_archive = None
-    policy_mod._policy = None
-    policy_mod._auditor = None
-
-
-def _apply_env(workspace: Path, cards: Path, db: Path, expect: dict[str, Any], ablation: str) -> None:
+def _apply_env(
+    workspace: Path,
+    cards: Path,
+    db: Path,
+    expect: dict[str, Any],
+    ablation: str,
+    base_settings: RuntimeSettings,
+) -> None:
+    """设置本次实验条件；默认预算来自启动配置，避免继承上一个 case 的覆盖。"""
     workspace.mkdir(parents=True, exist_ok=True)
     cards.mkdir(parents=True, exist_ok=True)
     db.parent.mkdir(parents=True, exist_ok=True)
@@ -68,20 +61,13 @@ def _apply_env(workspace: Path, cards: Path, db: Path, expect: dict[str, Any], a
     os.environ["CARDS_DIR"] = str(cards.resolve())
     os.environ["MEMORY_DB_PATH"] = str(db.resolve())
     os.environ["PROFILE_PATH"] = str(PROFILE.resolve())
-    os.environ["PRO_MODEL"] = "grok-4.7"
-    os.environ.pop("FLASH_MODEL", None)
-    budget = expect.get("budget")
-    reserve = expect.get("reserve")
+    budget = expect.get("budget", base_settings.context_budget_tokens)
+    reserve = expect.get("reserve", base_settings.output_reserve_tokens)
     if ablation == "no_compact":
-        budget, reserve = 200000, 8192
-    if budget:
-        os.environ["CONTEXT_BUDGET_TOKENS"] = str(int(budget))
-    else:
-        os.environ.pop("CONTEXT_BUDGET_TOKENS", None)
-    if reserve:
-        os.environ["OUTPUT_RESERVE_TOKENS"] = str(int(reserve))
-    else:
-        os.environ.pop("OUTPUT_RESERVE_TOKENS", None)
+        budget = base_settings.context_budget_tokens
+        reserve = base_settings.output_reserve_tokens
+    os.environ["CONTEXT_BUDGET_TOKENS"] = str(int(budget))
+    os.environ["OUTPUT_RESERVE_TOKENS"] = str(int(reserve))
     if ablation == "no_prefetch":
         os.environ["EVAL_DISABLE_PREFETCH"] = "1"
     else:
@@ -94,7 +80,7 @@ def _apply_env(workspace: Path, cards: Path, db: Path, expect: dict[str, Any], a
         os.environ["EVAL_MAX_ASSIGNMENTS"] = "1"
     else:
         os.environ.pop("EVAL_MAX_ASSIGNMENTS", None)
-    _reset()
+    reset_all_singletons()
 
 
 def _seed_materials(case_dir: Path, workspace: Path) -> None:
@@ -107,13 +93,12 @@ async def _seed_cards(expect: dict[str, Any], session: Any) -> list[int]:
     cards = expect.get("cards") or []
     if not cards:
         return []
-    from config.runtime import get_settings
     from memory.archive import TaskArchive
-    from memory.retrieve import index_card_ids, write_card_file
+    from memory.retrieve import index_card_ids
     import memory.archive as archive_mod
 
     settings = get_settings()
-    archive = TaskArchive(str(settings.memory_db_path))
+    archive = TaskArchive(settings)
     archive_mod._default_archive = archive
     task_type = str(cards[0].get("task_type") or "coding")
     task_id = archive.create_task(
@@ -127,19 +112,7 @@ async def _seed_cards(expect: dict[str, Any], session: Any) -> list[int]:
             str(card.get("title") or expect.get("id")),
             task_type,
         )
-        for cid in made:
-            write_card_file(
-                {
-                    "card_id": cid,
-                    "task_id": task_id,
-                    "card_type": card.get("type") or "lesson",
-                    "content": content,
-                    "task_title": card.get("title") or "",
-                    "task_type": task_type,
-                },
-                settings,
-            )
-            ids.append(cid)
+        ids.extend(made)
     if ids:
         await index_card_ids(ids, session.llm, settings)
     return ids
@@ -194,8 +167,8 @@ async def run_case(
     k: int,
     ablation: str,
     memory: str,
+    base_settings: RuntimeSettings,
 ) -> dict[str, Any]:
-    from config.runtime import get_settings
     from eval.grade import hidden_passed, smoke_passed
     from eval.report import efficiency_one
     from infra.sandbox_boot import recreate_sandbox
@@ -210,7 +183,7 @@ async def run_case(
     run_dir = out_root / run_id
     workspace = run_dir / "workspace"
     pool = run_dir / "pool"
-    _apply_env(workspace, pool / "cards", pool / "memory.db", expect, ablation)
+    _apply_env(workspace, pool / "cards", pool / "memory.db", expect, ablation, base_settings)
     if memory == "empty":
         expect = {**expect, "cards": []}
     _seed_materials(case_dir, workspace)
@@ -282,10 +255,14 @@ async def run_case(
     poison_prefetch = None
     if poison:
         try:
-            again = await prefetch_cards(question, session.llm, settings)
+            from runtime.lab.ingest import retrieval_query
+
+            query = retrieval_query(question, session_dir)
+            again = await prefetch_cards(query, session.llm, settings)
+            if not again.errors:
+                poison_prefetch = any(poison in item for item in again.cards)
         except Exception:
-            again = []
-        poison_prefetch = any(poison in item for item in again)
+            poison_prefetch = None
 
     traces_src = settings.traces_path
     traces_dst = run_dir / "traces.jsonl"
@@ -305,9 +282,13 @@ async def run_case(
         "ablation": ablation,
         "k": k,
         "memory": memory,
-        "models": {"pro": settings.pro_model, "flash": settings.flash_model},
+        "models": {
+            "pro": settings.pro_model,
+            "flash": settings.flash_model,
+            "embedding": settings.embedding_model,
+        },
         "context_budget_tokens": settings.context_budget_tokens,
-        "prefetch_min_score": 0.25,
+        "prefetch_min_score": settings.memory_min_score,
         "error": error,
         "hidden_passed": hidden_ok,
         "hidden_infra": hidden_infra,
@@ -386,9 +367,13 @@ async def _main() -> int:
     out.mkdir(parents=True, exist_ok=True)
     only = {x.strip() for x in args.ids.split(",") if x.strip()}
     plans = _plans(_cases(), args.k, args.ablation, only)
+    base_settings = get_settings()
     print(f"[suite] {len(plans)} runs -> {out}", flush=True)
     for case_dir, k, memory in plans:
-        await run_case(case_dir, out_root=out, k=k, ablation=args.ablation, memory=memory)
+        await run_case(
+            case_dir, out_root=out, k=k, ablation=args.ablation,
+            memory=memory, base_settings=base_settings,
+        )
     from eval.score_suite import write_vector
 
     write_vector(out)

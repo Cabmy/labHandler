@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import shutil
 import time
 from pathlib import Path
@@ -52,7 +53,7 @@ def _is_running() -> bool:
 
 @app.on_event("startup")
 async def _warm_memory_index() -> None:
-    """进程起来时对齐卡片文件与向量表。换 EMBEDDING_MODEL 后必须走这里才会重建。失败不挡服务。"""
+    """进程起来时对齐卡片文件与向量表。检索也会对账，预热失败记日志但不挡服务。"""
 
     async def _run() -> None:
         try:
@@ -60,7 +61,7 @@ async def _warm_memory_index() -> None:
 
             await reconcile_index(_session.llm, _session.settings)
         except Exception:
-            pass
+            logging.getLogger(__name__).exception("记忆索引预热失败")
 
     asyncio.create_task(_run())
 

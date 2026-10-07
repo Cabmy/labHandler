@@ -100,8 +100,14 @@ ingest 材料目录 → Remember-Judge 裁定长期规则 → Pro 写 SPEC.md
 - **幂等续跑**：append-only JOURNAL.jsonl 逐轮落盘，崩在任意一轮可续；副作用账本按产物指纹跳过已完成任务。
 - **安全边界**：host 白名单 + 路径守护 + 审计；重量操作走 MCP 进 Docker 沙箱。
 - **可观测**：Langfuse + 本地 JSONL，span 覆盖 run / step / turn / llm / tool / 验收。
-- **跨 lab 记忆**：卡片 markdown 为事实源，向量索引为派生；`/dream` 离线治理。
+- **跨 lab 记忆**：卡片 Markdown 是正文与元数据的唯一事实源；sqlite-vec 在 SQLite 内执行精确余弦检索，`/dream` 直接读取当前文件治理。
 - **会话隔离**：`done` 归档 → workspace 进 `.trash/` → 重建沙箱 → 新 lab。
+
+记忆检索在 ingest 时保存有长度上限的材料摘录，与用户请求共同构造查询。自动预取和主动检索共用候选召回阈值 `MEMORY_MIN_SCORE`（默认 0.35）；候选先按模型端点、模型名、维度和当前文件指纹过滤，再按正文去重。最多 8 张候选交给 Flash 通过 function calling 逐项判断是否与实际任务相关，最后按相似度取 top-k。向量分数不等于适用性；筛选失败或裁定不完整时明确降级，不注入未经筛选的候选。每次有候选的检索会增加一次 Flash 调用。索引失败逐卡报告，失败预取不缓存为空结果。Embedding 与筛选只对瞬时故障有限重试，完整检索受 `MEMORY_TIMEOUT_S`（默认 90 秒）限制。材料流式提取要求行并保留首尾，摘录仍有长度预算。
+
+记忆数据库仅保存任务归档、卡片 ID/生命周期与向量缓存，不保存卡片正文副本；淘汰时删除卡片文件并记录生命周期。sqlite-vec 使用 SQL 距离函数精确扫描，不引入独立服务或 ANN 索引。该版本不兼容旧数据库 schema：升级时配置新的 `MEMORY_DB_PATH` 与 `CARDS_DIR`，旧数据保留备份；不提供旧表读取或自动迁移路径。
+
+Flash 默认使用 `FLASH_NATIVE_FORCED_TOOLS=false`：普通工具调用保留原生 auto/思考模式；强制交卷只暴露指定工具，追加交卷指令，并严格校验响应，纯文本或越权工具视为失败。支持原生强制工具的网关可将该配置设为 true。流式解析会忽略空心跳并在取消时关闭流。
 
 设计细节与不变量见 [AGENTS.md](AGENTS.md)。
 
@@ -136,7 +142,21 @@ python eval/run_case.py --case two_sum      # 跑单个 case
 PYTHONPATH=. python eval/run_suite.py --k 3 # 跑 suite（需 LLM Key）
 ```
 
-口径见 `eval/` 各脚本 docstring。
+评测与主流程共用 `config/runtime.py` 加载的 `config/.env`：Pro / Flash / Embedding
+模型、网关、密钥和遥测均沿用配置。每次评测隔离工作区与记忆库，使用测试画像；
+case 的 `budget` / `reserve` 可覆盖上下文预算，普通 case 使用启动配置，
+`no_compact` 使用启动配置的窗口与输出预留覆盖 case 预算。口径见 `eval/` 各脚本 docstring。
+
+
+检索验证（不启动 Docker）：
+
+```bash
+python -m pytest -q eval/test_memory.py
+# 实际调用配置中的 Embedding 与 Flash API，仅使用合成卡片和临时数据：
+python -m eval.live_memory --output /tmp/labhandler-memory-check
+```
+
+真实 API 评测输出 `report.json`，分别报告召回、无关查询弃权、精确选择和错误次数；Embedding 缓存绑定端点与模型。它验证固定样本，不代表所有未来任务均能正确检索。
 
 ## Web 操作
 

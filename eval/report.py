@@ -452,11 +452,9 @@ def _iter_named(records: list[dict[str, Any]]):
 def efficiency_one(row: dict[str, Any]) -> dict[str, Any]:
     """单跑效率。
 
-    token 只能从 labhandler.turn 上的本地估算取：当前 provider（grok-4.6-high-fast）
-    的流式响应不回 usage，所以 labhandler.llm 上 gen_ai.usage.* 恒为 0。turn span 的
-    ATTR_TOKENS_IN 是装配层自己算的输入量（runtime/loop/cycle.py 里 ctx.input_tokens），
-    每轮一条，累加即为本次 run 的输入总量。provider 哪天开始回 usage，llm span 上
-    的真实值会优先生效。
+    优先使用 labhandler.llm 的 API usage。网关没有返回输入 usage 时，回退到
+    labhandler.turn 上的本地输入估算（装配层的 ctx.input_tokens，每轮一条）。
+    输出 token 仅使用 API usage，不按模型名称猜测网关是否提供计量。
     """
     records = load_traces(Path(str(row.get("traces_path") or "")))
     api_in = api_out = 0

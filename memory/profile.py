@@ -1,7 +1,7 @@
 """用户画像：profile/me.yaml 为唯一事实源。
 
 点号路径读写（identity.name、preferences.writing_style.formality）。
-写回走 runtime.lab.persist.atomic_write_text（tmp+fsync+rename+dir fsync）：
+写回走 infra.files.atomic_write_text（tmp+fsync+rename+dir fsync）：
 崩溃后磁盘上始终是一份完整 YAML。
 load：文件缺失或 YAML 非法时得到空 dict，不抛。
 inject_for_agent 把 identity / preferences / style_rules 拼进名单内 agent 的 system 末尾。
@@ -28,7 +28,7 @@ def _atomic_write(data: dict[str, Any]) -> None:
 
     延迟导入：runtime.lab.persist 的依赖链会回到 memory.profile，顶层 import 成环。
     """
-    from runtime.lab.persist import atomic_write_text
+    from infra.files import atomic_write_text
 
     text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
     atomic_write_text(_profile_path(), text)

@@ -16,6 +16,14 @@ class ErrorClass(str, Enum):
     LOOP = "loop"
 
 
+
+class LLMCallError(RuntimeError):
+    """保留网关分类，供一次性服务区分瞬时失败与永久错误。"""
+    def __init__(self, error_class: ErrorClass, detail: str = ""):
+        self.error_class = error_class
+        super().__init__(f"LLM gateway failed: {error_class.value}" + (f" ({detail})" if detail else ""))
+
+
 _AUTH_MARKERS = (
     "unauthorized client detected",
     "invalid api key",

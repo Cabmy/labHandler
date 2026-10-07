@@ -7,6 +7,8 @@ from typing import Any
 
 import jsonschema
 
+from runtime.errors import LLMCallError
+
 from runtime.lab.spec import MAX_ASSIGNMENTS
 from runtime.loop.schema import (
     BRIEF_MAX,
@@ -385,9 +387,6 @@ async def oneshot_schema(
     schema: dict[str, Any],
     description: str,
 ) -> dict[str, Any]:
-    from runtime.llm import LLMGateway
-
-    assert isinstance(llm, LLMGateway)
     result = await llm.chat(
         model=model,
         messages=[
@@ -397,8 +396,11 @@ async def oneshot_schema(
         tools=[openai_tool(name, description, schema)],
         tool_choice=tool_choice_required(name),
     )
-    if not result.tool_calls:
-        raise ValueError("model did not call the required function")
+    error_class = getattr(result, "error_class", None)
+    if error_class is not None and error_class.value != "ok":
+        raise LLMCallError(error_class, getattr(result, "error_detail", ""))
+    if len(result.tool_calls) != 1 or result.tool_calls[0].get("name") != name:
+        raise ValueError("model did not call exactly the required function")
     payload, err = parse_args(result.tool_calls[0]["arguments"])
     if payload is None:
         raise ValueError(err)

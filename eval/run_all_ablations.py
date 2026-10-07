@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""依次跑 T2（ablation=none）和四组 T3。模型由 run_suite 钉住（Pro=grok-4.7）。"""
-
-from __future__ import annotations
+"""依次跑 baseline 和四组消融，全部沿用 config/.env 的模型与运行配置。"""
 
 import subprocess
 import sys

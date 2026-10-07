@@ -1,16 +1,16 @@
 """会话目录的持久化原语：原子写、Task 树快照、续跑扫描。
 
-atomic_write_text（tmp + fsync + rename + dir fsync）是仓库唯一的原子写实现，
+infra.files.atomic_write_text（tmp + fsync + rename + dir fsync）是共享原子写实现，
 session 目录快照与 memory/profile 的 YAML 写回都走它，崩在半路不会留下截断的文件。
 阶段进度、Pro 对话与副作用账本不在这里——它们全部走
 runtime/lab/journal.py 的 append-only 事件日志（JOURNAL.jsonl）。
 """
 
 import json
-import os
 from pathlib import Path
 from typing import Any
 
+from infra.files import atomic_write_text
 from runtime.lab.journal import JOURNAL_FILE
 from runtime.task import TaskTree, TaskStatus
 
@@ -28,21 +28,6 @@ def session_dir(workspace: Path, thread_id: str) -> Path:
 
 
 # ── 原子写 ──────────────────────────────────────────────
-
-def atomic_write_text(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
-        f.write(content)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-    dir_fd = os.open(str(path.parent), os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
-
 
 def write_text(sdir: Path, name: str, content: str) -> None:
     atomic_write_text(sdir / name, content)

@@ -6,6 +6,7 @@ OUTPUT_RESERVE_TOKENS < CONTEXT_BUDGET_TOKENS。
 """
 
 import json
+import math
 import os
 from dataclasses import dataclass
 from functools import lru_cache
@@ -53,6 +54,8 @@ def _env_float(name: str, default: float, *, minimum: float | None = None, maxim
             value = float(raw.strip())
         except ValueError as e:
             raise ConfigError(f"{name} 必须是浮点数，实际是 {raw!r}") from e
+    if not math.isfinite(value):
+        raise ConfigError(f"{name} 必须是有限数值")
     if minimum is not None and value < minimum:
         raise ConfigError(f"{name} 必须 >= {minimum}，实际是 {value}")
     if maximum is not None and value > maximum:
@@ -106,10 +109,13 @@ class RuntimeSettings:
     flash_api_key: str
     llm_default_headers: dict[str, str]
     flash_default_headers: dict[str, str]
+    flash_native_forced_tools: bool
     # Embedding
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
+    memory_min_score: float
+    memory_timeout_s: float
     # 预算与控制
     pro_step_budget: int
     flash_step_budget: int
@@ -189,9 +195,13 @@ def get_settings() -> RuntimeSettings:
         flash_api_key=flash_api_key,
         llm_default_headers=llm_headers,
         flash_default_headers=flash_headers,
+        flash_native_forced_tools=_env_bool(
+            "FLASH_NATIVE_FORCED_TOOLS", not flash_model.lower().startswith("deepseek-")),
         embedding_base_url=_env_str("EMBEDDING_BASE_URL", "https://llmapi.paratera.com/v1/"),
         embedding_api_key=_env_str("EMBEDDING_API_KEY"),
         embedding_model=_env_str("EMBEDDING_MODEL", "GLM-Embedding-3"),
+        memory_min_score=_env_float("MEMORY_MIN_SCORE", 0.35, minimum=-1.0, maximum=1.0),
+        memory_timeout_s=_env_float("MEMORY_TIMEOUT_S", 90.0, minimum=1.0),
         pro_step_budget=_env_int("PRO_STEP_BUDGET", 20, minimum=1),
         flash_step_budget=_env_int("FLASH_STEP_BUDGET", 30, minimum=1),
         task_wall_time_s=_env_float("TASK_WALL_TIME_S", 900.0, minimum=10.0),

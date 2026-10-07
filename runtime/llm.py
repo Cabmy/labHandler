@@ -16,6 +16,7 @@ from typing import Any
 from openai import AsyncOpenAI
 
 from config.runtime import RuntimeSettings
+from config.prompts import FORCED_TOOL_INSTRUCTION
 from runtime.errors import ErrorClass, classify
 from runtime.observe import spans as S
 from runtime.observe.tracer import Tracer, as_tracer
@@ -29,6 +30,7 @@ class ChatResult:
     finish_reason: str | None
     usage: dict[str, int]
     error_class: ErrorClass = ErrorClass.OK
+    error_detail: str = ""
 
     @property
     def truncated(self) -> bool:
@@ -87,7 +89,7 @@ class LLMGateway:
         return self.chat_client
 
     async def aclose(self) -> None:
-        for client in {self.chat_client, self.flash_client}:
+        for client in {self.chat_client, self.flash_client, self.embed_client}:
             close = getattr(client, "close", None)
             if callable(close):
                 await close()
@@ -118,6 +120,10 @@ class LLMGateway:
                     on_delta=on_delta,
                 )
             except Exception as e:
+                detail = f"{type(e).__name__}: {e}"
+                for secret in {self.settings.llm_api_key, self.settings.flash_api_key, self.settings.embedding_api_key}:
+                    if secret:
+                        detail = detail.replace(secret, "[REDACTED]")
                 result = ChatResult(
                     content="",
                     reasoning="",
@@ -125,6 +131,7 @@ class LLMGateway:
                     finish_reason="error",
                     usage={},
                     error_class=classify(e),
+                    error_detail=detail[:1000],
                 )
             result.error_class = self._breaker(result.error_class)
             span.set(
@@ -186,6 +193,18 @@ class LLMGateway:
             kwargs["tool_choice"] = tool_choice
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+        forced = tool_choice == "required" or isinstance(tool_choice, dict)
+        adapted = model == self.settings.flash_model and forced and not self.settings.flash_native_forced_tools
+        if adapted:
+            available = list(tools or [])
+            if isinstance(tool_choice, dict):
+                name = tool_choice["function"]["name"]
+                available = [tool for tool in available if tool["function"]["name"] == name]
+            if not available:
+                raise ValueError("强制调用的工具未在本轮工具表中声明")
+            kwargs["tools"] = available
+            kwargs["tool_choice"] = "auto"
+            kwargs["messages"] = [*messages, {"role": "user", "content": FORCED_TOOL_INSTRUCTION}]
 
         content = ""
         reasoning = ""
@@ -195,57 +214,67 @@ class LLMGateway:
 
         async with self._sem:
             stream = await self._client_for(model).chat.completions.create(**kwargs)
-            async for chunk in stream:
-                if getattr(chunk, "usage", None):
-                    u = chunk.usage
-                    prompt_details = getattr(u, "prompt_tokens_details", None) or getattr(
-                        u, "input_tokens_details", None
-                    )
-                    completion_details = getattr(u, "completion_tokens_details", None)
-                    cached = int(getattr(prompt_details, "cached_tokens", 0) or 0)
-                    cached = cached or int(getattr(u, "cache_read_input_tokens", 0) or 0)
-                    usage = {
-                        "input_tokens": int(getattr(u, "prompt_tokens", 0) or 0),
-                        "output_tokens": int(getattr(u, "completion_tokens", 0) or 0),
-                        "reasoning_tokens": int(
-                            getattr(completion_details, "reasoning_tokens", 0) or 0
-                        ),
-                        "cached_tokens": cached,
-                    }
-                if not chunk.choices:
-                    continue
-                ch = chunk.choices[0]
-                finish_reason = ch.finish_reason or finish_reason
-                delta = ch.delta
-                if delta is None:
-                    continue
-                if delta.content:
-                    content += delta.content
-                    if on_delta:
-                        await on_delta(delta.content, False)
-                extra = getattr(delta, "reasoning_content", None)
-                if not extra:
-                    extra = (getattr(delta, "model_extra", None) or {}).get("reasoning_content")
-                if extra:
-                    reasoning += extra
-                    if on_delta:
-                        await on_delta(extra, True)
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        slot = acc.setdefault(tc.index or 0, {"id": "", "name": "", "arguments": ""})
-                        if tc.id:
-                            slot["id"] = tc.id
-                        fn = tc.function
-                        if fn is not None:
-                            if fn.name:
-                                slot["name"] += fn.name
-                            if fn.arguments:
-                                slot["arguments"] += fn.arguments
+            try:
+                async for chunk in stream:
+                    if chunk is None:
+                        continue
+                    if getattr(chunk, "usage", None):
+                        u = chunk.usage
+                        prompt_details = getattr(u, "prompt_tokens_details", None) or getattr(
+                            u, "input_tokens_details", None
+                        )
+                        completion_details = getattr(u, "completion_tokens_details", None)
+                        cached = int(getattr(prompt_details, "cached_tokens", 0) or 0)
+                        cached = cached or int(getattr(u, "cache_read_input_tokens", 0) or 0)
+                        usage = {
+                            "input_tokens": int(getattr(u, "prompt_tokens", 0) or 0),
+                            "output_tokens": int(getattr(u, "completion_tokens", 0) or 0),
+                            "reasoning_tokens": int(
+                                getattr(completion_details, "reasoning_tokens", 0) or 0
+                            ),
+                            "cached_tokens": cached,
+                        }
+                    if not chunk.choices:
+                        continue
+                    ch = chunk.choices[0]
+                    finish_reason = ch.finish_reason or finish_reason
+                    delta = ch.delta
+                    if delta is None:
+                        continue
+                    if delta.content:
+                        content += delta.content
+                        if on_delta:
+                            await on_delta(delta.content, False)
+                    extra = getattr(delta, "reasoning_content", None)
+                    if not extra:
+                        extra = (getattr(delta, "model_extra", None) or {}).get("reasoning_content")
+                    if extra:
+                        reasoning += extra
+                        if on_delta:
+                            await on_delta(extra, True)
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            slot = acc.setdefault(tc.index or 0, {"id": "", "name": "", "arguments": ""})
+                            if tc.id:
+                                slot["id"] = tc.id
+                            fn = tc.function
+                            if fn is not None:
+                                if fn.name:
+                                    slot["name"] += fn.name
+                                if fn.arguments:
+                                    slot["arguments"] += fn.arguments
+            finally:
+                await stream.close()
 
+        calls = [acc[i] for i in sorted(acc) if acc[i].get("name")]
+        allowed = {t["function"]["name"] for t in kwargs.get("tools", [])}
+        invalid = adapted and (not calls or any(c["name"] not in allowed for c in calls))
         return ChatResult(
             content=content,
             reasoning=reasoning,
-            tool_calls=[acc[i] for i in sorted(acc) if acc[i].get("name")],
+            tool_calls=calls,
+            error_class=ErrorClass.VALIDATION if invalid else ErrorClass.OK,
+            error_detail="强制工具调用未返回声明的工具" if invalid else "",
             finish_reason=finish_reason,
             usage=usage,
         )
@@ -258,4 +287,7 @@ class LLMGateway:
                 model=self.settings.embedding_model,
                 input=texts,
             )
-        return [list(item.embedding) for item in resp.data]
+        ordered = sorted(resp.data, key=lambda item: item.index)
+        if [item.index for item in ordered] != list(range(len(texts))):
+            raise ValueError("embedding 返回索引与输入不一致")
+        return [list(item.embedding) for item in ordered]

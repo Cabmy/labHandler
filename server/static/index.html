@@ -575,6 +575,7 @@
       es.addEventListener('cards', (e) => {
         const d = JSON.parse(e.data);
         logLine('toolret', 'prefetched cards ' + (d.n || 0));
+        if (d.errors && d.errors.length) logLine('toolret', '记忆检索未完整完成，可重试：' + d.errors.join(' · '));
       });
       es.addEventListener('node_done', (e) => {
         const d = JSON.parse(e.data);

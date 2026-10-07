@@ -1,7 +1,7 @@
 """离线知识治理（/dream）。
 
 按 (card_type, task_type) 分组；组内至少 2 张才送 Pro 判定。
-合并成功：新卡写入 archive + markdown + 向量索引；源卡 retired_at 置位并删文件。
+合并成功：新卡写入 archive + markdown + 向量索引；源卡删除文件并记录淘汰时间。
 合并写入失败：对应 source_ids 不淘汰。单组 LLM/解析失败记入 errors，其余组继续。
 卡片文件为事实源；向量表为派生索引。
 """
@@ -10,8 +10,9 @@ from typing import Any
 
 from config.prompts import DREAM_SYSTEM
 from config.runtime import get_settings
-from memory.archive import VALID_CARD_TYPES, get_task_archive
-from memory.retrieve import delete_card_file, index_card_ids, write_card_file
+from memory.archive import get_task_archive
+from memory.cards import VALID_CARD_TYPES
+from memory.retrieve import index_card_ids
 from runtime.llm import LLMGateway
 from runtime.loop.schema import DREAM_SCHEMA, SUBMIT_DREAM
 from runtime.loop.parse import oneshot_schema
@@ -78,11 +79,11 @@ async def _judge_group(
         if not isinstance(m, dict):
             continue
         content = str(m.get("content", "")).strip()
-        source_ids = [
+        source_ids = sorted({
             int(i)
             for i in (m.get("source_ids") or [])
             if isinstance(i, (int, str)) and str(i).isdigit() and int(i) in group_ids
-        ]
+        })
         if not content or len(source_ids) < 2:
             continue
         merged.append(
@@ -131,29 +132,21 @@ async def run_dream(llm: LLMGateway | None = None) -> dict[str, Any]:
             continue
         for m in merged:
             newest = card_by_id[max(m["source_ids"])]
-            ids = archive.create_cards(
-                newest["task_id"],
-                [{"type": m["type"], "content": m["content"]}],
-                str(newest.get("task_title", "")),
-                task_type,
-            )
+            try:
+                ids = archive.create_cards(
+                    newest["task_id"],
+                    [{"type": m["type"], "content": m["content"]}],
+                    str(newest.get("task_title", "")),
+                    task_type,
+                )
+            except Exception as e:
+                report["errors"].append(f"合并卡片写入失败: {type(e).__name__}: {e}")
+                ids = []
             if not ids:
                 retire_ids = [i for i in retire_ids if i not in m["source_ids"]]
                 continue
             created_ids.extend(ids)
             report["merged_created"] += len(ids)
-            for cid in ids:
-                write_card_file(
-                    {
-                        "card_id": cid,
-                        "task_id": newest["task_id"],
-                        "card_type": m["type"],
-                        "content": m["content"],
-                        "task_title": newest.get("task_title", ""),
-                        "task_type": task_type,
-                    },
-                    settings,
-                )
             if m["type"] == "pattern" and len(m["source_ids"]) >= 3:
                 report["promotion_suggestions"].append(
                     f"pattern 卡（合并自 {len(m['source_ids'])} 张，task_type={task_type}）"
@@ -164,8 +157,6 @@ async def run_dream(llm: LLMGateway | None = None) -> dict[str, Any]:
     if all_retire:
         unique = sorted(set(all_retire))
         report["retired"] = archive.retire_cards(unique)
-        for cid in unique:
-            delete_card_file(cid, settings)
 
     if created_ids:
         idx = await index_card_ids(created_ids, llm, settings)

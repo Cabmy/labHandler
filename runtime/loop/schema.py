@@ -30,6 +30,7 @@ SUBMIT_REMEMBER = "submit_remember"
 SUBMIT_SUMMARY = "submit_summary"
 SUBMIT_HALT = "submit_halt"
 SUBMIT_DREAM = "submit_dream"
+SUBMIT_MEMORY_SELECT = "submit_memory_select"
 SUBMIT_SKILL_EDIT = "submit_skill_edit"
 
 # 结构化出口：无副作用，能否执行由 bind 的 allow 决定；广告表可以更宽。
@@ -43,6 +44,7 @@ SCHEMA_TOOLS = {
     SUBMIT_SUMMARY,
     SUBMIT_HALT,
     SUBMIT_DREAM,
+    SUBMIT_MEMORY_SELECT,
     SUBMIT_SKILL_EDIT,
 }
 
@@ -348,6 +350,27 @@ DREAM_SCHEMA: dict[str, Any] = {
     },
 }
 
+MEMORY_SELECT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["verdicts"],
+    "additionalProperties": False,
+    "properties": {
+        "verdicts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["index", "relevant", "reason"],
+                "additionalProperties": False,
+                "properties": {
+                    "index": {"type": "integer", "minimum": 0},
+                    "relevant": {"type": "boolean"},
+                    "reason": {"type": "string", "minLength": 1},
+                },
+            },
+        },
+    },
+}
+
 SKILL_EDIT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["summary", "operations"],
@@ -378,6 +401,7 @@ _FULL = {
     SUBMIT_SUMMARY: SUMMARY_SCHEMA,
     SUBMIT_HALT: HALT_SCHEMA,
     SUBMIT_DREAM: DREAM_SCHEMA,
+    SUBMIT_MEMORY_SELECT: MEMORY_SELECT_SCHEMA,
     SUBMIT_SKILL_EDIT: SKILL_EDIT_SCHEMA,
 }
 
