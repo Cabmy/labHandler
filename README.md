@@ -10,18 +10,19 @@ ingest 材料目录 → Remember-Judge 裁定长期规则 → Pro 写 SPEC.md
 → Pro Judge（continue / finish / revise_spec / takeover）→ SUMMARY.md
 ```
 
-缺用户才能给的信息时，任一阶段可 `submit_halt` 短路到 SUMMARY。
+缺用户才能给的信息时，Pro 阶段可 `submit_halt` 短路到 SUMMARY；Flash 通过 blocked brief 上报。
 
 ## 架构
 
 分层视图：HTTP 入口 → RuntimeTask 控制面 → 阶段流水线 → 每个 Pro/Flash 节点的
 一轮 ReAct → LLM 网关与工具（经 MCP 进 Docker 沙箱），最下是持久化/记忆/可观测横切层。
+Pro、Flash 是职责角色，不代表具体供应商；可使用不同网关，也可使用名称相同的模型。
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
 │ server · FastAPI 127.0.0.1:8000                                    │
-│   Web UI ─► /chat · /stop · /done · /remember · /dream · /skill    │
-│   AgentRouter whitelist header · one lab per session · thread_id   │
+│   Web UI ─► tasks · files · memory · skills                        │
+│   one lab per session · thread_id · upload & task control          │
 └────────────────────────────────┬───────────────────────────────────┘
                                  ▼
 ┌────────────────────────────────────────────────────────────────────┐
@@ -47,7 +48,7 @@ ingest 材料目录 → Remember-Judge 裁定长期规则 → Pro 写 SPEC.md
 │           Pro submit_judge ─► continue|finish|revise_spec|takeover │
 │     └─► Pro submit_summary ─► SUMMARY.md                           │
 │                                                                    │
-│   any phase submit_halt ─► short-circuit SUMMARY (need_user)       │
+│   Pro submit_halt ─► short-circuit SUMMARY (need_user)             │
 └────────────────────────────────┬───────────────────────────────────┘
                                  ▼  per Pro / Flash node
 ┌────────────────────────────────────────────────────────────────────┐
@@ -65,15 +66,15 @@ ingest 材料目录 → Remember-Judge 裁定长期规则 → Pro 写 SPEC.md
                  ▼                        ▼
 ┌──────────────────────────────┐  ┌──────────────────────────────────┐
 │ LLM gateway · runtime/llm.py │  │ tools · tools/ + loop/registry   │
-│   Pro (glm) / Flash dual gate│  │   fs · search · sandbox · skill  │
-│   AsyncOpenAI streaming      │  │   profile · policy SecurityPolicy│
-│   max_retries=0              │  │   path guard + cmd whitelist     │
+│   Pro / Flash / Embedding    │  │   fs · search · sandbox · skill  │
+│   configurable API endpoints │  │   profile · policy SecurityPolicy│
+│   streaming · max_retries=0  │  │   path guard + cmd whitelist     │
 │   _breaker: consecutive fails│  │   + role write-protect           │
 │     -> escalate error FATAL  │  │   heavy ops -> MCP -> Docker     │
 └──────────────────────────────┘  └─────────────────┬────────────────┘
                                                     ▼ MCP
                                   ┌──────────────────────────────────┐
-                                  │ Docker AIO Sandbox               │
+                                  │ Sandbox · configurable image     │
                                   │   PYTHONPATH=/workspace pytest   │
                                   │   artifacts + SUMMARY.md         │
                                   │     written back to workspace/   │
@@ -83,9 +84,9 @@ ingest 材料目录 → Remember-Judge 裁定长期规则 → Pro 写 SPEC.md
 │ cross-cutting                                                      │
 │   persist · JOURNAL.jsonl (append-only) + STATE.json + ledger      │
 │             idempotent resume by artifact sha256 fingerprint       │
-│   memory  · card markdown (source of truth) + SQLite vectors       │
+│   memory  · card markdown (source of truth) + SQLite / sqlite-vec  │
 │             /dream offline curation                                │
-│   observe · Langfuse spans + local JSONL                           │
+│   observe · configured trace backend + local JSONL                 │
 │             run / step / turn / llm / tool / gate                  │
 └────────────────────────────────────────────────────────────────────┘
 ```
@@ -107,21 +108,33 @@ ingest 材料目录 → Remember-Judge 裁定长期规则 → Pro 写 SPEC.md
 
 记忆数据库仅保存任务归档、卡片 ID/生命周期与向量缓存，不保存卡片正文副本；淘汰时删除卡片文件并记录生命周期。sqlite-vec 使用 SQL 距离函数精确扫描，不引入独立服务或 ANN 索引。该版本不兼容旧数据库 schema：升级时配置新的 `MEMORY_DB_PATH` 与 `CARDS_DIR`，旧数据保留备份；不提供旧表读取或自动迁移路径。
 
-Flash 默认使用 `FLASH_NATIVE_FORCED_TOOLS=false`：普通工具调用保留原生 auto/思考模式；强制交卷只暴露指定工具，追加交卷指令，并严格校验响应，纯文本或越权工具视为失败。支持原生强制工具的网关可将该配置设为 true。流式解析会忽略空心跳并在取消时关闭流。
+`PRO_NATIVE_FORCED_TOOLS` 与 `FLASH_NATIVE_FORCED_TOOLS` 分别声明端点能力，不按模型名称推断。设为 false 时，强制交卷只暴露指定工具，使用 auto 并严格校验响应，纯文本或越权工具视为失败；设为 true 时使用原生强制工具。流式解析会忽略空心跳并在取消时关闭流。
 
 设计细节与不变量见 [AGENTS.md](AGENTS.md)。
 
 ## 安装
 
-要求 Python 3.11、Docker、AgentRouter Key（Chat）与 Paratera Key（Embedding）。
+要求 Python 3.11、Docker，以及兼容 OpenAI Chat Completions / Embeddings 协议的服务。Chat 端点须支持流式输出和 function calling；可以使用第三方网关、自建服务或不同供应商的端点。
 
 ```bash
 conda create -n labhandler python=3.11 -y && conda activate labhandler
 pip install -r requirements.txt
-cp config/.env.example config/.env   # 填 LLM_API_KEY 与 EMBEDDING_API_KEY
+cp config/.env.example config/.env   # 填端点、密钥、模型名及所需请求头
 ```
 
-必填项缺失启动即报错。关键配置：
+必填项缺失启动即报错；模型名和 API 地址必须显式配置，没有固定供应商回退。
+
+| 角色 | 端点 | 密钥 | 模型 | 自定义请求头 |
+|---|---|---|---|---|
+| Pro | `LLM_BASE_URL` | `LLM_API_KEY` | `PRO_MODEL` | `LLM_DEFAULT_HEADERS` |
+| Flash | `FLASH_BASE_URL` | `FLASH_API_KEY` | `FLASH_MODEL` | `FLASH_DEFAULT_HEADERS` |
+| Embedding | `EMBEDDING_BASE_URL` | `EMBEDDING_API_KEY` | `EMBEDDING_MODEL` | `EMBEDDING_DEFAULT_HEADERS` |
+
+Flash 与 Pro 使用同一端点时，端点、密钥和请求头可继承；切换到独立端点时须显式配置 Flash 密钥，请求头默认不继承。请求头为 JSON 对象，`{}` 表示不加自定义头。需要白名单头或自定义鉴权头时按所选服务填写；不要求额外请求头的服务无需添加供应商专用字段。网关按角色路由，同名模型也不会串用端点或密钥。无鉴权的本地服务可填写其接受的占位 key。
+
+`AIO_SANDBOX_IMAGE` / `AIO_SANDBOX_MCP_URL` 可指定兼容沙箱镜像与 MCP 服务；遥测可使用配置的 Langfuse 兼容端点或关闭远程上报。
+
+其他关键配置：
 
 - `CONTEXT_BUDGET_TOKENS`：所用模型的真实上下文窗口（默认 200000），达 `COMPACT_TRIGGER_RATIO` 触发压缩。
 - `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL`：遥测后端，注意 EU/US 区域，选错会 401；留空只写本地 `workspace/.labhandler/traces.jsonl`。
@@ -151,12 +164,12 @@ case 的 `budget` / `reserve` 可覆盖上下文预算，普通 case 使用启�
 检索验证（不启动 Docker）：
 
 ```bash
-python -m pytest -q eval/test_memory.py
+python -m pytest -q eval/test_memory.py eval/test_providers.py
 # 实际调用配置中的 Embedding 与 Flash API，仅使用合成卡片和临时数据：
 python -m eval.live_memory --output /tmp/labhandler-memory-check
 ```
 
-真实 API 评测输出 `report.json`，分别报告召回、无关查询弃权、精确选择和错误次数；Embedding 缓存绑定端点与模型。它验证固定样本，不代表所有未来任务均能正确检索。
+真实 API 评测输出 `report.json`，分别报告召回、无关查询弃权、精确选择和错误次数；Embedding 缓存绑定端点、模型和鉴权配置摘要；更换请求头或密钥也会重建派生索引，摘要不会暴露密钥。它验证固定样本，不代表所有未来任务均能正确检索。
 
 ## Web 操作
 

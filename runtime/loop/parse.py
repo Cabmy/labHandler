@@ -386,9 +386,11 @@ async def oneshot_schema(
     name: str,
     schema: dict[str, Any],
     description: str,
+    role: str = "pro",
 ) -> dict[str, Any]:
     result = await llm.chat(
         model=model,
+        role=role,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},

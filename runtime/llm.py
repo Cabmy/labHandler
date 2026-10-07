@@ -47,6 +47,7 @@ class LLMGateway:
         *,
         chat_client: AsyncOpenAI | None = None,
         embed_client: AsyncOpenAI | None = None,
+        flash_client: AsyncOpenAI | None = None,
         tracer: Tracer | None = None,
     ) -> None:
         self.settings = settings
@@ -65,7 +66,7 @@ class LLMGateway:
             and settings.flash_api_key == settings.llm_api_key
             and settings.flash_default_headers == settings.llm_default_headers
         )
-        self.flash_client = (
+        self.flash_client = flash_client or (
             self.chat_client
             if same_flash
             else AsyncOpenAI(
@@ -79,14 +80,17 @@ class LLMGateway:
         self.embed_client = embed_client or AsyncOpenAI(
             api_key=settings.embedding_api_key or "empty",
             base_url=settings.embedding_base_url,
+            default_headers=settings.embedding_default_headers,
             max_retries=0,
             timeout=60.0,
         )
 
-    def _client_for(self, model: str) -> AsyncOpenAI:
-        if model == self.settings.flash_model:
+    def _client_for(self, role: str) -> AsyncOpenAI:
+        if role == "pro":
+            return self.chat_client
+        if role == "flash":
             return self.flash_client
-        return self.chat_client
+        raise ValueError(f"未知 LLM 角色: {role}")
 
     async def aclose(self) -> None:
         for client in {self.chat_client, self.flash_client, self.embed_client}:
@@ -98,6 +102,7 @@ class LLMGateway:
         self,
         *,
         model: str,
+        role: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
@@ -113,6 +118,7 @@ class LLMGateway:
             try:
                 result = await self._openai_chat(
                     model=model,
+                    role=role,
                     messages=messages,
                     tools=tools,
                     tool_choice=tool_choice,
@@ -175,6 +181,7 @@ class LLMGateway:
         self,
         *,
         model: str,
+        role: str,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         tool_choice: Any,
@@ -194,7 +201,10 @@ class LLMGateway:
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         forced = tool_choice == "required" or isinstance(tool_choice, dict)
-        adapted = model == self.settings.flash_model and forced and not self.settings.flash_native_forced_tools
+        client = self._client_for(role)
+        native_forced_tools = (self.settings.pro_native_forced_tools if role == "pro"
+                               else self.settings.flash_native_forced_tools)
+        adapted = forced and not native_forced_tools
         if adapted:
             available = list(tools or [])
             if isinstance(tool_choice, dict):
@@ -213,7 +223,7 @@ class LLMGateway:
         finish_reason: str | None = None
 
         async with self._sem:
-            stream = await self._client_for(model).chat.completions.create(**kwargs)
+            stream = await client.chat.completions.create(**kwargs)
             try:
                 async for chunk in stream:
                     if chunk is None:

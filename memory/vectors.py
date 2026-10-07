@@ -16,6 +16,14 @@ from memory.cards import content_sha256
 from memory.db import connect
 
 
+def embedding_space(settings: RuntimeSettings) -> str:
+    """端点、模型和鉴权配置共同标识向量空间，敏感值只保留摘要。"""
+    routing = json.dumps({"headers": settings.embedding_default_headers,
+                          "api_key": settings.embedding_api_key}, sort_keys=True)
+    return json.dumps([settings.embedding_base_url.rstrip("/"), settings.embedding_model,
+                       content_sha256(routing)])
+
+
 def _pack(vector: list[float]) -> bytes:
     if not vector or not all(math.isfinite(x) for x in vector):
         raise ValueError("embedding 必须是非空、有限数值的一维向量")
@@ -31,9 +39,7 @@ class VectorIndex:
         self.settings = settings or get_settings()
         self.db_path = self.settings.memory_db_path
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.space = json.dumps([
-            self.settings.embedding_base_url.rstrip("/"), self.settings.embedding_model,
-        ])
+        self.space = embedding_space(self.settings)
         with self._connect() as conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS card_vectors (

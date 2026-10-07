@@ -13,6 +13,7 @@ import time
 from config.runtime import get_settings
 from memory.cards import write_card_file
 from memory.retrieve import search_cards
+from memory.vectors import embedding_space
 from runtime.llm import LLMGateway
 
 CARDS = [
@@ -62,7 +63,7 @@ class RecordedGateway:
         self.gateway = gateway
         self.cache_path = cache_path
         s = gateway.settings
-        self.space = [s.embedding_base_url.rstrip("/"), s.embedding_model]
+        self.space = embedding_space(s)
         data = json.loads(cache_path.read_text()) if cache_path.exists() else {}
         self.vectors = data.get("vectors", {}) if data.get("space") == self.space else {}
         self.embedding_calls = 0

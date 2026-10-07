@@ -450,7 +450,7 @@ def test_cancelled_chat_closes_stream(settings):
         gateway.chat_client = gateway.flash_client = client
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(.01):
-                await gateway._openai_chat(model=settings.pro_model, messages=[], tools=None,
+                await gateway._openai_chat(model=settings.pro_model, role="pro", messages=[], tools=None,
                                           tool_choice=None, max_tokens=None, on_delta=None)
         assert stream.closed
     asyncio.run(run())
@@ -512,7 +512,7 @@ def test_flash_forced_tool_adapter_and_null_stream_chunks(settings, returned):
         gateway.chat_client = gateway.flash_client = client
         tools = [{"type": "function", "function": {"name": name}} for name in ["read_file", "submit_brief"]]
         messages = [{"role": "user", "content": "finish"}]
-        result = await gateway._openai_chat(model=settings.flash_model, messages=messages, tools=tools,
+        result = await gateway._openai_chat(model=settings.flash_model, role="flash", messages=messages, tools=tools,
                   tool_choice={"type": "function", "function": {"name": "submit_brief"}}, max_tokens=None, on_delta=None)
         sent = create.call_args.kwargs
         assert sent["tool_choice"] == "auto"
@@ -575,3 +575,14 @@ def test_material_excerpt_keeps_middle_requirement(settings):
                     + "提交时间说明。\n" * 200, encoding="utf-8")
     context = material_context(settings, settings.workspace_dir / ".labhandler" / "session")
     assert "必须实现带 TTL" in context and len(context) <= 1100
+
+
+def test_embedding_auth_configuration_isolates_vector_space(settings):
+    index = VectorIndex(settings)
+    index.upsert("card", "body", [1., 0.])
+    fingerprints = {"card": content_sha256("body")}
+    changed_headers = replace(settings, embedding_default_headers={"x-tenant": "another"})
+    changed_key = replace(settings, embedding_api_key="different-embedding-secret")
+    for changed in [changed_headers, changed_key]:
+        assert VectorIndex(changed).search([1., 0.], fingerprints, .25) == []
+    assert "different-embedding-secret" not in VectorIndex(changed_key).space

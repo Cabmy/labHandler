@@ -14,7 +14,7 @@ async def select_relevant(query: str, cards: list[dict], llm,
     from runtime.loop.schema import MEMORY_SELECT_SCHEMA, SUBMIT_MEMORY_SELECT
 
     payload = await retry_transient(lambda: oneshot_schema(
-        llm, model=settings.flash_model, system=MEMORY_SELECT_SYSTEM,
+        llm, model=settings.flash_model, role="flash", system=MEMORY_SELECT_SYSTEM,
         user=json.dumps({"request": query, "candidates": [
             {"index": i, "task_title": c.get("task_title", ""),
              "task_type": c.get("task_type", ""), "content": c["content"]}

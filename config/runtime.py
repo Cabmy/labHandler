@@ -1,7 +1,7 @@
 """运行时配置中心：config/.env 读成一份不可变的 RuntimeSettings。
 
 进程内单例。缺项或非法值在 get_settings() 时抛 ConfigError，无静默回落。
-硬约束：LLM_API_KEY 非空；PRO_MODEL / FLASH_MODEL 非空；
+硬约束：LLM_API_KEY 非空；Chat / Embedding 端点与模型显式配置；
 OUTPUT_RESERVE_TOKENS < CONTEXT_BUDGET_TOKENS。
 """
 
@@ -19,14 +19,6 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 class ConfigError(RuntimeError):
     """配置缺失或不合法。只在 get_settings() 时抛出。"""
-
-
-# LLM_DEFAULT_HEADERS 为空时使用。AgentRouter 缺这组头会 401 unauthorized client detected。
-_DEFAULT_LLM_HEADERS = {
-    "User-Agent": "claude-cli/1.0.108 (external, cli)",
-    "x-app": "cli",
-    "anthropic-version": "2023-06-01",
-}
 
 
 def _env_int(name: str, default: int, *, minimum: int | None = None) -> int:
@@ -109,11 +101,13 @@ class RuntimeSettings:
     flash_api_key: str
     llm_default_headers: dict[str, str]
     flash_default_headers: dict[str, str]
+    pro_native_forced_tools: bool
     flash_native_forced_tools: bool
     # Embedding
     embedding_base_url: str
     embedding_api_key: str
     embedding_model: str
+    embedding_default_headers: dict[str, str]
     memory_min_score: float
     memory_timeout_s: float
     # 预算与控制
@@ -163,16 +157,25 @@ def get_settings() -> RuntimeSettings:
     if not llm_key:
         raise ConfigError("LLM_API_KEY 未配置。复制 config/.env.example 到 config/.env 并填入密钥。")
 
-    pro_model = _env_str("PRO_MODEL", "glm-5.3")
-    flash_model = _env_str("FLASH_MODEL", "deepseek-v4-flash")
+    pro_model = _env_str("PRO_MODEL")
+    flash_model = _env_str("FLASH_MODEL")
     if not pro_model or not flash_model:
         raise ConfigError("PRO_MODEL 与 FLASH_MODEL 不能为空")
 
-    llm_base_url = _env_str("LLM_BASE_URL", "https://agentrouter.org/v1")
-    llm_headers = _env_headers("LLM_DEFAULT_HEADERS", default=_DEFAULT_LLM_HEADERS)
+    llm_base_url = _env_str("LLM_BASE_URL")
+    embedding_base_url = _env_str("EMBEDDING_BASE_URL")
+    embedding_model = _env_str("EMBEDDING_MODEL")
+    for name, value in [("LLM_BASE_URL", llm_base_url), ("EMBEDDING_BASE_URL", embedding_base_url),
+                        ("EMBEDDING_MODEL", embedding_model)]:
+        if not value:
+            raise ConfigError(f"{name} 未配置；请填写所选服务的配置")
+    llm_headers = _env_headers("LLM_DEFAULT_HEADERS")
     flash_base_url = _env_str("FLASH_BASE_URL") or llm_base_url
-    flash_api_key = _env_str("FLASH_API_KEY") or llm_key
-    flash_headers = _env_headers("FLASH_DEFAULT_HEADERS", default=llm_headers)
+    same_endpoint = flash_base_url.rstrip("/") == llm_base_url.rstrip("/")
+    flash_api_key = _env_str("FLASH_API_KEY") or (llm_key if same_endpoint else "")
+    if not flash_api_key:
+        raise ConfigError("Flash 使用独立网关时必须配置 FLASH_API_KEY")
+    flash_headers = _env_headers("FLASH_DEFAULT_HEADERS", default=llm_headers if same_endpoint else {})
 
     context_budget = _env_int("CONTEXT_BUDGET_TOKENS", 200000, minimum=4096)
     output_reserve = _env_int("OUTPUT_RESERVE_TOKENS", 8192, minimum=256)
@@ -195,11 +198,12 @@ def get_settings() -> RuntimeSettings:
         flash_api_key=flash_api_key,
         llm_default_headers=llm_headers,
         flash_default_headers=flash_headers,
-        flash_native_forced_tools=_env_bool(
-            "FLASH_NATIVE_FORCED_TOOLS", not flash_model.lower().startswith("deepseek-")),
-        embedding_base_url=_env_str("EMBEDDING_BASE_URL", "https://llmapi.paratera.com/v1/"),
+        pro_native_forced_tools=_env_bool("PRO_NATIVE_FORCED_TOOLS", True),
+        flash_native_forced_tools=_env_bool("FLASH_NATIVE_FORCED_TOOLS", False),
+        embedding_base_url=embedding_base_url,
         embedding_api_key=_env_str("EMBEDDING_API_KEY"),
-        embedding_model=_env_str("EMBEDDING_MODEL", "GLM-Embedding-3"),
+        embedding_model=embedding_model,
+        embedding_default_headers=_env_headers("EMBEDDING_DEFAULT_HEADERS"),
         memory_min_score=_env_float("MEMORY_MIN_SCORE", 0.35, minimum=-1.0, maximum=1.0),
         memory_timeout_s=_env_float("MEMORY_TIMEOUT_S", 90.0, minimum=1.0),
         pro_step_budget=_env_int("PRO_STEP_BUDGET", 20, minimum=1),

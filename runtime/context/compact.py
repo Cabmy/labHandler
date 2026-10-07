@@ -289,6 +289,7 @@ async def _summarize(
         blob = _render_for_summary(turns)
         result = await llm.chat(
             model=settings.flash_model,
+            role="flash",
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": blob},

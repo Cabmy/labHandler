@@ -306,6 +306,7 @@ async def run_loop(
 
             result = await llm.chat(
                 model=spec.model,
+                role=spec.name,
                 messages=ctx.messages,
                 tools=openai_tools,
                 tool_choice=choice,
