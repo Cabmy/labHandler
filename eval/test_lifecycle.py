@@ -130,10 +130,10 @@ def test_stop_cancels_current_work_and_can_resume(runner, tmp_path, monkeypatch)
             return {"verdict": "fail", "summary": "Honest report"}
 
         monkeypatch.setattr("runtime.lab.runner.run_lab", finish)
-        assert (await runner.run("ignored", tmp_path, resume=True))["verdict"] == "fail"
+        assert (await runner.resume(tmp_path))["verdict"] == "fail"
         assert Journal(tmp_path / JOURNAL_FILE).replay().status() == "FINISHED"
         with pytest.raises(ValueError, match="not resumable"):
-            await runner.run("again", tmp_path, resume=True)
+            await runner.resume(tmp_path)
 
     asyncio.run(run())
 
@@ -308,7 +308,7 @@ def test_summary_failure_resumes_summary_and_closes_only_after_file_write(runner
     assert not (tmp_path / "SUMMARY.md").exists()
     summary_ok = True
     calls.clear()
-    asyncio.run(runner.run("test", tmp_path, resume=True))
+    asyncio.run(runner.resume(tmp_path))
     assert calls == ["summary"]
     assert (tmp_path / "SUMMARY.md").read_text() == "完成情况"
     assert Journal(tmp_path / JOURNAL_FILE).replay().status() == "FINISHED"
@@ -362,10 +362,10 @@ def test_summary_write_failure_does_not_close_session(runner, tmp_path, monkeypa
 
     monkeypatch.setattr(flow, "write_text", fail_summary)
     with pytest.raises(OSError, match="disk full"):
-        asyncio.run(runner.run("test", tmp_path, resume=True))
+        asyncio.run(runner.resume(tmp_path))
     assert journal.replay().resumable
     monkeypatch.setattr(flow, "write_text", original)
-    assert asyncio.run(runner.run("test", tmp_path, resume=True))["summary"] == "saved"
+    assert asyncio.run(runner.resume(tmp_path))["summary"] == "saved"
     assert not journal.replay().resumable
 
 
@@ -413,7 +413,7 @@ def test_pipeline_resume_keeps_dispatch_and_retries_only_interrupted_worker(runn
         before = Journal(tmp_path / JOURNAL_FILE).replay()
         assert 1 in before.step_dispatch and not before.step_briefs
         resumed = True
-        assert (await runner.run("continue", tmp_path, resume=True))["verdict"] == "pass"
+        assert (await runner.resume(tmp_path))["verdict"] == "pass"
         assert calls == [TaskKind.SPEC, TaskKind.DISPATCH, TaskKind.WORKER,
                          TaskKind.WORKER, TaskKind.JUDGE, TaskKind.SUMMARY]
         state = Journal(tmp_path / JOURNAL_FILE).replay()

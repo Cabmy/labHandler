@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
+from config.prompts import render_lab_request, render_user_instruction
+
 JOURNAL_FILE = "JOURNAL.jsonl"
 
 _STAGES = {"remember", "spec", "advance", "summary"}
@@ -23,6 +25,8 @@ class JournalState:
 
     begun: bool = False
     question: str = ""
+    instructions: list[str] = field(default_factory=list)
+    request_revision: int = 0
     # 有 session_closed 才终结；无 live 协程的 open 会话始终可恢复。
     result: dict[str, Any] | None = None
     pause_reason: str = "interrupted"
@@ -47,6 +51,10 @@ class JournalState:
     effects: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
+    def current_request(self) -> str:
+        return render_lab_request(self.question, self.instructions)
+
+    @property
     def resumable(self) -> bool:
         return self.begun and self.result is None
 
@@ -60,6 +68,8 @@ class JournalState:
 
     def latest_submit(self, name: str) -> dict[str, Any] | None:
         for attempt in reversed(list(self.attempts.values())):
+            if attempt["request_revision"] != self.request_revision:
+                continue
             submit = (attempt.get("end") or {}).get("submit") or {}
             if submit.get("name") == name:
                 return submit["payload"]
@@ -155,7 +165,7 @@ class Journal:
             elif kind == "session_closed":
                 st.result = dict(payload["result"])
             elif kind == "attempt_started":
-                st.attempts[payload["task_id"]] = dict(payload)
+                st.attempts[payload["task_id"]] = {**payload, "request_revision": st.request_revision}
             elif kind == "attempt_ended":
                 st.attempts[payload["task_id"]]["end"] = dict(payload)
             elif kind == "tx_snapshot":
@@ -165,6 +175,17 @@ class Journal:
                 messages = payload.get("messages")
                 if isinstance(messages, list):
                     tx.extend(m for m in messages if isinstance(m, dict))
+            elif kind == "user_instruction":
+                instruction = payload["text"].strip()
+                if not instruction:
+                    raise ValueError("user_instruction must not be empty")
+                st.instructions.append(instruction)
+                st.request_revision += 1
+                # 已有主线直接追加；尚无主线时，开场会使用 current_request。
+                if tx:
+                    tx = drop_dangling_tool_calls(tx)
+                    tx.append({"role": "user", "content": render_user_instruction(instruction), "pinned": True})
+                self._invalidate_plan(st)
             elif kind == "stage":
                 stage = str(payload.get("stage") or "")
                 if stage in _STAGES:
@@ -215,6 +236,23 @@ class Journal:
                 st.effects.pop(str(payload.get("node_id") or ""), None)
         st.transcript = drop_dangling_tool_calls(tx)
         return st
+
+    @staticmethod
+    def _invalidate_plan(st: JournalState) -> None:
+        """新要求开启新规划；保留文件、历史和进度，废弃旧计划的执行凭据。"""
+        st.stage = "spec"
+        st.dispatch_step = 0
+        st.halt = None
+        st.sandbox_down = ""
+        st.run_gate = None
+        st.executed_ids.clear()
+        st.gates.clear()
+        st.gate_tries.clear()
+        st.broken_gates.clear()
+        st.effects.clear()
+        st.step_dispatch.clear()
+        st.step_briefs.clear()
+        st.step_judges.clear()
 
     @staticmethod
     def _fold_gate(st: JournalState, payload: dict[str, Any]) -> None:

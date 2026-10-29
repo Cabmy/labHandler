@@ -170,6 +170,29 @@ def render_state_update(kind: str, body: str) -> str:
     return f'<state_update type="{kind}">\n{body.strip()}\n</state_update>'
 
 
+# 用户请求修订：原始目标保留，后续指令按顺序叠加。
+def render_lab_request(question: str, instructions: list[str]) -> str:
+    if not instructions:
+        return question
+    updates = "\n\n".join(f"### Update {i}\n{text}" for i, text in enumerate(instructions, 1))
+    return (
+        f"{question}\n\n## Subsequent user instructions (in order)\n"
+        f"Later instructions override conflicting earlier requirements.\n\n{updates}"
+    )
+
+
+def render_user_instruction(instruction: str) -> str:
+    return (
+        "The user paused this lab and added the following instruction. "
+        "It updates the existing request; newer user instructions take precedence over "
+        "conflicting earlier requirements and SPEC interfaces. Preserve useful existing files. "
+        "Revise SPEC for the current requirements before dispatching more work. "
+        "Previous assignments, completion markers and gates do not establish compliance "
+        "with changed requirements; inspect what can be retained and update acceptance as needed.\n\n"
+        f"## User instruction\n{instruction}"
+    )
+
+
 # Pro：写出 SPEC.md。里程碑 = 交给 Flash 的产品步骤，不是 Pro 自己的日程。
 SPEC_PHASE_PROMPT = """## Role
 You are Pro writing SPEC.md. The initial user task has the request plus a workspace catalog.
@@ -181,7 +204,8 @@ A specification of the finished work plus a Flash work queue — not your privat
 - goal: what the finished work must be
 - overview: how you intend to get there, including facts you already read from the materials
 - interfaces: names fixed for the entire task (function / class / cli / file / http) with
-  signatures. Once written they never change. Acceptance code will import them verbatim.
+  signatures. They stay fixed unless the user explicitly revises the requirements.
+  Acceptance code will import them verbatim.
 - deliverables, constraints
 - acceptance_strategy: one prose string on how YOU will write the gate (samples → pytest).
   Not a JSON object, not a Flash task.

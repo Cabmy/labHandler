@@ -57,7 +57,11 @@ labHandler 只维护一个会话生命周期。执行位置、执行历史、产
 
 ## 恢复与落盘
 
-恢复扫描只读 Journal：有 begin、没有 session_closed 即可恢复。恢复位置由 stage 和 dispatch/brief/judge 提交点确定；已经完成的 SPEC 取最新成功提交，不能回退到第一版。Pro 对话在每轮和退出时落盘。当前尝试的预算计数不跨新尝试延续。
+恢复扫描只读 Journal：有 begin、没有 session_closed 即可恢复。恢复位置由 stage 和 dispatch/brief/judge 提交点确定；已经完成的 SPEC 取当前请求修订内最新成功提交，不能回退到第一版。Pro 对话在每轮和退出时落盘。当前尝试的预算计数不跨新尝试延续。
+
+新建与续跑使用独立入口：`LabSession.run(question)` 新建 lab；`LabSession.resume(thread_id, instruction="")` 恢复原会话。Web 的 `/api/task` 在存在未完成 lab 时返回 409；`/api/resume` 只接受 `instruction` 作为补充内容，不接受旧的 `question` 字段。
+
+空白指令不产生请求修订，保持原 SPEC、派发提交点和幂等凭据。非空指令先写入 `user_instruction(text)`：保留原请求并按顺序累计修订，将新内容作为 pinned 用户消息加入已有 Pro 主线；还没有主线时，初始请求包含全部修订。该事件同时让旧 SPEC 提交、待执行派发、门禁结论和产物跳过凭据失效，回到 SPEC 阶段，由 Pro 评估如何复用已有文件并更新规划。执行历史、产品文件和完成记录保留；新派发的 Flash 收到原请求及全部修订。取消或重启后 replay 同一事件，既不丢指令，也不重复注入。
 
 Journal 逐行 append + fsync。完整换行是记录边界；读者忽略尾部半行，写者重新打开时截掉未提交尾部，避免新事件粘到坏行。已经提交的坏行拒绝恢复，不能静默丢掉一个 close 或 brief。
 
@@ -67,4 +71,4 @@ Journal 逐行 append + fsync。完整换行是记录边界；读者忽略尾部
 
 ## 验证
 
-`python -m pytest -q eval/test_lifecycle.py` 覆盖停止、外部取消、排队取消、并发清理、异常提交、关闭后禁止恢复、日志半行、坏行、最新 SPEC、执行结果与验收分离，以及 Summary 失败/恢复。
+`python -m pytest -q eval/test_lifecycle.py eval/test_instructions.py eval/test_web_resume.py` 覆盖停止、外部取消、排队取消、并发清理、异常提交、关闭后禁止恢复、日志半行、坏行、最新 SPEC、执行结果与验收分离，以及 Summary 失败/恢复。

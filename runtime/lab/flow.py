@@ -413,8 +413,8 @@ async def _begin(
 ) -> LabState:
     runner._applied_rules = None
     runner._skill = SkillBind()
-    if state and state.question.strip():
-        question = state.question
+    if state and state.current_request.strip():
+        question = state.current_request
 
     reset_sandbox_failure_counter()
     ledger = EffectLedger(

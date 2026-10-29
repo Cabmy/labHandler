@@ -82,6 +82,23 @@ def _env_headers(name: str, *, default: dict[str, str] | None = None) -> dict[st
     return {str(k): str(v) for k, v in data.items()}
 
 
+def _env_body(name: str, *, default: dict | None = None) -> dict:
+    """供应商扩展请求体，保留嵌套 JSON 类型，不按模型名称推断能力。"""
+    raw = _env_str(name)
+    if not raw:
+        return dict(default or {})
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ConfigError(f"{name} 不是合法 JSON：{e}") from e
+    if not isinstance(data, dict):
+        raise ConfigError(f"{name} 必须是 JSON 对象")
+    reserved = {"model", "messages", "tools", "tool_choice", "stream", "stream_options", "max_tokens"}
+    if reserved.intersection(data):
+        raise ConfigError(f"{name} 不可覆盖网关字段：{', '.join(sorted(reserved.intersection(data)))}")
+    return data
+
+
 @dataclass(frozen=True)
 class RuntimeSettings:
     """一次启动的全部旋钮。frozen：读完后进程内不再变。"""
@@ -101,6 +118,8 @@ class RuntimeSettings:
     flash_api_key: str
     llm_default_headers: dict[str, str]
     flash_default_headers: dict[str, str]
+    llm_extra_body: dict
+    flash_extra_body: dict
     pro_native_forced_tools: bool
     flash_native_forced_tools: bool
     # Embedding
@@ -176,6 +195,8 @@ def get_settings() -> RuntimeSettings:
     if not flash_api_key:
         raise ConfigError("Flash 使用独立网关时必须配置 FLASH_API_KEY")
     flash_headers = _env_headers("FLASH_DEFAULT_HEADERS", default=llm_headers if same_endpoint else {})
+    llm_extra_body = _env_body("LLM_EXTRA_BODY")
+    flash_extra_body = _env_body("FLASH_EXTRA_BODY", default=llm_extra_body if same_endpoint else {})
 
     context_budget = _env_int("CONTEXT_BUDGET_TOKENS", 200000, minimum=4096)
     output_reserve = _env_int("OUTPUT_RESERVE_TOKENS", 8192, minimum=256)
@@ -198,6 +219,8 @@ def get_settings() -> RuntimeSettings:
         flash_api_key=flash_api_key,
         llm_default_headers=llm_headers,
         flash_default_headers=flash_headers,
+        llm_extra_body=llm_extra_body,
+        flash_extra_body=flash_extra_body,
         pro_native_forced_tools=_env_bool("PRO_NATIVE_FORCED_TOOLS", True),
         flash_native_forced_tools=_env_bool("FLASH_NATIVE_FORCED_TOOLS", False),
         embedding_base_url=embedding_base_url,

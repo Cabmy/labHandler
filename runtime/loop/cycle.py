@@ -215,7 +215,12 @@ async def run_loop(
 
     async def emit(kind: str, **payload: Any) -> None:
         if on_event:
-            await on_event({"kind": kind, **payload})
+            await on_event({
+                "kind": kind,
+                "phase": task.kind.value,
+                "assignment_id": (task.node_spec or {}).get("id", ""),
+                **payload,
+            })
 
     def trace_event(name: str, **attrs: Any) -> None:
         tracer.event(name, **attrs)

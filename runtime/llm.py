@@ -194,6 +194,9 @@ class LLMGateway:
             "stream": True,
             "stream_options": {"include_usage": True},
         }
+        extra_body = self.settings.llm_extra_body if role == "pro" else self.settings.flash_extra_body
+        if extra_body:
+            kwargs["extra_body"] = extra_body
         if tools:
             kwargs["tools"] = tools
         if tool_choice is not None:

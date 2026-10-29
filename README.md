@@ -98,7 +98,7 @@ Pro、Flash 是职责角色，不代表具体供应商；可使用不同网关�
 - **程序性验收四态**：`pass` / `fail` / `test_invalid` / `no_hard_criteria`（无硬指标不等于通过）。验收代码只由 Pro 写，在沙箱内跑 pytest；产物不可检验时如实标注，交 Judge 语义判断。
 - **生命周期**：会话只持久化是否收尾；运行状态从 live 协程派生为 `RUNNING / PAUSED / FINISHED`。子任务是不可复活的执行记录，`RuntimeTask` 只管预算、权限和语义事件。恢复只读 Journal，详见 [状态与恢复设计](doc/LIFECYCLE.md)。
 - **上下文管理**：超预算即压缩——近期留原文、早期成纪要、tool 正文卸盘，压完重新装配再发请求。NOTES.md 常驻，FORGET.md 记排除项。
-- **幂等续跑**：append-only JOURNAL.jsonl 逐轮落盘，崩在任意一轮可续；副作用账本按产物指纹跳过已完成任务。
+- **幂等续跑**：append-only JOURNAL.jsonl 逐轮落盘，崩在任意一轮可续；副作用账本按产物指纹跳过已完成任务。暂停后可填写补充指令再继续：新要求先落盘，Pro 修订 SPEC 后重新派发；留空则直接续原断点。已有文件与历史保留，旧规划的派发和验收结论不充当新要求的完成凭据。
 - **安全边界**：host 白名单 + 路径守护 + 审计；重量操作走 MCP 进 Docker 沙箱。
 - **可观测**：Langfuse + 本地 JSONL，span 覆盖 run / step / turn / llm / tool / 验收。
 - **跨 lab 记忆**：卡片 Markdown 是正文与元数据的唯一事实源；sqlite-vec 在 SQLite 内执行精确余弦检索，`/dream` 直接读取当前文件治理。
@@ -129,6 +129,8 @@ cp config/.env.example config/.env   # 填端点、密钥、模型名及所需�
 | Pro | `LLM_BASE_URL` | `LLM_API_KEY` | `PRO_MODEL` | `LLM_DEFAULT_HEADERS` |
 | Flash | `FLASH_BASE_URL` | `FLASH_API_KEY` | `FLASH_MODEL` | `FLASH_DEFAULT_HEADERS` |
 | Embedding | `EMBEDDING_BASE_URL` | `EMBEDDING_API_KEY` | `EMBEDDING_MODEL` | `EMBEDDING_DEFAULT_HEADERS` |
+
+默认模板使用 DeepSeek 官方接口，Pro 与 Flash 均为 `deepseek-flash`，只需填写同一个 Chat 密钥。`LLM_EXTRA_BODY={"thinking":{"type":"disabled"}}` 关闭默认思考模式，以支持流水线原生强制工具调用；`FLASH_EXTRA_BODY` 留空继承同端点的扩展参数，独立端点默认不继承。扩展参数不可覆盖消息、工具及流式配置。Embedding 仍需单独配置向量服务，不能用 DeepSeek Chat 密钥替代。
 
 Flash 与 Pro 使用同一端点时，端点、密钥和请求头可继承；切换到独立端点时须显式配置 Flash 密钥，请求头默认不继承。请求头为 JSON 对象，`{}` 表示不加自定义头。需要白名单头或自定义鉴权头时按所选服务填写；不要求额外请求头的服务无需添加供应商专用字段。网关按角色路由，同名模型也不会串用端点或密钥。无鉴权的本地服务可填写其接受的占位 key。
 

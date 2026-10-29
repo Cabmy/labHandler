@@ -22,6 +22,7 @@ def configured(monkeypatch):
         "EMBEDDING_BASE_URL": "https://vectors.example/v1", "EMBEDDING_API_KEY": "vector-key",
         "EMBEDDING_MODEL": "custom-vector-model", "EMBEDDING_DEFAULT_HEADERS": '{"x-provider":"vectors"}',
         "PRO_NATIVE_FORCED_TOOLS": "false", "FLASH_NATIVE_FORCED_TOOLS": "true",
+        "LLM_EXTRA_BODY": "{}", "FLASH_EXTRA_BODY": "{}",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -76,8 +77,35 @@ def test_capabilities_do_not_depend_on_model_name(configured, monkeypatch):
     assert get_settings().flash_native_forced_tools is False
 
 
+def test_extra_body_preserves_json_and_only_inherits_on_same_endpoint(configured, monkeypatch):
+    monkeypatch.setenv("LLM_EXTRA_BODY", '{"thinking":{"type":"disabled"}}')
+    monkeypatch.setenv("FLASH_EXTRA_BODY", "")
+    get_settings.cache_clear()
+    assert get_settings().llm_extra_body == {"thinking": {"type": "disabled"}}
+    assert get_settings().flash_extra_body == {}
+    monkeypatch.setenv("FLASH_BASE_URL", "")
+    monkeypatch.setenv("FLASH_DEFAULT_HEADERS", "")
+    get_settings.cache_clear()
+    assert get_settings().flash_extra_body == get_settings().llm_extra_body
+    monkeypatch.setenv("FLASH_EXTRA_BODY", "{}")
+    get_settings.cache_clear()
+    assert get_settings().flash_extra_body == {}
+
+
+@pytest.mark.parametrize("body", ['[]', '{broken', '{"messages":[]}', '{"tool_choice":"none"}', '{"stream":false}'])
+def test_extra_body_rejects_invalid_or_gateway_overrides(configured, monkeypatch, body):
+    monkeypatch.setenv("LLM_EXTRA_BODY", body)
+    get_settings.cache_clear()
+    with pytest.raises(ConfigError, match="LLM_EXTRA_BODY"):
+        get_settings()
+
+
 def test_custom_endpoints_headers_and_same_model_role_routing(configured, monkeypatch):
     requests = []
+    monkeypatch.setenv("LLM_EXTRA_BODY", '{"thinking":{"type":"disabled"}}')
+    monkeypatch.setenv("FLASH_EXTRA_BODY", '{"thinking":{"type":"enabled"}}')
+    get_settings.cache_clear()
+    configured = get_settings()
 
     def handle(request):
         body = json.loads(request.content)
@@ -122,6 +150,8 @@ def test_custom_endpoints_headers_and_same_model_role_routing(configured, monkey
     assert [r.headers["authorization"] for r, _ in requests[:3]] == ["Bearer planner-key", "Bearer worker-key", "Bearer vector-key"]
     assert [r.headers["x-provider"] for r, _ in requests[:3]] == ["planner", "worker", "vectors"]
     assert all("x-app" not in request.headers for request, _ in requests)
+    assert requests[0][1]["thinking"] == {"type": "disabled"}
+    assert requests[1][1]["thinking"] == {"type": "enabled"}
     assert requests[3][1]["tool_choice"] == "auto"
     assert len(requests[3][1]["tools"]) == 1
     assert requests[4][1]["tool_choice"]["function"]["name"] == "submit_result"

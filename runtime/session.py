@@ -1,6 +1,6 @@
 """lab 生命周期：一次会话对应一个 thread_id、一个 Journal、一个会话目录。
 
-新任务永远新开会话。续跑只通过 attach_resume 显式选择未收尾的 Journal，
+run 新建会话，resume 显式选择未收尾的 Journal 并接收可选补充指令，
 并 replay JOURNAL.jsonl 恢复 Pro 对话与阶段进度到断点。
 done() 归档知识卡、把 workspace 挪进 .trash、重建沙箱，并换一棵空 runner。
 """
@@ -56,7 +56,6 @@ class LabSession:
         )
         self.thread_id = _new_thread_id()
         self.last_result: dict[str, Any] = {}
-        self._resuming = False
 
     @property
     def session_path(self) -> Path:
@@ -75,13 +74,6 @@ class LabSession:
         return {"thread_id": tid, "status": state.status(running=running),
                 "reason": "" if running else state.pause_reason}
 
-    def attach_resume(self, thread_id: str) -> None:
-        """选择未收尾的会话；可恢复性由 runner 在读取 Journal 时校验。"""
-        if self.runner.running:
-            raise RuntimeError("lab is already running")
-        self.thread_id = thread_id
-        self._resuming = True
-
     def decline_resume(self) -> dict[str, Any]:
         found = latest_incomplete(self.settings.workspace_dir)
         if found:
@@ -92,21 +84,30 @@ class LabSession:
         self.runner.request_stop()
 
     async def run(self, question: str, on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None) -> dict[str, Any]:
+        """新建一个 lab；续跑必须调用 resume。"""
         if self.runner.running:
             raise RuntimeError("lab is already running")
+        self.thread_id = _new_thread_id()
         self.last_result = {}
-        resume = self._resuming
-        if not resume:
-            self.thread_id = _new_thread_id()
-        self._resuming = False
         self.tracer.new_trace()
-        self.session_path.mkdir(parents=True, exist_ok=True)
-        result = await self.runner.run(
-            question,
-            self.session_path,
-            on_event=on_event,
-            resume=resume,
-        )
+        result = await self.runner.run(question, self.session_path, on_event=on_event)
+        self.last_result = result
+        return result
+
+    async def resume(
+        self,
+        thread_id: str,
+        *,
+        instruction: str = "",
+        on_event: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> dict[str, Any]:
+        """恢复原 lab；补充指令由 runner 先写 Journal，再进入规划。"""
+        if self.runner.running:
+            raise RuntimeError("lab is already running")
+        self.thread_id = thread_id
+        self.last_result = {}
+        self.tracer.new_trace()
+        result = await self.runner.resume(self.session_path, instruction=instruction, on_event=on_event)
         self.last_result = result
         return result
 
@@ -213,7 +214,6 @@ class LabSession:
         except Exception as e:
             sandbox = f"failed: {type(e).__name__}: {e}"
         self.last_result = {}
-        self._resuming = False
         self.thread_id = _new_thread_id()
         self.runner = LabRunner(
             self.settings,

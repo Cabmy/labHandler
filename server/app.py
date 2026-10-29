@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sse_starlette.sse import EventSourceResponse
 
 from config.runtime import get_settings
@@ -142,13 +142,15 @@ async def delete_file(name: str) -> dict[str, Any]:
 
 
 class TaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     question: str
 
 
-async def _run_lab(question: str) -> None:
+async def _run_lab(text: str, *, thread_id: str | None = None) -> None:
     """把一次 LabSession.run 写成 final/error 事件并关闭 SSE。
 
-    续跑 vs 新开由 session 是否已 attach_resume 决定。
+    thread_id 显式区分新建与续跑；续跑的 text 仅表示补充指令。
     """
 
     async def sink(ev: dict[str, Any]) -> None:
@@ -156,7 +158,10 @@ async def _run_lab(question: str) -> None:
 
     started = time.time()
     try:
-        result = await _session.run(question, on_event=sink)
+        if thread_id is None:
+            result = await _session.run(text, on_event=sink)
+        else:
+            result = await _session.resume(thread_id, instruction=text, on_event=sink)
         await _event_queue.put(
             {
                 "kind": "final",
@@ -181,15 +186,19 @@ async def submit_task(req: TaskRequest) -> dict[str, Any]:
     async with _task_lock:
         if _is_running():
             raise HTTPException(status_code=409, detail="已有任务在运行（单任务约束）")
+        if await asyncio.to_thread(latest_incomplete, _ws()):
+            raise HTTPException(status_code=409, detail="已有暂停的 lab，请继续或归档后再新建")
         while not _event_queue.empty():
             _event_queue.get_nowait()
         _current_task = asyncio.create_task(_run_lab(question))
-    return {"accepted": True, "question": question, "thread_id": _session.thread_id}
+    return {"accepted": True, "question": question}
 
 
 class ResumeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     continue_lab: bool
-    question: str = "继续上次未完成的 lab"
+    instruction: str = ""
 
 
 @app.get("/api/resume")
@@ -210,10 +219,9 @@ async def resume_lab(req: ResumeRequest) -> dict[str, Any]:
         tid, _ = peek
         if not req.continue_lab:
             return await asyncio.to_thread(_session.decline_resume)
-        _session.attach_resume(tid)
         while not _event_queue.empty():
             _event_queue.get_nowait()
-        _current_task = asyncio.create_task(_run_lab(req.question))
+        _current_task = asyncio.create_task(_run_lab(req.instruction, thread_id=tid))
     return {"accepted": True, "thread_id": tid, "resumed": True}
 
 

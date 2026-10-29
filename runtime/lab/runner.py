@@ -115,7 +115,26 @@ class LabRunner:
         session_dir: Path,
         *,
         on_event: EventSink | None = None,
-        resume: bool = False,
+    ) -> dict[str, Any]:
+        return await self._run(question, session_dir, on_event=on_event, resume=False, instruction="")
+
+    async def resume(
+        self,
+        session_dir: Path,
+        *,
+        instruction: str = "",
+        on_event: EventSink | None = None,
+    ) -> dict[str, Any]:
+        return await self._run("", session_dir, on_event=on_event, resume=True, instruction=instruction.strip())
+
+    async def _run(
+        self,
+        question: str,
+        session_dir: Path,
+        *,
+        on_event: EventSink | None,
+        resume: bool,
+        instruction: str,
     ) -> dict[str, Any]:
         if self.running:
             raise RuntimeError("lab is already running")
@@ -124,7 +143,10 @@ class LabRunner:
         if resume:
             if not state.resumable:
                 raise ValueError("session is not resumable")
-            question = state.question
+            if instruction:
+                journal.append("user_instruction", {"text": instruction})
+                state = journal.replay()
+            question = state.current_request
         else:
             if state.begun:
                 raise ValueError("new lab requires a new session directory")
