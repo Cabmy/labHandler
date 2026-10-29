@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator
 
-from config.prompts import render_lab_request, render_user_instruction
+from config.prompts import render_artifact_mismatch, render_lab_request, render_user_instruction
 
 JOURNAL_FILE = "JOURNAL.jsonl"
 
@@ -26,7 +26,7 @@ class JournalState:
     begun: bool = False
     question: str = ""
     instructions: list[str] = field(default_factory=list)
-    request_revision: int = 0
+    plan_revision: int = 0  # 用户补充或产物失配都会开启新规划，隔离旧提交。
     # 有 session_closed 才终结；无 live 协程的 open 会话始终可恢复。
     result: dict[str, Any] | None = None
     pause_reason: str = "interrupted"
@@ -68,7 +68,7 @@ class JournalState:
 
     def latest_submit(self, name: str) -> dict[str, Any] | None:
         for attempt in reversed(list(self.attempts.values())):
-            if attempt["request_revision"] != self.request_revision:
+            if attempt["plan_revision"] != self.plan_revision:
                 continue
             submit = (attempt.get("end") or {}).get("submit") or {}
             if submit.get("name") == name:
@@ -165,7 +165,7 @@ class Journal:
             elif kind == "session_closed":
                 st.result = dict(payload["result"])
             elif kind == "attempt_started":
-                st.attempts[payload["task_id"]] = {**payload, "request_revision": st.request_revision}
+                st.attempts[payload["task_id"]] = {**payload, "plan_revision": st.plan_revision}
             elif kind == "attempt_ended":
                 st.attempts[payload["task_id"]]["end"] = dict(payload)
             elif kind == "tx_snapshot":
@@ -180,11 +180,19 @@ class Journal:
                 if not instruction:
                     raise ValueError("user_instruction must not be empty")
                 st.instructions.append(instruction)
-                st.request_revision += 1
+                st.plan_revision += 1
                 # 已有主线直接追加；尚无主线时，开场会使用 current_request。
                 if tx:
                     tx = drop_dangling_tool_calls(tx)
                     tx.append({"role": "user", "content": render_user_instruction(instruction), "pinned": True})
+                self._invalidate_plan(st)
+            elif kind == "artifact_mismatch":
+                st.plan_revision += 1
+                tx = drop_dangling_tool_calls(tx)
+                if not tx:
+                    tx.append({"role": "user", "content": st.current_request})
+                tx.append({"role": "user", "content": render_artifact_mismatch(payload["mismatches"]),
+                           "pinned": True})
                 self._invalidate_plan(st)
             elif kind == "stage":
                 stage = str(payload.get("stage") or "")
@@ -239,7 +247,7 @@ class Journal:
 
     @staticmethod
     def _invalidate_plan(st: JournalState) -> None:
-        """新要求开启新规划；保留文件、历史和进度，废弃旧计划的执行凭据。"""
+        """保留文件、历史和进度，废弃旧计划的执行凭据并回到 SPEC。"""
         st.stage = "spec"
         st.dispatch_step = 0
         st.halt = None

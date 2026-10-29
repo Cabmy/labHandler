@@ -81,7 +81,7 @@ def test_multiple_instructions_survive_snapshot_and_remain_ordered(tmp_path):
     journal.append("user_instruction", {"text": "输出 JSON"})
     state = journal.replay()
     assert state.instructions == ["改用 C++", "输出 JSON"]
-    assert state.request_revision == 2
+    assert state.plan_revision == 2
     assert state.current_request.index("完成这个 lab") < state.current_request.index("改用 C++") < state.current_request.index("输出 JSON")
     assert len(state.transcript) == 3
     assert sum("改用 C++" in message["content"] for message in state.transcript) == 1

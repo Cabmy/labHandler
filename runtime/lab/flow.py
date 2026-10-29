@@ -417,6 +417,15 @@ async def _begin(
         question = state.current_request
 
     reset_sandbox_failure_counter()
+    if state:
+        recorded = EffectLedger(default_probes(), journal, runner.settings.workspace_dir,
+                                entries=state.effects)
+        mismatches = {aid: issues for aid in recorded.entries
+                      if (issues := recorded.mismatches(aid))}
+        if mismatches:
+            # 通知和旧规划失效是同一个持久化事实，崩溃后也不能复用旧裁定收尾。
+            journal.append("artifact_mismatch", {"mismatches": mismatches})
+            state = journal.replay()
     ledger = EffectLedger(
         default_probes(),
         journal,

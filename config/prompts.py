@@ -170,6 +170,23 @@ def render_state_update(kind: str, body: str) -> str:
     return f'<state_update type="{kind}">\n{body.strip()}\n</state_update>'
 
 
+def render_artifact_mismatch(mismatches: dict[str, list[str]]) -> str:
+    details = "\n".join(
+        f"- {aid}: {issue}"
+        for aid, issues in mismatches.items() for issue in issues
+    )
+    return render_state_update(
+        "artifact_mismatch",
+        "Artifact fingerprints no longer match the recorded outputs:\n"
+        f"{details}\n\n"
+        "Previous briefs, gates and decisions describe older files and are historical evidence only. "
+        "The execution plan has been invalidated. Inspect the current files and revise SPEC before "
+        "dispatching. Decide what can be reused, repaired or recreated; a content change alone does "
+        "not mean the current product is wrong. Preserve useful files. Re-dispatching the same "
+        "assignment id is allowed. Do not claim the old passing gate verifies the current files.",
+    )
+
+
 # 用户请求修订：原始目标保留，后续指令按顺序叠加。
 def render_lab_request(question: str, instructions: list[str]) -> str:
     if not instructions:

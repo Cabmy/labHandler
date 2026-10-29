@@ -29,8 +29,8 @@ class SideEffectProbe(Protocol):
     def capture(self, workspace: Path,
                 brief: dict[str, Any]) -> dict[str, Any] | None: ...
 
-    def satisfied(self, workspace: Path,
-                  fingerprint: dict[str, Any]) -> bool: ...
+    def mismatches(self, workspace: Path,
+                   fingerprint: dict[str, Any]) -> list[str]: ...
 
 
 class FileWriteProbe:
@@ -60,20 +60,22 @@ class FileWriteProbe:
                 continue
         return {"files": fingerprints} if fingerprints else None
 
-    def satisfied(self, workspace: Path, fingerprint: dict[str, Any]) -> bool:
+    def mismatches(self, workspace: Path, fingerprint: dict[str, Any]) -> list[str]:
         files = fingerprint.get("files")
         if not isinstance(files, dict) or not files:
-            return False
+            return ["文件指纹记录为空或无效"]
+        issues = []
         for rel, digest in files.items():
             path = self._resolve(workspace, str(rel))
             if path is None:
-                return False
+                issues.append(f"{rel}: 文件缺失或路径无效")
+                continue
             try:
                 if sha256_file(path) != digest:
-                    return False
-            except OSError:
-                return False
-        return True
+                    issues.append(f"{rel}: 文件内容已变化")
+            except OSError as exc:
+                issues.append(f"{rel}: 无法读取（{type(exc).__name__}）")
+        return issues
 
 
 def default_probes() -> dict[str, SideEffectProbe]:
@@ -114,14 +116,21 @@ class EffectLedger:
 
     def satisfied(self, node_id: str) -> bool:
         """节点副作用是否仍然完好。无记录、探针缺失或指纹对不上都返回 False。"""
+        return not self.mismatches(node_id)
+
+    def mismatches(self, node_id: str) -> list[str]:
+        """返回可供 Pro 决策的失配原因；空列表表示所有探针均通过。"""
         prints = self.entries.get(node_id)
         if not prints:
-            return False
+            return ["没有副作用指纹记录"]
+        issues = []
         for name, fingerprint in prints.items():
             probe = self.probes.get(name)
-            if probe is None or not probe.satisfied(self.workspace, fingerprint):
-                return False
-        return True
+            if probe is None:
+                issues.append(f"{name}: 探针未注册")
+            else:
+                issues.extend(probe.mismatches(self.workspace, fingerprint))
+        return issues
 
     def drop(self, node_id: str) -> None:
         if self.entries.pop(node_id, None) is not None:

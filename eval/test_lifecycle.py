@@ -7,7 +7,7 @@ import pytest
 
 from runtime.lab import flow
 from runtime.lab.accept import AcceptResult, FAIL, PASS
-from runtime.lab.effects import EffectLedger
+from runtime.lab.effects import EffectLedger, default_probes
 from runtime.lab.execution import Attempt, RunPaused
 from runtime.lab.journal import JOURNAL_FILE, Journal
 from runtime.lab.persist import latest_incomplete, session_dir
@@ -423,3 +423,79 @@ def test_pipeline_resume_keeps_dispatch_and_retries_only_interrupted_worker(runn
         assert not (tmp_path / "STATE.json").exists()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("change", ["modified", "deleted", "unchanged"])
+def test_resume_reports_artifact_changes_before_reusing_old_decisions(
+    runner, tmp_path, monkeypatch, change,
+):
+    from runtime.context.notes import write_cards
+
+    journal = opened(tmp_path)
+    journal.append_transcript([{"role": "user", "content": "test lab"}], False)
+    (tmp_path / "CATALOG.md").write_text("catalog")
+    write_cards(tmp_path, [])
+    monkeypatch.setattr(flow, "load_profile", lambda: {})
+    monkeypatch.setattr(flow, "catalog_rules", lambda profile: [])
+    product = tmp_path / "main.py"
+    product.write_text("original")
+    ledger = EffectLedger(default_probes(), journal, tmp_path)
+    ledger.record("a", {"changed_files": ["main.py"]})
+    submit(journal, TaskKind.SPEC, "submit_spec", {"goal": "old", "milestones": ["old"]})
+    submit(journal, TaskKind.SUMMARY, "submit_summary", {"user_summary": "old summary"})
+    journal.append("executed", {"ids": ["a"]})
+    journal.append("gate", {"gate_id": "a", "state": "pass"})
+    journal.append("dispatch", {"step": 1, "payload": {"assignments": [{"id": "a"}]}, "run": ["a"]})
+    journal.append("brief", {"step": 1, "aid": "a", "brief": {"outcome": "done"}})
+    journal.append("judge", {"step": 1, "decision": "finish"})
+    journal.append("stage", {"stage": "summary", "dispatch_step": 1})
+    if change == "modified":
+        product.write_text("user improvement")
+    elif change == "deleted":
+        product.unlink()
+
+    calls = []
+
+    async def loop(node, spec, **kwargs):
+        calls.append(node.kind)
+        history = kwargs["history"]
+        messages = [m for m in history if "artifact_mismatch" in str(m.get("content"))]
+        assert len(messages) == 1 and messages[0]["pinned"]
+        assert "a:" in messages[0]["content"] and "main.py" in messages[0]["content"]
+        state = journal.replay()
+        if node.kind is TaskKind.SPEC:
+            assert state.latest_submit("submit_summary") is None
+            assert not any([state.executed_ids, state.gates, state.effects,
+                            state.step_dispatch, state.step_briefs, state.step_judges])
+        payloads = {
+            TaskKind.SPEC: {"goal": "review current product", "milestones": ["produce output"]},
+            TaskKind.DISPATCH: {"step_goal": "current files reviewed", "assignments": []},
+            TaskKind.SUMMARY: {"user_summary": "new summary"},
+        }
+        return LoopResult(None, {"name": f"submit_{node.kind.value}",
+                                 "payload": payloads[node.kind]}, "submit", history=history)
+
+    monkeypatch.setattr(flow, "run_loop", loop)
+    if change != "unchanged":
+        # 第一次通知落盘后暂停；重启必须保留消息与失效状态，且不重复通知。
+        async def paused(*args, **kwargs):
+            raise RunPaused("test interruption")
+
+        monkeypatch.setattr(flow, "run_loop", paused)
+        assert asyncio.run(runner.resume(tmp_path))["verdict"] == "paused"
+        state = journal.replay()
+        assert state.stage == "spec" and state.instructions == []
+        assert state.question == "test lab" and state.plan_revision == 1
+        monkeypatch.setattr(flow, "run_loop", loop)
+
+    result = asyncio.run(runner.resume(tmp_path))
+    if change == "unchanged":
+        assert calls == [] and result["summary"] == "old summary"
+    else:
+        assert calls == [TaskKind.SPEC, TaskKind.DISPATCH, TaskKind.SUMMARY]
+        assert result["summary"] == "new summary"
+        assert journal.path.read_text().count('"kind": "artifact_mismatch"') == 1
+    if change == "modified":
+        assert product.read_text() == "user improvement"
+    elif change == "deleted":
+        assert not product.exists()
